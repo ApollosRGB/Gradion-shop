@@ -1,15 +1,16 @@
-# 🎁 Treat Stand — SYNAOS Order App
+# 🎁 Gradion Shop — SYNAOS Order App
 
 A Shopee-style desktop ordering app that dispatches **SYNAOS intralogistics jobs** (AGV transport orders) through the SYNAOS Job Management API. Built with Electron for Windows and macOS, with light/dark mode and separate **user** and **admin** interfaces.
 
-![status](https://img.shields.io/badge/version-1.0.0-e0563f)
+![status](https://img.shields.io/badge/version-1.3.0-e0563f)
 
 ## Features
 
 ### 🛍️ User interface
 - Browse the products/jobs an admin has published, in a mobile-store style catalog.
 - Add any item multiple times; a live order panel on the right shows quantities, per-item prices, and the running total.
-- **Finish & Send to Robot** creates one SYNAOS transport job per ordered unit and jumps to a live **order-progress** screen.
+- **Finish & Send to Robot** creates one SYNAOS transport job per ordered unit and jumps to a live **order-progress** screen. Ordering an item adds its quantity to the product's **sold** count.
+- **Rate your order** — once an order is delivered, the customer rates each item 1–5 stars; the product's displayed rating becomes the **running average** of all ratings received.
 - The progress screen polls the Job API and narrates the AGV journey — *Order placed → On the way to Production → Picked up → Delivering to Shop → Delivered!* — using each station's configured **function** label.
 - **My Orders** keeps a history; reopen any order to see its live status. Confirm receipt ("👍 Got it!") or cancel (discards the SYNAOS jobs).
 
@@ -39,8 +40,8 @@ Authentication is HTTP Basic. All admin configuration (products, stations, price
 ## Download
 
 Grab the latest installers from the [Releases page](../../releases):
-- **Windows** — `TreatStand-Setup-1.0.0.exe`
-- **macOS** — `TreatStand-1.0.0.dmg`
+- **Windows** — `GradionShop-Setup-1.3.0.exe`
+- **macOS** — `GradionShop-1.3.0.dmg`
 
 ## Development
 

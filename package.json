@@ -1,8 +1,8 @@
 {
   "name": "treat-stand-order-app",
-  "productName": "Treat Stand",
-  "version": "1.0.1",
-  "description": "Shopee-style order app driving SYNAOS intralogistics jobs (AGV transport orders).",
+  "productName": "Gradion Shop",
+  "version": "1.3.0",
+  "description": "Gradion Shop — Shopee-style order app driving SYNAOS intralogistics jobs (AGV transport orders).",
   "main": "main.js",
   "author": "ApollosRGB",
   "license": "MIT",
@@ -16,8 +16,8 @@
     "electron-builder": "^25.1.8"
   },
   "build": {
-    "appId": "com.gradion.treatstand",
-    "productName": "Treat Stand",
+    "appId": "com.gradion.shop",
+    "productName": "Gradion Shop",
     "directories": {
       "output": "release"
     },
@@ -40,7 +40,7 @@
     },
     "nsis": {
       "oneClick": true,
-      "artifactName": "TreatStand-Setup-${version}.${ext}"
+      "artifactName": "GradionShop-Setup-${version}.${ext}"
     },
     "mac": {
       "target": {
@@ -54,7 +54,7 @@
       "identity": null
     },
     "dmg": {
-      "artifactName": "TreatStand-${version}.${ext}"
+      "artifactName": "GradionShop-${version}.${ext}"
     }
   }
 }

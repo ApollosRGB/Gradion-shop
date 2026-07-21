@@ -31,6 +31,7 @@ function defaultStore() {
         image: null,
         visible: true,
         rating: 4.9,
+        ratingCount: 642,
         sold: 642,
         steps: [
           { stationRef: 'st-k2', action: 'PICK' },
@@ -44,6 +45,7 @@ function defaultStore() {
         image: null,
         visible: true,
         rating: 4.8,
+        ratingCount: 729,
         sold: 729,
         steps: [
           { stationRef: 'st-k2', action: 'PICK' },
@@ -65,6 +67,8 @@ function loadStore() {
     data.stations = data.stations || def.stations;
     data.stations.forEach((s) => { if (!s.system) s.system = 'STATION'; });
     data.products = data.products || def.products;
+    // Seed rating counters so the displayed rating can become a running average
+    data.products.forEach((p) => { if (p.ratingCount == null) p.ratingCount = p.sold || 0; });
     data.robots = data.robots || [];
     data.orders = data.orders || [];
     return data;
@@ -262,7 +266,7 @@ function registerIpc() {
     const store = loadStore();
     return apiRequest(store.settings, 'PUT', `/api/v1/jobs/${jobId}/discard-request`, {
       id: jobId,
-      reason: 'Cancelled from Treat Stand app'
+      reason: 'Cancelled from Gradion Shop app'
     });
   });
 

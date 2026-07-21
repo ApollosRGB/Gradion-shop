@@ -11,6 +11,7 @@ let adminTab = 'products';
 let productDraft = null;       // product being edited in admin
 let progressOrderId = null;    // order currently shown on progress screen
 let pollTimer = null;
+let ratingDraft = {};          // in-progress star selection { productId: 1..5 }
 
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
@@ -222,6 +223,14 @@ async function onFinish() {
     error: r.error || null
   }));
 
+  // Count each ordered item toward the product's "sold" total once the order is placed
+  if (anyOk) {
+    itemsSnapshot.forEach((it) => {
+      const p = store.products.find((x) => x.id === it.productId);
+      if (p) p.sold = (p.sold || 0) + it.qty;
+    });
+  }
+
   const order = {
     id: orderId,
     shortId: orderId.slice(-6),
@@ -230,7 +239,9 @@ async function onFinish() {
     jobs,
     total: cartTotal(),
     state: anyOk ? 'in_progress' : 'failed',
-    confirmed: false
+    confirmed: false,
+    rated: false,
+    ratings: {}
   };
   store.orders.unshift(order);
   await persist();
@@ -294,9 +305,37 @@ function milestonePhase(m) {
 
 function openProgress(orderId) {
   progressOrderId = orderId;
+  const ord = store.orders.find((o) => o.id === orderId);
+  ratingDraft = ord && ord.ratings ? { ...ord.ratings } : {};
   showView('progress');
   renderProgress(null);
   startPolling();
+}
+
+// Applies the customer's star ratings to each product's running average
+async function submitOrderRating(orderId) {
+  const order = store.orders.find((o) => o.id === orderId);
+  if (!order || order.rated) return;
+  if (!order.items.every((i) => ratingDraft[i.productId] > 0)) {
+    toast('Please rate every item first.', 'error');
+    return;
+  }
+  order.items.forEach((it) => {
+    const r = ratingDraft[it.productId];
+    order.ratings[it.productId] = r;
+    const p = store.products.find((x) => x.id === it.productId);
+    if (p) {
+      const count = p.ratingCount || 0;
+      const sum = (p.rating || 0) * count;
+      p.ratingCount = count + 1;
+      p.rating = (sum + r) / p.ratingCount;   // new running average
+    }
+  });
+  order.rated = true;
+  await persist();
+  renderCatalog();
+  renderProgress(null);
+  toast('Thanks for your rating! ⭐', 'success');
 }
 
 function startPolling() {
@@ -339,6 +378,7 @@ async function pollOnce() {
       order.state = 'completed';
       await persist();
       renderOrdersBadge();
+      renderProgress(liveJobs, order);   // immediately reflect completion + show rating card
     } else if (anyFailed && order.state === 'in_progress') {
       order.state = 'failed';
       await persist();
@@ -455,6 +495,43 @@ function renderProgress(liveJobs, orderArg) {
       </div>
     </div>`;
 
+  // Rating card — shown once the order is completed
+  const starsRow = (pid, value, interactive) =>
+    [1, 2, 3, 4, 5].map((n) =>
+      `<span class="star-pick ${n <= value ? 'on' : ''}" ${interactive ? `data-rate="${pid}" data-val="${n}"` : ''}>★</span>`).join('');
+
+  let ratingBlock = '';
+  if (completed) {
+    if (order.rated) {
+      const avg = order.items.reduce((s, i) => s + (order.ratings[i.productId] || 0), 0) / (order.items.length || 1);
+      ratingBlock = `
+        <div class="order-card">
+          <h2 style="text-align:center;">Thanks for rating! ⭐</h2>
+          <p class="hint" style="text-align:center;">You rated this order ${avg.toFixed(1)} on average.</p>
+          ${order.items.map((i) => `
+            <div class="rate-row">
+              <div class="rate-name">${escapeHtml(i.name)}</div>
+              <div class="stars-lg readonly">${starsRow(i.productId, order.ratings[i.productId] || 0, false)}</div>
+            </div>`).join('')}
+        </div>`;
+    } else {
+      const allRated = order.items.every((i) => ratingDraft[i.productId] > 0);
+      ratingBlock = `
+        <div class="order-card">
+          <h2 style="text-align:center;">Rate your order</h2>
+          <p class="hint" style="text-align:center;">Tap the stars to rate each item.</p>
+          ${order.items.map((i) => `
+            <div class="rate-row">
+              <div class="rate-name">${escapeHtml(i.name)}</div>
+              <div class="stars-lg">${starsRow(i.productId, ratingDraft[i.productId] || 0, true)}</div>
+            </div>`).join('')}
+          <div class="progress-actions" style="margin-top:14px;">
+            <button class="btn btn-primary" id="submitRating" ${allRated ? '' : 'disabled'}>Submit rating</button>
+          </div>
+        </div>`;
+    }
+  }
+
   $('#progressWrap').innerHTML = `
     <div class="order-card">
       <h2>Order #${escapeHtml(order.shortId)}</h2>
@@ -463,6 +540,7 @@ function renderProgress(liveJobs, orderArg) {
       <div class="steps">${stepsHtml}</div>
     </div>
     ${confirmBlock}
+    ${ratingBlock}
     <div class="order-items-card">
       <h3>Order items</h3>
       ${itemsHtml}
@@ -476,6 +554,12 @@ function renderProgress(liveJobs, orderArg) {
     </div>`;
 
   $('#backToShop').addEventListener('click', () => showView('shop'));
+  $$('[data-rate]').forEach((el) => el.addEventListener('click', () => {
+    ratingDraft[el.dataset.rate] = parseInt(el.dataset.val, 10);
+    renderProgress(null);
+  }));
+  const submitBtn = $('#submitRating');
+  if (submitBtn) submitBtn.addEventListener('click', () => submitOrderRating(order.id));
   const gotIt = $('#confirmGotIt');
   if (gotIt) gotIt.addEventListener('click', () => confirmOrder(order.id));
   const cancel = $('#cancelOrder');

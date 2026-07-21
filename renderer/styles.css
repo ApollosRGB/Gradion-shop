@@ -341,6 +341,17 @@ input.inp:focus, select.inp:focus, textarea.inp:focus { outline: 2px solid var(-
 .modal-field label { font-size: 13px; font-weight: 600; color: var(--text-muted); }
 .err-text { color: #d64545; font-size: 13px; min-height: 18px; }
 
+/* Order rating */
+.rate-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 12px 4px; border-bottom: 1px solid var(--border); }
+.rate-row:last-child { border-bottom: none; }
+.rate-name { font-weight: 600; }
+.stars-lg { display: flex; gap: 6px; font-size: 30px; line-height: 1; }
+.stars-lg .star-pick { color: var(--border); cursor: pointer; transition: transform 0.08s; }
+.stars-lg .star-pick.on { color: var(--star); }
+.stars-lg .star-pick:hover { transform: scale(1.15); }
+.stars-lg.readonly .star-pick { cursor: default; }
+.stars-lg.readonly .star-pick:hover { transform: none; }
+
 /* Discovery modal list */
 .disc-list { max-height: 320px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; margin-top: 6px; border: 1px solid var(--border); border-radius: 12px; padding: 8px; }
 .disc-row { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 8px; cursor: pointer; }
