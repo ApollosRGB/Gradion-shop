@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline';" />
+  <title>Treat Stand</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- Top bar -->
+    <header class="topbar">
+      <div class="brand"><span class="brand-emoji">🎁</span> <span id="brandTitle">Treat Stand</span></div>
+      <div class="topbar-actions">
+        <button id="themeToggle" class="icon-btn" title="Toggle light / dark">🌙</button>
+        <button id="adminToggle" class="ghost-btn">Admin</button>
+      </div>
+    </header>
+
+    <!-- USER: SHOP -->
+    <main id="view-shop" class="view">
+      <div class="shop-layout">
+        <section class="catalog" id="catalog"></section>
+        <aside class="cart" id="cartPanel">
+          <h2 class="cart-title">🛒 Your Order</h2>
+          <div class="cart-items" id="cartItems"></div>
+          <div class="cart-footer">
+            <div class="cart-total-row">
+              <span>Total</span>
+              <span class="cart-total" id="cartTotal">$0.00</span>
+            </div>
+            <button class="finish-btn" id="finishBtn" disabled>Finish &amp; Send to Robot</button>
+          </div>
+        </aside>
+      </div>
+    </main>
+
+    <!-- USER: ORDER PROGRESS -->
+    <main id="view-progress" class="view hidden">
+      <div class="progress-wrap" id="progressWrap"></div>
+    </main>
+
+    <!-- USER: MY ORDERS -->
+    <main id="view-orders" class="view hidden">
+      <div class="orders-wrap">
+        <h1 class="page-h1">My Orders</h1>
+        <div id="ordersList" class="orders-list"></div>
+      </div>
+    </main>
+
+    <!-- ADMIN -->
+    <main id="view-admin" class="view hidden">
+      <div class="admin-wrap" id="adminWrap"></div>
+    </main>
+
+    <!-- Bottom nav (user) -->
+    <nav class="bottom-nav" id="bottomNav">
+      <button class="nav-btn active" data-view="shop"><span class="nav-emoji">🛍️</span><span>Shop</span></button>
+      <button class="nav-btn" data-view="orders"><span class="nav-emoji">🧾</span><span>My Orders</span><span class="badge" id="ordersBadge">0</span></button>
+    </nav>
+  </div>
+
+  <!-- Modal host -->
+  <div id="modalRoot"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
