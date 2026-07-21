@@ -341,6 +341,14 @@ input.inp:focus, select.inp:focus, textarea.inp:focus { outline: 2px solid var(-
 .modal-field label { font-size: 13px; font-weight: 600; color: var(--text-muted); }
 .err-text { color: #d64545; font-size: 13px; min-height: 18px; }
 
+/* Discovery modal list */
+.disc-list { max-height: 320px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; margin-top: 6px; border: 1px solid var(--border); border-radius: 12px; padding: 8px; }
+.disc-row { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 8px; cursor: pointer; }
+.disc-row:hover { background: var(--surface-2); }
+.disc-row input { width: 16px; height: 16px; }
+.disc-id { font-weight: 600; font-family: ui-monospace, monospace; flex: 0 0 auto; }
+.disc-note { color: var(--text-muted); font-size: 12px; margin-left: auto; }
+
 /* Toast */
 #toastHost { position: fixed; bottom: 90px; left: 50%; transform: translateX(-50%); z-index: 200; display: flex; flex-direction: column; gap: 8px; align-items: center; }
 .toast { background: #1f2430; color: #fff; padding: 12px 20px; border-radius: 999px; font-weight: 600; font-size: 14px; box-shadow: 0 8px 24px rgba(0,0,0,0.3); animation: fadein 0.2s; }

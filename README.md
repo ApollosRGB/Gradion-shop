@@ -15,7 +15,8 @@ A Shopee-style desktop ordering app that dispatches **SYNAOS intralogistics jobs
 
 ### ⚙️ Admin interface (password-protected)
 - **Jobs / Products** — define each product as a sequence of job milestones (station + action, e.g. *Production · PICK → Shop · DROP*), set its price, attach an image file, and choose whether users can see it.
-- **Stations** — map a friendly name + **function** (production, storage, shop, charging…) to a SYNAOS station address ID used in job milestones.
+- **Stations** — map a friendly name + **function** (production, storage, shop, charging…) to a SYNAOS station address ID used in job milestones. **Add from SYNAOS** reads the real station addresses the tenant uses (derived from the job-manager, the only data reachable with Basic auth — the layout/fleet services sit behind an OAuth2 gateway), so you don't hand-type IDs.
+- **Robots** — **Read from SYNAOS** lists the transport resources (AGVs) the tenant uses, with their mode and supported job types. A product can be pinned to a specific robot (sets `assignedResourceId` on the job) or left to the SYNAOS scheduler.
 - **Settings** — SYNAOS connection (base URL, username, password) with a **Test connection** button, plus a **change admin password** form and dark-mode toggle.
 - Admin is locked behind a password (default `Ts13`) that can only be changed from within the admin session.
 

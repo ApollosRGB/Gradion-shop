@@ -1,7 +1,7 @@
 {
   "name": "treat-stand-order-app",
   "productName": "Treat Stand",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Shopee-style order app driving SYNAOS intralogistics jobs (AGV transport orders).",
   "main": "main.js",
   "author": "ApollosRGB",

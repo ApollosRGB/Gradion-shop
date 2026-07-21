@@ -690,6 +690,13 @@ function renderProductEditor(body) {
         <label class="fld">Units sold (display)
           <input class="inp" id="f-sold" type="number" min="0" step="1" value="${p.sold}">
         </label>
+        <label class="fld full">Assign robot (transport resource)
+          <select class="inp" id="f-resource">
+            <option value="">Auto — let SYNAOS choose</option>
+            ${(store.robots || []).map((r) => `<option value="${escapeHtml(r.id)}" ${p.resourceId === r.id ? 'selected' : ''}>${escapeHtml(r.id)}${r.mode ? ' (' + escapeHtml(r.mode) + ')' : ''}</option>`).join('')}
+            ${p.resourceId && !(store.robots || []).some((r) => r.id === p.resourceId) ? `<option value="${escapeHtml(p.resourceId)}" selected>${escapeHtml(p.resourceId)}</option>` : ''}
+          </select>
+        </label>
         <label class="fld switch full">
           <input type="checkbox" id="f-visible" ${p.visible ? 'checked' : ''}> Show this job to users
         </label>
@@ -717,6 +724,7 @@ function renderProductEditor(body) {
   $('#f-rating').addEventListener('input', (e) => p.rating = parseFloat(e.target.value) || 0);
   $('#f-sold').addEventListener('input', (e) => p.sold = parseInt(e.target.value) || 0);
   $('#f-visible').addEventListener('change', (e) => p.visible = e.target.checked);
+  $('#f-resource').addEventListener('change', (e) => p.resourceId = e.target.value || null);
   $$('[data-step-station]', body).forEach((el) => el.addEventListener('change', (e) => p.steps[+el.dataset.stepStation].stationRef = e.target.value));
   $$('[data-step-action]', body).forEach((el) => el.addEventListener('change', (e) => p.steps[+el.dataset.stepAction].action = e.target.value));
   $$('[data-step-del]', body).forEach((el) => el.addEventListener('click', () => { p.steps.splice(+el.dataset.stepDel, 1); renderAdmin(); }));
@@ -753,6 +761,7 @@ function renderProductEditor(body) {
 // ---- Admin: stations ----
 function renderAdminStations() {
   const body = $('#adminBody');
+  const fns = ['production', 'storage', 'shop', 'charging', 'other'];
   const list = store.stations.map((s) => `
     <div class="admin-item">
       <div class="thumb">📍</div>
@@ -764,11 +773,13 @@ function renderAdminStations() {
           <label class="fld">Station ID (SYNAOS address)
             <input class="inp" data-st-id="${s.id}" value="${escapeHtml(s.stationId)}">
           </label>
-          <label class="fld full">Function
+          <label class="fld">Function
             <select class="inp" data-st-fn="${s.id}">
-              ${['production', 'storage', 'shop', 'charging', 'other'].map((f) =>
-                `<option value="${f}" ${f === s.fn ? 'selected' : ''}>${f}</option>`).join('')}
+              ${fns.map((f) => `<option value="${f}" ${f === s.fn ? 'selected' : ''}>${f}</option>`).join('')}
             </select>
+          </label>
+          <label class="fld">Address system
+            <input class="inp" data-st-sys="${s.id}" value="${escapeHtml(s.system || 'STATION')}">
           </label>
         </div>
         <div class="row-actions" style="margin-top:8px;">
@@ -777,12 +788,38 @@ function renderAdminStations() {
       </div>
     </div>`).join('');
 
+  const robots = store.robots || [];
+  const robotsHtml = robots.length
+    ? robots.map((r) => `
+      <div class="admin-item">
+        <div class="thumb">🤖</div>
+        <div class="grow">
+          <div class="title-row">
+            <span class="nm">${escapeHtml(r.id)}</span>
+            ${r.mode ? `<span class="chip on">${escapeHtml(r.mode)}</span>` : '<span class="chip off">unknown mode</span>'}
+          </div>
+          <div class="desc">Supports: ${escapeHtml((r.supportedJobTypes || []).join(', ') || '—')}</div>
+        </div>
+      </div>`).join('')
+    : '<p class="hint">No robots loaded yet. Click “Read from SYNAOS” to fetch the transport resources this tenant is using.</p>';
+
   body.innerHTML = `
     <div class="panel">
-      <h2>Stations</h2>
-      <p class="hint">Stations map a friendly name + function to a SYNAOS station address ID (used in job milestones). Function labels appear in the user's order-progress screen.</p>
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+        <h2>Stations</h2>
+        <button class="btn btn-secondary" id="syncSynaos">⟳ Add from SYNAOS</button>
+      </div>
+      <p class="hint">Stations map a friendly name + function to a SYNAOS station address (used in job milestones). Function labels appear in the user's order-progress screen. “Add from SYNAOS” reads the real station addresses this tenant uses.</p>
       <div class="admin-list">${list || '<p class="hint">No stations yet.</p>'}</div>
-      <button class="btn btn-primary" id="addStation" style="margin-top:16px;">+ Add station</button>
+      <button class="btn btn-primary" id="addStation" style="margin-top:16px;">+ Add station manually</button>
+    </div>
+    <div class="panel">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+        <h2>Robots (transport resources)</h2>
+        <button class="btn btn-secondary" id="syncSynaos2">⟳ Read from SYNAOS</button>
+      </div>
+      <p class="hint">The AGVs/robots SYNAOS is using. A product can be pinned to a specific robot in its job settings, or left to the SYNAOS scheduler.</p>
+      <div class="admin-list">${robotsHtml}</div>
     </div>`;
 
   $$('[data-st-name]', body).forEach((el) => el.addEventListener('change', async (e) => {
@@ -794,6 +831,9 @@ function renderAdminStations() {
   $$('[data-st-fn]', body).forEach((el) => el.addEventListener('change', async (e) => {
     store.stations.find((s) => s.id === el.dataset.stFn).fn = e.target.value; await persist();
   }));
+  $$('[data-st-sys]', body).forEach((el) => el.addEventListener('change', async (e) => {
+    store.stations.find((s) => s.id === el.dataset.stSys).system = e.target.value.trim() || 'STATION'; await persist();
+  }));
   $$('[data-st-del]', body).forEach((el) => el.addEventListener('click', () => {
     confirmModal('Delete station?', 'Products using it will need their steps updated.', async () => {
       store.stations = store.stations.filter((s) => s.id !== el.dataset.stDel);
@@ -802,9 +842,88 @@ function renderAdminStations() {
     });
   }));
   $('#addStation').addEventListener('click', async () => {
-    store.stations.push({ id: uid('st'), stationId: 'NEW', name: 'New station', fn: 'other' });
+    store.stations.push({ id: uid('st'), stationId: 'NEW', name: 'New station', fn: 'other', system: 'STATION' });
     await persist();
     renderAdminStations();
+  });
+  $('#syncSynaos').addEventListener('click', discoverFromSynaosFlow);
+  $('#syncSynaos2').addEventListener('click', discoverFromSynaosFlow);
+}
+
+// Reads stations + robots live from SYNAOS and opens an import picker
+async function discoverFromSynaosFlow() {
+  const btns = [$('#syncSynaos'), $('#syncSynaos2')].filter(Boolean);
+  btns.forEach((b) => { b.disabled = true; b.textContent = 'Reading SYNAOS…'; });
+  let res;
+  try {
+    res = await window.api.discoverFromSynaos();
+  } catch (e) {
+    toast('Could not reach SYNAOS: ' + e.message, 'error');
+    renderAdminStations();
+    return;
+  }
+  if (!res.ok) {
+    toast('SYNAOS read failed: ' + (res.error || 'HTTP ' + res.status), 'error');
+    renderAdminStations();
+    return;
+  }
+  // Cache robots immediately
+  store.robots = res.robots || [];
+  await persist();
+  openDiscoverModal(res);
+}
+
+function openDiscoverModal(res) {
+  const existing = new Set(store.stations.map((s) => (s.stationId || '') + '|' + (s.system || 'STATION')));
+  const rows = res.stations.map((st, i) => {
+    const key = st.id + '|' + st.system;
+    const already = existing.has(key);
+    return `
+      <label class="disc-row">
+        <input type="checkbox" data-disc="${i}" ${already ? 'disabled' : 'checked'}>
+        <span class="disc-id">${escapeHtml(st.id)}</span>
+        <span class="chip ${st.system === 'STATION' ? 'on' : ''}">${escapeHtml(st.system)}</span>
+        ${already ? '<span class="disc-note">already added</span>' : ''}
+      </label>`;
+  }).join('');
+
+  const robotLines = (res.robots || []).map((r) =>
+    `<span class="chip">${escapeHtml(r.id)}${r.mode ? ' · ' + escapeHtml(r.mode) : ''}</span>`).join(' ');
+
+  const host = modalHost();
+  host.innerHTML = `
+    <div class="modal-backdrop">
+      <div class="modal" style="max-width:560px;">
+        <h3>Read from SYNAOS</h3>
+        <p>Found <b>${res.stations.length}</b> station address(es) and <b>${(res.robots || []).length}</b> robot(s) across <b>${res.jobCount}</b> jobs. Pick the stations to import.</p>
+        <div class="disc-list">${rows || '<p class="hint">No station addresses found in SYNAOS jobs.</p>'}</div>
+        ${robotLines ? `<div style="margin-top:14px;"><div class="hint" style="margin-bottom:6px;">Robots (saved automatically):</div>${robotLines}</div>` : ''}
+        <div class="modal-actions">
+          <button class="btn btn-secondary" id="discCancel">Close</button>
+          <button class="btn btn-primary" id="discImport">Import selected</button>
+        </div>
+      </div>
+    </div>`;
+
+  $('#discCancel').addEventListener('click', () => { closeModal(); renderAdminStations(); });
+  $('#discImport').addEventListener('click', async () => {
+    const picked = $$('[data-disc]').filter((c) => c.checked && !c.disabled).map((c) => res.stations[+c.dataset.disc]);
+    let added = 0;
+    picked.forEach((st) => {
+      const key = st.id + '|' + st.system;
+      if (store.stations.some((s) => (s.stationId || '') + '|' + (s.system || 'STATION') === key)) return;
+      const fn = /shop|store/i.test(st.id) ? 'shop'
+        : /(lg_|storage|lager)/i.test(st.id) ? 'storage'
+        : /(charge|charging)/i.test(st.id) ? 'charging'
+        : /(m\df|prod|vg_|qa_)/i.test(st.id) ? 'production' : 'other';
+      store.stations.push({ id: uid('st'), stationId: st.id, name: st.id, fn, system: st.system });
+      added++;
+    });
+    await persist();
+    closeModal();
+    renderCatalog();
+    renderAdminStations();
+    toast(added ? `Imported ${added} station(s) from SYNAOS` : 'Nothing new to import', added ? 'success' : undefined);
   });
 }
 

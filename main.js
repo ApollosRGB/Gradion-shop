@@ -19,9 +19,10 @@ function defaultStore() {
       apiPassword: 'X#jzd.0sdc20b0q#MYa"'
     },
     stations: [
-      { id: 'st-k2', stationId: 'K2', name: 'Production', fn: 'production' },
-      { id: 'st-k1', stationId: 'K1', name: 'Shop', fn: 'shop' }
+      { id: 'st-k2', stationId: 'K2', name: 'Production', fn: 'production', system: 'STATION' },
+      { id: 'st-k1', stationId: 'K1', name: 'Shop', fn: 'shop', system: 'STATION' }
     ],
+    robots: [],
     products: [
       {
         id: 'p-pen',
@@ -62,7 +63,9 @@ function loadStore() {
     const def = defaultStore();
     data.settings = Object.assign(def.settings, data.settings || {});
     data.stations = data.stations || def.stations;
+    data.stations.forEach((s) => { if (!s.system) s.system = 'STATION'; });
     data.products = data.products || def.products;
+    data.robots = data.robots || [];
     data.orders = data.orders || [];
     return data;
   } catch (e) {
@@ -143,17 +146,20 @@ function buildJobPayload(product, stations, orderId, unitId) {
     return {
       id: crypto.randomUUID(),
       action: step.action,
-      address: { system: 'STATION', id: st ? st.stationId : step.stationRef },
+      address: { system: (st && st.system) || 'STATION', id: st ? st.stationId : step.stationRef },
       correlations
     };
   });
-  return {
+  const job = {
     id: jobId,
     milestones,
     executeMilestonesInProvidedSequence: true,
     correlations: [{ kind: 'SCHEDULER', id: 'SYNAOS-JOBS' }, ...correlations],
     scheduling: { scheduler: 'SYNAOS-JOBS' }
   };
+  // Optionally pin the job to a specific transport resource (robot) chosen by the admin
+  if (product.resourceId) job.assignedResourceId = product.resourceId;
+  return job;
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +176,48 @@ function registerIpc() {
   ipcMain.handle('api:test', async (_ev, settings) => {
     const res = await apiRequest(settings, 'GET', '/api/v1/jobs?finishedLessThanSecondsAgo=10');
     return { ok: res.ok, status: res.status, error: res.error || null };
+  });
+
+  // Reads the real stations and transport resources (robots) that SYNAOS is using,
+  // by scanning the job-manager's jobs (the only data reachable with Basic auth —
+  // the layout/fleet services sit behind an OAuth2 gateway). Enriches robots via
+  // the resource-mode endpoint to confirm they are live.
+  ipcMain.handle('api:discoverFromSynaos', async (_ev, settingsOverride) => {
+    const store = loadStore();
+    const settings = settingsOverride || store.settings;
+    const res = await apiRequest(settings, 'GET', '/api/v1/jobs?finishedLessThanSecondsAgo=999999999');
+    if (!res.ok) {
+      return { ok: false, status: res.status, error: res.error || `HTTP ${res.status}` };
+    }
+    const jobs = Array.isArray(res.data) ? res.data : [];
+    const stationMap = new Map();   // id -> Set(systems)
+    const robotSet = new Set();
+    for (const job of jobs) {
+      if (job.assignedResourceId) robotSet.add(job.assignedResourceId);
+      for (const m of job.milestones || []) {
+        const a = m.address;
+        if (a && a.id != null) {
+          if (!stationMap.has(a.id)) stationMap.set(a.id, new Set());
+          stationMap.get(a.id).add(a.system || 'STATION');
+        }
+      }
+    }
+    const stations = [...stationMap.entries()]
+      .map(([id, sys]) => ({ id: String(id), system: sys.has('STATION') ? 'STATION' : [...sys][0] }))
+      .sort((a, b) => (a.system === b.system ? a.id.localeCompare(b.id) : a.system.localeCompare(b.system)));
+
+    // Enrich robots with their mode / supported job types (confirms they are real)
+    const robots = [];
+    for (const id of [...robotSet].sort()) {
+      const rm = await apiRequest(settings, 'GET', `/api/v1/resources/${encodeURIComponent(id)}/resource-mode`);
+      robots.push({
+        id,
+        mode: rm.ok && rm.data ? rm.data.resourceMode : null,
+        supportedJobTypes: rm.ok && rm.data ? rm.data.supportedJobTypes : null,
+        live: rm.ok
+      });
+    }
+    return { ok: true, status: res.status, jobCount: jobs.length, stations, robots };
   });
 
   // Creates one SYNAOS job per ordered unit. Returns created job descriptors.
