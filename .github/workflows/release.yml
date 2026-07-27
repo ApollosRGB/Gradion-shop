@@ -29,10 +29,13 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # No GH_TOKEN here on purpose: with a token in the environment and a tag
+      # present, electron-builder publishes to GitHub by itself, so both matrix
+      # jobs would race to create their own draft release. Publishing is the
+      # release job's responsibility alone.
       - name: Build application
         run: ${{ matrix.build }}
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CSC_IDENTITY_AUTO_DISCOVERY: false
 
       - name: Upload build output
