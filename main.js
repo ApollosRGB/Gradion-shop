@@ -75,6 +75,7 @@ function loadStore() {
     // Seed rating counters so the displayed rating can become a running average
     data.products.forEach((p) => { if (p.ratingCount == null) p.ratingCount = p.sold || 0; });
     data.robots = data.robots || [];
+    data.robots.forEach((r) => { if (r.homeNode === undefined) r.homeNode = null; });
     data.orders = data.orders || [];
     return data;
   } catch (e) {
@@ -144,6 +145,10 @@ function apiRequest(settings, method, apiPath, body) {
   });
 }
 
+// Correlation id marking the trailing "go to the waiting spot" milestone, so the
+// customer-facing progress screen can tell parking apart from the actual delivery.
+const WAITING_SPOT_TAG = 'waitingSpot';
+
 // A resource id is only usable if it is a real, concrete id — never a UI sentinel
 // such as "" (auto) or "__capable__" (app picks a capable robot).
 function usableResourceId(value) {
@@ -185,7 +190,21 @@ function buildRelayPayloads(legs, stations, orderId, unitId) {
       }
       return milestone;
     });
+    // The next leg waits for this leg's last *delivery* milestone — not for the
+    // robot to finish parking afterwards.
     previousMilestoneId = milestones[milestones.length - 1].id;
+
+    // Waiting spot: once this robot's work is done, send it to its home node.
+    // Marked with a correlation so the order-progress screen can ignore it.
+    const park = leg.parkNode;
+    if (park && park.id) {
+      milestones.push({
+        id: crypto.randomUUID(),
+        action: 'MOVE',
+        address: { system: park.system || 'STATION', id: park.id },
+        correlations: [...correlations, { kind: 'gradionStep', id: WAITING_SPOT_TAG }]
+      });
+    }
 
     const job = {
       id: crypto.randomUUID(),

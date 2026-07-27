@@ -352,6 +352,13 @@ function eligibleRobotsForProduct(product) {
 // Per-step robot override. Empty/absent means "use the job-level default".
 const STEP_INHERIT = '';
 
+// Trailing "drive to the waiting spot" milestones are tagged by the main process
+// so they can be kept out of the customer's delivery progress.
+const WAITING_SPOT_TAG = 'waitingSpot';
+function isWaitingSpotMilestone(m) {
+  return (m.correlations || []).some((c) => c.id === WAITING_SPOT_TAG);
+}
+
 // Resolves the robot for a single step, honouring only robots allowed at that
 // step's own station (a relay leg needs access to its own stations, not the whole route).
 function resolveStepResource(product, step, index) {
@@ -375,6 +382,16 @@ function stepHasOverride(step) {
   return !!(step.resourceId && step.resourceId !== STEP_INHERIT);
 }
 
+// The robot's configured waiting spot, appended as a trailing MOVE so it parks
+// itself once its part of the route is done. Only possible when we know which
+// robot runs the leg — an unassigned leg is chosen by SYNAOS, so it has no home.
+function parkNodeFor(resourceId) {
+  if (!resourceId) return null;
+  const robot = (store.robots || []).find((r) => r.id === resourceId);
+  const home = robot && robot.homeNode;
+  return home && home.id ? { id: home.id, system: home.system || 'STATION' } : null;
+}
+
 // Splits a product's route into legs — one per robot. Consecutive steps sharing a
 // robot stay in one job; a change of robot starts a new job (SYNAOS executes every
 // milestone of a job with the same resource, so a relay must be several jobs).
@@ -382,12 +399,13 @@ function buildLegsForUnit(product, index) {
   const steps = product.steps || [];
   const warnings = new Set();
   const plain = (s) => ({ stationRef: s.stationRef, action: s.action });
+  const withPark = (legs) => legs.map((l) => ({ ...l, parkNode: parkNodeFor(l.resourceId) }));
 
   // No per-step overrides → one robot for the whole route (unchanged behaviour)
   if (!steps.some(stepHasOverride)) {
     const { resourceId, fellBack } = resolveResourceForUnit(product, index);
     if (fellBack) warnings.add(fellBack);
-    return { legs: [{ resourceId, steps: steps.map(plain) }], warnings: [...warnings] };
+    return { legs: withPark([{ resourceId, steps: steps.map(plain) }]), warnings: [...warnings] };
   }
 
   const legs = [];
@@ -398,7 +416,7 @@ function buildLegsForUnit(product, index) {
     if (last && last.resourceId === resourceId) last.steps.push(plain(step));
     else legs.push({ resourceId, steps: [plain(step)] });
   });
-  return { legs, warnings: [...warnings] };
+  return { legs: withPark(legs), warnings: [...warnings] };
 }
 
 // A robot change mid-route means the load is physically handed over, which only
@@ -537,7 +555,10 @@ async function pollOnce() {
       const d = liveJobs[j.jobId];
       if (!d) return false;
       if (d.status === 'FINISHED_SUCCESS' || d.finishedExternally) return true;
-      return (d.milestones || []).every((m) => milestonePhase(m) === 4);
+      // The order is delivered once the delivery milestones are done; the robot
+      // driving off to its waiting spot afterwards must not hold the order open.
+      return (d.milestones || []).filter((m) => !isWaitingSpotMilestone(m))
+        .every((m) => milestonePhase(m) === 4);
     });
     const anyFailed = createdJobs.some((j) => {
       const d = liveJobs[j.jobId];
@@ -1144,6 +1165,17 @@ function renderAdminStations() {
           </div>
           <div class="desc">Supports: ${escapeHtml((r.supportedJobTypes || []).join(', ') || '—')}</div>
           ${cannot.length ? `<div class="desc" style="color:#d64545;">✖ Cannot reach: ${escapeHtml(cannot.join(', '))}</div>` : ''}
+          <div class="form-grid" style="margin-top:10px;">
+            <label class="fld">Waiting spot — node id
+              <input class="inp" data-robot-home-id="${escapeHtml(r.id)}" value="${escapeHtml((r.homeNode && r.homeNode.id) || '')}" placeholder="e.g. 00">
+            </label>
+            <label class="fld">Waiting spot — navigation graph
+              <input class="inp" data-robot-home-sys="${escapeHtml(r.id)}" value="${escapeHtml((r.homeNode && r.homeNode.system) || '')}" placeholder="e.g. TUSK/NODES">
+            </label>
+          </div>
+          <span class="fld-hint">${(r.homeNode && r.homeNode.id)
+            ? `After finishing its part of an order, ${escapeHtml(r.id)} drives to <b>${escapeHtml(r.homeNode.id)}</b> on <b>${escapeHtml(r.homeNode.system || 'STATION')}</b>.`
+            : 'Leave empty to let the robot stay where it finished.'}</span>
           <div class="row-actions" style="margin-top:8px;">
             <button class="link-btn danger" data-robot-del="${escapeHtml(r.id)}">Remove</button>
           </div>
@@ -1202,6 +1234,18 @@ function renderAdminStations() {
     await persist();
     renderAdminStations();
   }));
+  const setHome = async (rid, patch) => {
+    const robot = (store.robots || []).find((r) => r.id === rid);
+    if (!robot) return;
+    const home = { id: '', system: '', ...(robot.homeNode || {}), ...patch };
+    robot.homeNode = home.id.trim() ? { id: home.id.trim(), system: (home.system || '').trim() || 'STATION' } : null;
+    await persist();
+    renderAdminStations();
+  };
+  $$('[data-robot-home-id]', body).forEach((el) =>
+    el.addEventListener('change', () => setHome(el.dataset.robotHomeId, { id: el.value })));
+  $$('[data-robot-home-sys]', body).forEach((el) =>
+    el.addEventListener('change', () => setHome(el.dataset.robotHomeSys, { system: el.value })));
   $$('[data-robot-del]', body).forEach((el) => el.addEventListener('click', () => {
     const rid = el.dataset.robotDel;
     confirmModal('Remove robot?', `${rid} will be removed from the list and from any station's allowed robots.`, async () => {

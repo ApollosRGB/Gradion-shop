@@ -2,7 +2,7 @@
 
 A Shopee-style desktop ordering app that dispatches **SYNAOS intralogistics jobs** (AGV transport orders) through the SYNAOS Job Management API. Built with Electron for Windows and macOS, with light/dark mode and separate **user** and **admin** interfaces.
 
-![status](https://img.shields.io/badge/version-1.4.0-e0563f)
+![status](https://img.shields.io/badge/version-1.5.0-e0563f)
 
 ## Features
 
@@ -20,6 +20,7 @@ A Shopee-style desktop ordering app that dispatches **SYNAOS intralogistics jobs
 - **Stations** — map a friendly name + **function** (production, storage, shop, charging…) to a SYNAOS station address ID used in job milestones. **Add from SYNAOS** reads the real station addresses the tenant uses (derived from the job-manager, the only data reachable with Basic auth — the layout/fleet services sit behind an OAuth2 gateway), so you don't hand-type IDs.
 - **Robots** — **Read from SYNAOS** lists the transport resources (AGVs) the tenant uses, with their mode and supported job types. **Add robot by id** registers robots discovery can't see (it only finds robots already used in jobs), validated live against SYNAOS — ids are case-sensitive.
 - **Robot ↔ station access** — each station has an *allowed robots* list. The app also mines job history for `UNABLE_TO_ACCESS_ADDRESS` and marks those robots ✖ for that station. A product's robot dropdown only offers robots that can reach **every** station on its route; the rest are disabled with the reason. Products default to **“Auto — only robots that can reach these stations”**, which pins a capable robot (spread across them) instead of leaving it to the SYNAOS scheduler, which has been observed picking unreachable robots. A pinned-but-incapable robot is never sent — the job degrades to scheduler assignment with a warning.
+- **Waiting spots** — each robot can be given a home node on its navigation graph (e.g. `00` on `TUSK/NODES`). Once a robot finishes its part of an order, the app appends a `MOVE` to that node at the end of *its* job, so it parks itself. The trailing move is tagged with a correlation and excluded from the customer's progress, and the next robot in a relay waits on the previous robot's last **delivery** milestone — not on it finishing parking. Robots left to the SYNAOS scheduler get no waiting spot, since the app can't know which robot will run the leg.
 - **Settings** — SYNAOS connection (base URL, username, password) with a **Test connection** button, plus a **change admin password** form and dark-mode toggle.
 - Admin is locked behind a password (default `Ts13`) that can only be changed from within the admin session.
 
@@ -42,8 +43,8 @@ Authentication is HTTP Basic. All admin configuration (products, stations, price
 ## Download
 
 Grab the latest installers from the [Releases page](../../releases):
-- **Windows** — `GradionShop-Setup-1.4.0.exe`
-- **macOS** — `GradionShop-1.4.0.dmg`
+- **Windows** — `GradionShop-Setup-1.5.0.exe`
+- **macOS** — `GradionShop-1.5.0.dmg`
 
 ## Development
 
