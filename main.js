@@ -152,34 +152,57 @@ function usableResourceId(value) {
   return id;
 }
 
-function buildJobPayload(product, stations, orderId, unitId, resourceId) {
-  const jobId = crypto.randomUUID();
+// A SYNAOS job is executed by exactly one transport resource ("All milestones will
+// be executed by the same transport resource"), so a route that uses several robots
+// must be split into one job per robot. Consecutive legs are chained with a milestone
+// dependency, so a leg cannot start approaching until the previous leg has FINISHED.
+//
+// legs: [{ resourceId, steps: [{ stationRef, action }] }]
+function buildRelayPayloads(legs, stations, orderId, unitId) {
   const correlations = [
     { kind: 'order', id: orderId },
     { kind: 'orderUnit', id: unitId }
   ];
-  const milestones = product.steps.map((step) => {
-    const st = stations.find((s) => s.id === step.stationRef);
-    return {
+  const jobs = [];
+  let previousMilestoneId = null;
+
+  legs.forEach((leg, legIndex) => {
+    const milestones = leg.steps.map((step, stepIndex) => {
+      const st = stations.find((s) => s.id === step.stationRef);
+      const milestone = {
+        id: crypto.randomUUID(),
+        action: step.action,
+        address: { system: (st && st.system) || 'STATION', id: st ? st.stationId : step.stationRef },
+        correlations
+      };
+      // Hand-off: the first milestone of a follow-on leg waits for the previous leg
+      if (stepIndex === 0 && previousMilestoneId) {
+        milestone.dependencies = [{
+          predecessorId: previousMilestoneId,
+          requiredPredecessorStatus: 'FINISHED',
+          blockedQualification: 'APPROACHING_ALLOWED'
+        }];
+      }
+      return milestone;
+    });
+    previousMilestoneId = milestones[milestones.length - 1].id;
+
+    const job = {
       id: crypto.randomUUID(),
-      action: step.action,
-      address: { system: (st && st.system) || 'STATION', id: st ? st.stationId : step.stationRef },
-      correlations
+      milestones,
+      executeMilestonesInProvidedSequence: true,
+      correlations: [{ kind: 'SCHEDULER', id: 'SYNAOS-JOBS' }, ...correlations],
+      scheduling: { scheduler: 'SYNAOS-JOBS' }
     };
+    // Pin this leg to its robot. The renderer resolves which robot may serve each
+    // station; anything else (auto, sentinels, blanks) is left to the SYNAOS scheduler.
+    const pinned = usableResourceId(leg.resourceId);
+    if (pinned) job.assignedResourceId = pinned;
+
+    jobs.push({ payload: job, legIndex, totalLegs: legs.length });
   });
-  const job = {
-    id: jobId,
-    milestones,
-    executeMilestonesInProvidedSequence: true,
-    correlations: [{ kind: 'SCHEDULER', id: 'SYNAOS-JOBS' }, ...correlations],
-    scheduling: { scheduler: 'SYNAOS-JOBS' }
-  };
-  // Optionally pin the job to a specific transport resource (robot).
-  // The renderer resolves which robot may serve this product's stations; anything
-  // else (auto, sentinels, blanks) is left unassigned so the SYNAOS scheduler decides.
-  const pinned = usableResourceId(resourceId);
-  if (pinned) job.assignedResourceId = pinned;
-  return job;
+
+  return jobs;
 }
 
 // ---------------------------------------------------------------------------
@@ -235,8 +258,11 @@ function registerIpc() {
             const events = (m.eventHistory || []).map((e) => e.name);
             // SYNAOS reports an unreachable address as an execution-stopped reason
             const unreachable = /UNABLE_TO_ACCESS_ADDRESS/i.test(m.executionStoppedReason || '');
+            // A job/milestone closed by a human ("finished externally") proves nothing
+            // about the robot's reach, so it must never count as positive evidence.
+            const externally = m.finishedExternally === true || job.finishedExternally === true;
             if (unreachable) noteCap(key, rid, 'no');
-            else if (events.includes('MILESTONE_FINISHED')) noteCap(key, rid, 'ok');
+            else if (events.includes('MILESTONE_FINISHED') && !externally) noteCap(key, rid, 'ok');
           }
         }
       }
@@ -259,7 +285,10 @@ function registerIpc() {
     return { ok: true, status: res.status, jobCount: jobs.length, stations, robots, capability };
   });
 
-  // Creates one SYNAOS job per ordered unit. Returns created job descriptors.
+  // Creates the SYNAOS jobs for each ordered unit — one job per robot leg.
+  // Legs are posted in order because a follow-on leg references the previous leg's
+  // milestone id; if a leg fails, the unit's remaining legs are skipped so we never
+  // leave a dangling dependency pointing at a milestone that was never created.
   ipcMain.handle('api:createOrderJobs', async (_ev, { orderId, units }) => {
     const store = loadStore();
     const results = [];
@@ -269,26 +298,45 @@ function registerIpc() {
         results.push({ unitId: unit.unitId, ok: false, error: 'Unknown product' });
         continue;
       }
-      const payload = buildJobPayload(product, store.stations, orderId, unit.unitId, unit.resourceId);
-      const res = await apiRequest(store.settings, 'POST', '/api/v1/jobs', payload);
-      if (res.ok) {
-        // Best-effort: register an Operation so the job shows up in the SYNAOS frontend
-        apiRequest(store.settings, 'POST', '/api/v1/operations', {
-          id: crypto.randomUUID(),
-          name: product.name,
-          filter: { id: payload.id, kind: 'jobId' },
-          type: 'Job',
-          icon: 'JOB'
+      const legs = Array.isArray(unit.legs) && unit.legs.length
+        ? unit.legs
+        : [{ resourceId: unit.resourceId, steps: product.steps }];
+
+      const planned = buildRelayPayloads(legs, store.stations, orderId, unit.unitId);
+      let aborted = false;
+      for (const { payload, legIndex, totalLegs } of planned) {
+        if (aborted) {
+          results.push({
+            unitId: unit.unitId, legIndex, totalLegs, ok: false, jobId: payload.id,
+            assignedResourceId: payload.assignedResourceId || null,
+            error: 'Skipped — an earlier leg of this item could not be created'
+          });
+          continue;
+        }
+        const res = await apiRequest(store.settings, 'POST', '/api/v1/jobs', payload);
+        if (res.ok) {
+          // Best-effort: register an Operation so the job shows up in the SYNAOS frontend
+          apiRequest(store.settings, 'POST', '/api/v1/operations', {
+            id: crypto.randomUUID(),
+            name: totalLegs > 1 ? `${product.name} (leg ${legIndex + 1}/${totalLegs})` : product.name,
+            filter: { id: payload.id, kind: 'jobId' },
+            type: 'Job',
+            icon: 'JOB'
+          });
+        } else {
+          aborted = true;
+        }
+        results.push({
+          unitId: unit.unitId,
+          legIndex,
+          totalLegs,
+          ok: res.ok,
+          status: res.status,
+          jobId: payload.id,
+          assignedResourceId: payload.assignedResourceId || null,
+          error: res.ok ? null : res.error || (res.raw ? String(res.raw).slice(0, 300) : `HTTP ${res.status}`)
         });
       }
-      results.push({
-        unitId: unit.unitId,
-        ok: res.ok,
-        status: res.status,
-        jobId: payload.id,
-        assignedResourceId: payload.assignedResourceId || null,
-        error: res.ok ? null : res.error || (res.raw ? String(res.raw).slice(0, 300) : `HTTP ${res.status}`)
-      });
     }
     return results;
   });

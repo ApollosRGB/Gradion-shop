@@ -201,9 +201,9 @@ async function onFinish() {
     if (!p) return;
     itemsSnapshot.push({ productId: p.id, name: p.name, price: p.price, qty: c.qty, image: p.image, steps: p.steps });
     for (let i = 0; i < c.qty; i++) {
-      const { resourceId, fellBack: fb } = resolveResourceForUnit(p, i);
-      if (fb) fellBack.add(`${p.name}|${fb}`);
-      units.push({ unitId: uid('u'), productId: p.id, resourceId });
+      const { legs, warnings } = buildLegsForUnit(p, i);
+      warnings.forEach((w) => fellBack.add(`${p.name}|${w}`));
+      units.push({ unitId: uid('u'), productId: p.id, legs, resourceId: legs[0] ? legs[0].resourceId : null });
     }
   });
 
@@ -225,14 +225,21 @@ async function onFinish() {
   }
 
   const anyOk = results.some((r) => r.ok);
-  const jobs = results.map((r, i) => ({
-    unitId: units[i].unitId,
-    productId: units[i].productId,
-    jobId: r.jobId,
-    created: r.ok,
-    assignedResourceId: r.assignedResourceId || null,
-    error: r.error || null
-  }));
+  // One unit can produce several jobs (one per robot leg), so match on unitId
+  // rather than position.
+  const jobs = results.map((r) => {
+    const unit = units.find((u) => u.unitId === r.unitId);
+    return {
+      unitId: r.unitId,
+      productId: unit ? unit.productId : null,
+      jobId: r.jobId,
+      created: r.ok,
+      assignedResourceId: r.assignedResourceId || null,
+      legIndex: r.legIndex || 0,
+      totalLegs: r.totalLegs || 1,
+      error: r.error || null
+    };
+  });
 
   // Count each ordered item toward the product's "sold" total once the order is placed
   if (anyOk) {
@@ -293,7 +300,9 @@ function allRobotIds() {
   return (store.robots || []).map((r) => r.id);
 }
 
-// Robots permitted at a single station
+// May this robot be assigned here at all? Permissive: the admin's allow-list when
+// set, otherwise anything SYNAOS has not proved incapable (✖). A robot with no
+// history here is allowed — it simply has not been tried yet.
 function robotsAllowedAtStation(st) {
   const all = allRobotIds();
   if (Array.isArray(st.allowedRobots) && st.allowedRobots.length) {
@@ -303,30 +312,119 @@ function robotsAllowedAtStation(st) {
   return all.filter((id) => !(cap.no || []).includes(id));
 }
 
-// Robots able to serve *every* station in a product's route.
-// Returns the eligible ids plus, for each excluded robot, the station that excluded it.
+// Which robot should the app pick when told to choose automatically? Stricter:
+// prefer robots that have actually completed a milestone here (✓), because SYNAOS
+// has been seen auto-assigning an untried robot that then failed with
+// UNABLE_TO_ACCESS_ADDRESS. Never used to veto an explicit choice by the admin.
+function robotsPreferredAtStation(st) {
+  const allowed = robotsAllowedAtStation(st);
+  if (Array.isArray(st.allowedRobots) && st.allowedRobots.length) return allowed;
+  const cap = (store.capability || {})[stationKeyOf(st)] || { ok: [], no: [] };
+  const proven = allowed.filter((id) => (cap.ok || []).includes(id));
+  return proven.length ? proven : allowed;
+}
+
+// Robots able to serve *every* station a product's job-level default covers.
+// Steps with their own robot are excluded — they do not constrain the default.
+// `preferred` narrows to proven robots and is what auto-selection uses.
 function eligibleRobotsForProduct(product) {
   const all = allRobotIds();
   const blockedAt = {};
   let eligible = null;
-  (product.steps || []).forEach((step) => {
+  let preferred = null;
+  const steps = (product.steps || []).filter((s) => !stepHasOverride(s));
+  const scope = steps.length ? steps : (product.steps || []);
+  scope.forEach((step) => {
     const st = store.stations.find((s) => s.id === step.stationRef);
     if (!st) return;
     const allowed = robotsAllowedAtStation(st);
+    const pref = robotsPreferredAtStation(st);
     all.forEach((id) => { if (!allowed.includes(id) && !blockedAt[id]) blockedAt[id] = st.name; });
     eligible = eligible === null ? allowed.slice() : eligible.filter((id) => allowed.includes(id));
+    preferred = preferred === null ? pref.slice() : preferred.filter((id) => pref.includes(id));
   });
-  return { eligible: eligible === null ? all : eligible, blockedAt };
+  const elig = eligible === null ? all : eligible;
+  let pref = preferred === null ? all : preferred;
+  if (!pref.length) pref = elig;   // never let the preference filter strand a route
+  return { eligible: elig, preferred: pref, blockedAt };
+}
+
+// Per-step robot override. Empty/absent means "use the job-level default".
+const STEP_INHERIT = '';
+
+// Resolves the robot for a single step, honouring only robots allowed at that
+// step's own station (a relay leg needs access to its own stations, not the whole route).
+function resolveStepResource(product, step, index) {
+  const raw = step.resourceId;
+  const choice = (raw === undefined || raw === null || raw === STEP_INHERIT)
+    ? (product.resourceId || AUTO_ANY)
+    : raw;
+  const st = store.stations.find((s) => s.id === step.stationRef);
+  if (choice === AUTO_CAPABLE) {
+    const preferred = st ? robotsPreferredAtStation(st) : [];
+    if (!preferred.length) return { resourceId: null, fellBack: 'no-capable' };
+    return { resourceId: preferred[index % preferred.length], fellBack: null };
+  }
+  if (choice === AUTO_ANY) return { resourceId: null, fellBack: null };
+  const allowed = st ? robotsAllowedAtStation(st) : [];
+  if (!allowed.includes(choice)) return { resourceId: null, fellBack: 'incapable' };
+  return { resourceId: choice, fellBack: null };
+}
+
+function stepHasOverride(step) {
+  return !!(step.resourceId && step.resourceId !== STEP_INHERIT);
+}
+
+// Splits a product's route into legs — one per robot. Consecutive steps sharing a
+// robot stay in one job; a change of robot starts a new job (SYNAOS executes every
+// milestone of a job with the same resource, so a relay must be several jobs).
+function buildLegsForUnit(product, index) {
+  const steps = product.steps || [];
+  const warnings = new Set();
+  const plain = (s) => ({ stationRef: s.stationRef, action: s.action });
+
+  // No per-step overrides → one robot for the whole route (unchanged behaviour)
+  if (!steps.some(stepHasOverride)) {
+    const { resourceId, fellBack } = resolveResourceForUnit(product, index);
+    if (fellBack) warnings.add(fellBack);
+    return { legs: [{ resourceId, steps: steps.map(plain) }], warnings: [...warnings] };
+  }
+
+  const legs = [];
+  steps.forEach((step) => {
+    const { resourceId, fellBack } = resolveStepResource(product, step, index);
+    if (fellBack) warnings.add(fellBack);
+    const last = legs[legs.length - 1];
+    if (last && last.resourceId === resourceId) last.steps.push(plain(step));
+    else legs.push({ resourceId, steps: [plain(step)] });
+  });
+  return { legs, warnings: [...warnings] };
+}
+
+// A robot change mid-route means the load is physically handed over, which only
+// works if the outgoing robot DROPs and the incoming robot PICKs at the same station.
+function handoverIssues(product) {
+  const steps = product.steps || [];
+  const label = (s) => (stepHasOverride(s) ? s.resourceId : '(job default)');
+  const issues = [];
+  for (let i = 1; i < steps.length; i++) {
+    if (label(steps[i]) === label(steps[i - 1])) continue;
+    const prev = steps[i - 1], cur = steps[i];
+    if (prev.action !== 'DROP' || cur.action !== 'PICK' || prev.stationRef !== cur.stationRef) {
+      issues.push(`Steps ${i} → ${i + 1} change robot, so they need a hand-over: step ${i} should be <b>DROP</b> and step ${i + 1} a <b>PICK</b> at the same station.`);
+    }
+  }
+  return issues;
 }
 
 // Decides the robot for one ordered unit. Never returns a robot that cannot
 // serve the route — an unreachable or unknown choice degrades to the scheduler.
 function resolveResourceForUnit(product, index) {
   const choice = product.resourceId || AUTO_ANY;
-  const { eligible } = eligibleRobotsForProduct(product);
+  const { eligible, preferred } = eligibleRobotsForProduct(product);
   if (choice === AUTO_CAPABLE) {
-    if (!eligible.length) return { resourceId: null, fellBack: 'no-capable' };
-    return { resourceId: eligible[index % eligible.length], fellBack: null };
+    if (!preferred.length) return { resourceId: null, fellBack: 'no-capable' };
+    return { resourceId: preferred[index % preferred.length], fellBack: null };
   }
   if (choice === AUTO_ANY) return { resourceId: null, fellBack: null };
   if (!eligible.includes(choice)) return { resourceId: null, fellBack: 'incapable' };
@@ -833,13 +931,47 @@ function renderProductEditor(body) {
     resourceHint = `<span class="fld-hint">Can reach this route: <b>${escapeHtml(elig.eligible.join(', '))}</b>.</span>`;
   }
 
-  const stepsHtml = p.steps.map((s, i) => `
+  // Per-step robot options: only robots allowed at that step's own station
+  const stepRobotOpts = (step) => {
+    const st = store.stations.find((x) => x.id === step.stationRef);
+    const allowed = st ? robotsAllowedAtStation(st) : [];
+    const blocked = allRobotIds().filter((id) => !allowed.includes(id));
+    const sel = step.resourceId || STEP_INHERIT;
+    return [
+      `<option value="" ${sel === STEP_INHERIT ? 'selected' : ''}>Same as job</option>`,
+      `<option value="${AUTO_CAPABLE}" ${sel === AUTO_CAPABLE ? 'selected' : ''}>Auto — capable here</option>`,
+      ...allowed.map((id) => `<option value="${escapeHtml(id)}" ${sel === id ? 'selected' : ''}>${escapeHtml(id)}</option>`),
+      ...blocked.map((id) => `<option value="${escapeHtml(id)}" disabled>${escapeHtml(id)} — no access</option>`)
+    ].join('');
+  };
+
+  const stepsHtml = p.steps.map((s, i) => {
+    const changesRobot = i > 0 &&
+      (stepHasOverride(s) ? s.resourceId : '(job default)') !==
+      (stepHasOverride(p.steps[i - 1]) ? p.steps[i - 1].resourceId : '(job default)');
+    return `
+    ${changesRobot ? '<div class="leg-divider"><span>🤝 hand-over — new robot / new job</span></div>' : ''}
     <div class="step-editor-row">
       <span class="chip">${i + 1}</span>
       <select class="inp" data-step-station="${i}">${stationOpts(s.stationRef)}</select>
-      <select class="inp" data-step-action="${i}" style="max-width:130px;">${actionOpts(s.action)}</select>
+      <select class="inp" data-step-action="${i}" style="max-width:120px;">${actionOpts(s.action)}</select>
+      <select class="inp" data-step-robot="${i}" style="max-width:190px;" title="Robot for this step">${stepRobotOpts(s)}</select>
       <button class="link-btn danger" data-step-del="${i}" ${p.steps.length <= 1 ? 'style="visibility:hidden;"' : ''}>Remove</button>
-    </div>`).join('');
+    </div>`;
+  }).join('');
+
+  // Preview of how the route will be split into jobs
+  const previewLegs = buildLegsForUnit(p, 0).legs;
+  const legPreview = previewLegs.length > 1
+    ? `<div class="leg-preview">This route will be sent as <b>${previewLegs.length} chained jobs</b>:
+        ${previewLegs.map((l, i) => `<div class="leg-line"><span class="chip">Job ${i + 1}</span> <b>${escapeHtml(l.resourceId || 'SYNAOS decides')}</b> — ${escapeHtml(l.steps.map((x) => `${stationName(x.stationRef)}·${x.action}`).join(' → '))}</div>`).join('')}
+        <span class="fld-hint">Each job starts only after the previous one has finished.</span>
+      </div>`
+    : '';
+  const issues = handoverIssues(p);
+  const issuesHtml = issues.length
+    ? `<div class="handover-warn">⚠️ ${issues.join('<br>⚠️ ')}</div>`
+    : '';
 
   body.innerHTML = `
     <div class="panel">
@@ -883,9 +1015,11 @@ function renderProductEditor(body) {
         </div>
       </div>
       <h2 style="margin-top:22px;">Job milestones (process)</h2>
-      <p class="hint">The AGV executes these in order. Each step = a station + an action.</p>
+      <p class="hint">Executed in order. Each step = station + action + the robot that performs it. A step set to a different robot starts a new chained job, because SYNAOS runs every milestone of one job with the same robot.</p>
       <div class="steps-editor" id="stepsEditor">${stepsHtml}</div>
       <button class="link-btn add-step" id="addStep" style="margin-top:8px;">+ Add step</button>
+      ${issuesHtml}
+      ${legPreview}
       <div class="progress-actions" style="margin-top:20px;">
         <button class="btn btn-primary" id="saveProduct">Save</button>
         <button class="btn btn-secondary" id="cancelProduct">Cancel</button>
@@ -899,11 +1033,21 @@ function renderProductEditor(body) {
   $('#f-sold').addEventListener('input', (e) => p.sold = parseInt(e.target.value) || 0);
   $('#f-visible').addEventListener('change', (e) => p.visible = e.target.checked);
   $('#f-resource').addEventListener('change', (e) => { p.resourceId = e.target.value || null; renderAdmin(); });
-  $$('[data-step-station]', body).forEach((el) => el.addEventListener('change', (e) => p.steps[+el.dataset.stepStation].stationRef = e.target.value));
-  $$('[data-step-action]', body).forEach((el) => el.addEventListener('change', (e) => p.steps[+el.dataset.stepAction].action = e.target.value));
+  // Re-render on step edits: changing a station or action changes which robots are
+  // allowed there and whether a hand-over boundary is still valid.
+  $$('[data-step-station]', body).forEach((el) => el.addEventListener('change', (e) => {
+    p.steps[+el.dataset.stepStation].stationRef = e.target.value; renderAdmin();
+  }));
+  $$('[data-step-action]', body).forEach((el) => el.addEventListener('change', (e) => {
+    p.steps[+el.dataset.stepAction].action = e.target.value; renderAdmin();
+  }));
+  $$('[data-step-robot]', body).forEach((el) => el.addEventListener('change', (e) => {
+    p.steps[+el.dataset.stepRobot].resourceId = e.target.value || STEP_INHERIT;
+    renderAdmin();
+  }));
   $$('[data-step-del]', body).forEach((el) => el.addEventListener('click', () => { p.steps.splice(+el.dataset.stepDel, 1); renderAdmin(); }));
   $('#addStep').addEventListener('click', () => {
-    p.steps.push({ stationRef: store.stations[0] ? store.stations[0].id : '', action: 'MOVE' });
+    p.steps.push({ stationRef: store.stations[0] ? store.stations[0].id : '', action: 'MOVE', resourceId: STEP_INHERIT });
     renderAdmin();
   });
   $('#f-pickimg').addEventListener('click', async () => {
@@ -972,7 +1116,9 @@ function renderAdminStations() {
           </div>
           <span class="fld-hint">${(s.allowedRobots || []).length
             ? 'Only the ticked robots may be assigned here.'
-            : 'None ticked = any robot except those SYNAOS proved cannot reach it (✖).'}</span>
+            : (((store.capability || {})[stationKeyOf(s)] || {}).ok || []).length
+              ? 'None ticked = only robots proven to work here (✓) are used. Tick to override.'
+              : 'None ticked = any robot except those SYNAOS proved cannot reach it (✖).'}</span>
         </div>
         <div class="row-actions" style="margin-top:8px;">
           <button class="link-btn danger" data-st-del="${s.id}">Delete station</button>
