@@ -45,6 +45,16 @@ async function boot() {
 }
 
 function wireChrome() {
+  // The relay supervisor runs in the main process; refresh when it creates the
+  // next leg of a hand-over so the progress screen tracks the new job.
+  if (window.api.onRelayChanged) {
+    window.api.onRelayChanged(async () => {
+      const fresh = await window.api.storeGet();
+      store.pendingRelays = fresh.pendingRelays || [];
+      if (currentView === 'progress') pollOnce();
+      if (currentView === 'admin' && adminTab === 'settings') renderAdmin();
+    });
+  }
   $('#themeToggle').addEventListener('click', toggleTheme);
   $('#adminToggle').addEventListener('click', onAdminToggle);
   $$('.nav-btn').forEach((b) =>
@@ -1374,6 +1384,7 @@ function openDiscoverModal(res) {
 function renderAdminSettings() {
   const body = $('#adminBody');
   const s = store.settings;
+  const a = s.arm || {};
   body.innerHTML = `
     <div class="panel">
       <h2>SYNAOS connection</h2>
@@ -1394,6 +1405,57 @@ function renderAdminSettings() {
         <button class="btn btn-secondary" id="testConn">Test connection</button>
         <span class="api-status" id="connStatus"><span class="dot"></span> Not tested</span>
       </div>
+    </div>
+    <div class="panel">
+      <h2>Robotic arm (MQTT)</h2>
+      <p class="hint">When a route changes robot, the arm moves the load between the two AGVs at the hand-over station. The receiving AGV's job is only created once the arm reports the transfer done.</p>
+      <label class="fld switch" style="margin-bottom:14px;">
+        <input type="checkbox" id="a-enabled" ${a.enabled ? 'checked' : ''}> Use the robotic arm for hand-overs
+      </label>
+      <div class="form-grid">
+        <label class="fld full">Broker URL
+          <input class="inp" id="a-url" value="${escapeHtml(a.brokerUrl || '')}" placeholder="mqtt://192.168.1.50:1883">
+          <span class="fld-hint">mqtt:// · mqtts:// (TLS) · ws:// · wss:// are all supported.</span>
+        </label>
+        <label class="fld">Username
+          <input class="inp" id="a-user" value="${escapeHtml(a.username || '')}" placeholder="(optional)">
+        </label>
+        <label class="fld">Password
+          <input class="inp" id="a-pass" type="password" value="${escapeHtml(a.password || '')}" placeholder="(optional)">
+        </label>
+        <label class="fld">Command topic
+          <input class="inp" id="a-cmd" value="${escapeHtml(a.commandTopic || '')}" placeholder="arm/command">
+        </label>
+        <label class="fld">Status topic
+          <input class="inp" id="a-stat" value="${escapeHtml(a.statusTopic || '')}" placeholder="arm/status">
+        </label>
+        <label class="fld full">Command payload
+          <textarea class="inp" id="a-tpl" rows="6" spellcheck="false">${escapeHtml(a.payloadTemplate || '')}</textarea>
+          <span class="fld-hint">Placeholders: <code>{from}</code> <code>{to}</code> <code>{orderId}</code> <code>{unitId}</code> <code>{transferId}</code> — rename the JSON fields to whatever the arm expects.</span>
+        </label>
+        <label class="fld">Status field
+          <input class="inp" id="a-sfield" value="${escapeHtml(a.statusField || '')}" placeholder="status">
+          <span class="fld-hint">JSON field to read. Leave blank to match the raw text.</span>
+        </label>
+        <label class="fld">“Finished” value
+          <input class="inp" id="a-sdone" value="${escapeHtml(a.statusDoneValue || '')}" placeholder="done">
+        </label>
+        <label class="fld">Transfer-id field
+          <input class="inp" id="a-smatch" value="${escapeHtml(a.statusMatchField || '')}" placeholder="transferId">
+          <span class="fld-hint">If the arm echoes this back, statuses are matched to the right transfer.</span>
+        </label>
+        <label class="fld">Timeout (seconds)
+          <input class="inp" id="a-timeout" type="number" min="5" step="5" value="${Number(a.timeoutSeconds) || 120}">
+          <span class="fld-hint">If the arm stays silent this long, the order continues anyway.</span>
+        </label>
+      </div>
+      <div class="progress-actions" style="margin-top:16px; align-items:center; flex-wrap:wrap;">
+        <button class="btn btn-secondary" id="saveArm">Save arm settings</button>
+        <button class="btn btn-secondary" id="testArm">Test connection</button>
+        <button class="btn btn-secondary" id="testArmPub">Send test transfer</button>
+        <span class="api-status" id="armStatus"><span class="dot"></span> Not tested</span>
+      </div>
+      <div id="armLog" class="arm-log"></div>
     </div>
     <div class="panel">
       <h2>Admin password</h2>
@@ -1431,6 +1493,57 @@ function renderAdminSettings() {
     if (res.ok) status.innerHTML = '<span class="dot ok"></span> Connected (HTTP ' + res.status + ')';
     else status.innerHTML = `<span class="dot bad"></span> Failed (${res.error || 'HTTP ' + res.status})`;
   });
+  // ---- Robotic arm ----
+  const readArmForm = () => ({
+    enabled: $('#a-enabled').checked,
+    brokerUrl: $('#a-url').value.trim(),
+    username: $('#a-user').value,
+    password: $('#a-pass').value,
+    commandTopic: $('#a-cmd').value.trim(),
+    statusTopic: $('#a-stat').value.trim(),
+    payloadTemplate: $('#a-tpl').value,
+    statusField: $('#a-sfield').value.trim(),
+    statusDoneValue: $('#a-sdone').value.trim(),
+    statusMatchField: $('#a-smatch').value.trim(),
+    timeoutSeconds: parseInt($('#a-timeout').value, 10) || 120
+  });
+  const armStatusEl = () => $('#armStatus');
+  const showArmLog = async () => {
+    const st = await window.api.armStatus();
+    const rows = (st.log || []).map((l) =>
+      `<div class="arm-log-row"><span class="dir ${l.direction}">${l.direction === 'out' ? '▲ sent' : '▼ recv'}</span>
+        <code>${escapeHtml(l.topic)}</code><span class="msg">${escapeHtml(l.message)}</span></div>`).join('');
+    const pend = (st.pending || []).map((p) =>
+      `<div class="arm-log-row"><span class="dir">⏳</span><span class="msg">${escapeHtml(p.productName)} — leg ${p.leg}/${p.totalLegs}, ${escapeHtml(p.state)}${p.lastError ? ' — ' + escapeHtml(p.lastError) : ''}</span></div>`).join('');
+    $('#armLog').innerHTML = (pend ? `<div class="arm-log-title">Hand-overs in progress</div>${pend}` : '')
+      + (rows ? `<div class="arm-log-title">Recent MQTT traffic</div>${rows}` : '');
+  };
+
+  $('#saveArm').addEventListener('click', async () => {
+    store.settings.arm = Object.assign({}, store.settings.arm, readArmForm());
+    await persist();
+    toast('Arm settings saved', 'success');
+  });
+  $('#testArm').addEventListener('click', async () => {
+    armStatusEl().innerHTML = '<span class="dot"></span> Connecting…';
+    const res = await window.api.armTest(readArmForm());
+    armStatusEl().innerHTML = res.ok
+      ? `<span class="dot ok"></span> Connected${res.subscribed ? ' · subscribed to ' + escapeHtml(res.subscribed) : ''}`
+      : `<span class="dot bad"></span> ${escapeHtml(res.error || 'Failed')}`;
+    showArmLog();
+  });
+  $('#testArmPub').addEventListener('click', async () => {
+    armStatusEl().innerHTML = '<span class="dot"></span> Publishing test transfer…';
+    const res = await window.api.armTestPublish(readArmForm());
+    armStatusEl().innerHTML = res.ok
+      ? (res.via === 'status'
+        ? '<span class="dot ok"></span> Arm confirmed the transfer'
+        : `<span class="dot bad"></span> Published, but no confirmation (${escapeHtml(res.via)})`)
+      : `<span class="dot bad"></span> ${escapeHtml(res.error || 'Failed')}`;
+    showArmLog();
+  });
+  showArmLog();
+
   $('#changePass').addEventListener('click', async () => {
     const a = $('#s-newpass').value, b = $('#s-newpass2').value;
     if (!a) { toast('Enter a new password.', 'error'); return; }

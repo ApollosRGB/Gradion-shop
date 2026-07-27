@@ -9,5 +9,9 @@ contextBridge.exposeInMainWorld('api', {
   createOrderJobs: (payload) => ipcRenderer.invoke('api:createOrderJobs', payload),
   getJob: (jobId) => ipcRenderer.invoke('api:getJob', jobId),
   discardJob: (jobId) => ipcRenderer.invoke('api:discardJob', jobId),
-  pickImage: () => ipcRenderer.invoke('dialog:pickImage')
+  pickImage: () => ipcRenderer.invoke('dialog:pickImage'),
+  armTest: (arm) => ipcRenderer.invoke('arm:test', arm),
+  armTestPublish: (arm) => ipcRenderer.invoke('arm:testPublish', arm),
+  armStatus: () => ipcRenderer.invoke('arm:status'),
+  onRelayChanged: (fn) => ipcRenderer.on('relay:changed', () => fn())
 });

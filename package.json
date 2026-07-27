@@ -1,7 +1,7 @@
 {
   "name": "treat-stand-order-app",
   "productName": "Gradion Shop",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "Gradion Shop — Shopee-style order app driving SYNAOS intralogistics jobs (AGV transport orders).",
   "main": "main.js",
   "author": "ApollosRGB",
@@ -12,6 +12,7 @@
     "dist:mac": "electron-builder --mac"
   },
   "devDependencies": {
+    "aedes": "^0.51.3",
     "electron": "^33.2.0",
     "electron-builder": "^25.1.8"
   },
@@ -56,5 +57,8 @@
     "dmg": {
       "artifactName": "GradionShop-${version}.${ext}"
     }
+  },
+  "dependencies": {
+    "mqtt": "^5.15.2"
   }
 }

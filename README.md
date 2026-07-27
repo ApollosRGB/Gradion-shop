@@ -2,7 +2,7 @@
 
 A Shopee-style desktop ordering app that dispatches **SYNAOS intralogistics jobs** (AGV transport orders) through the SYNAOS Job Management API. Built with Electron for Windows and macOS, with light/dark mode and separate **user** and **admin** interfaces.
 
-![status](https://img.shields.io/badge/version-1.5.0-e0563f)
+![status](https://img.shields.io/badge/version-1.6.0-e0563f)
 
 ## Features
 
@@ -21,6 +21,7 @@ A Shopee-style desktop ordering app that dispatches **SYNAOS intralogistics jobs
 - **Robots** — **Read from SYNAOS** lists the transport resources (AGVs) the tenant uses, with their mode and supported job types. **Add robot by id** registers robots discovery can't see (it only finds robots already used in jobs), validated live against SYNAOS — ids are case-sensitive.
 - **Robot ↔ station access** — each station has an *allowed robots* list. The app also mines job history for `UNABLE_TO_ACCESS_ADDRESS` and marks those robots ✖ for that station. A product's robot dropdown only offers robots that can reach **every** station on its route; the rest are disabled with the reason. Products default to **“Auto — only robots that can reach these stations”**, which pins a capable robot (spread across them) instead of leaving it to the SYNAOS scheduler, which has been observed picking unreachable robots. A pinned-but-incapable robot is never sent — the job degrades to scheduler assignment with a warning.
 - **Waiting spots** — each robot can be given a home node on its navigation graph (e.g. `00` on `TUSK/NODES`). Once a robot finishes its part of an order, the app appends a `MOVE` to that node at the end of *its* job, so it parks itself. The trailing move is tagged with a correlation and excluded from the customer's progress, and the next robot in a relay waits on the previous robot's last **delivery** milestone — not on it finishing parking. Robots left to the SYNAOS scheduler get no waiting spot, since the app can't know which robot will run the leg.
+- **Robotic arm (MQTT)** — a hand-over between two AGVs is a physical transfer, performed by a robotic arm on an MQTT broker. Configure the broker URL (`mqtt://`, `mqtts://`, `ws://`, `wss://`), optional credentials, the command and status topics, and a **payload template** with `{from}` `{to}` `{orderId}` `{unitId}` `{transferId}` placeholders so the JSON matches whatever the arm expects. With the arm enabled, only the first leg of a relay is dispatched; when the outgoing AGV's `DROP` finishes the app publishes the transfer command, waits for the arm to report done on the status topic (matched by transfer id), and only then creates the receiving AGV's job — so an AGV can never arrive before the goods have been moved. A configurable timeout stops a silent arm from wedging an order. **Test connection** and **Send test transfer** verify the setup without placing an order, and a live log shows recent MQTT traffic and hand-overs in progress. The supervisor runs in the main process, so it keeps going even if the customer leaves the progress screen, and resumes hand-overs left in flight after a restart.
 - **Settings** — SYNAOS connection (base URL, username, password) with a **Test connection** button, plus a **change admin password** form and dark-mode toggle.
 - Admin is locked behind a password (default `Ts13`) that can only be changed from within the admin session.
 
@@ -43,8 +44,8 @@ Authentication is HTTP Basic. All admin configuration (products, stations, price
 ## Download
 
 Grab the latest installers from the [Releases page](../../releases):
-- **Windows** — `GradionShop-Setup-1.5.0.exe`
-- **macOS** — `GradionShop-1.5.0.dmg`
+- **Windows** — `GradionShop-Setup-1.6.0.exe`
+- **macOS** — `GradionShop-1.6.0.dmg`
 
 ## Development
 
@@ -59,7 +60,7 @@ Cross-platform installers are produced automatically by the **Build & Release** 
 
 ## Tech
 
-Electron • context-isolated preload IPC • no external runtime dependencies • Node's built-in `https` for the API client.
+Electron • context-isolated preload IPC • Node's built-in `https` for the SYNAOS API client • [`mqtt`](https://www.npmjs.com/package/mqtt) for the robotic arm (the only runtime dependency).
 
 ## License
 
