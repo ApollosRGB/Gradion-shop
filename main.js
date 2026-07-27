@@ -19,10 +19,11 @@ function defaultStore() {
       apiPassword: 'X#jzd.0sdc20b0q#MYa"'
     },
     stations: [
-      { id: 'st-k2', stationId: 'K2', name: 'Production', fn: 'production', system: 'STATION' },
-      { id: 'st-k1', stationId: 'K1', name: 'Shop', fn: 'shop', system: 'STATION' }
+      { id: 'st-k2', stationId: 'K2', name: 'Production', fn: 'production', system: 'STATION', allowedRobots: [] },
+      { id: 'st-k1', stationId: 'K1', name: 'Shop', fn: 'shop', system: 'STATION', allowedRobots: [] }
     ],
     robots: [],
+    capability: {},
     products: [
       {
         id: 'p-pen',
@@ -65,7 +66,11 @@ function loadStore() {
     const def = defaultStore();
     data.settings = Object.assign(def.settings, data.settings || {});
     data.stations = data.stations || def.stations;
-    data.stations.forEach((s) => { if (!s.system) s.system = 'STATION'; });
+    data.stations.forEach((s) => {
+      if (!s.system) s.system = 'STATION';
+      if (!Array.isArray(s.allowedRobots)) s.allowedRobots = [];
+    });
+    data.capability = data.capability || {};
     data.products = data.products || def.products;
     // Seed rating counters so the displayed rating can become a running average
     data.products.forEach((p) => { if (p.ratingCount == null) p.ratingCount = p.sold || 0; });
@@ -139,7 +144,15 @@ function apiRequest(settings, method, apiPath, body) {
   });
 }
 
-function buildJobPayload(product, stations, orderId, unitId) {
+// A resource id is only usable if it is a real, concrete id — never a UI sentinel
+// such as "" (auto) or "__capable__" (app picks a capable robot).
+function usableResourceId(value) {
+  const id = typeof value === 'string' ? value.trim() : '';
+  if (!id || id.startsWith('__')) return null;
+  return id;
+}
+
+function buildJobPayload(product, stations, orderId, unitId, resourceId) {
   const jobId = crypto.randomUUID();
   const correlations = [
     { kind: 'order', id: orderId },
@@ -161,8 +174,11 @@ function buildJobPayload(product, stations, orderId, unitId) {
     correlations: [{ kind: 'SCHEDULER', id: 'SYNAOS-JOBS' }, ...correlations],
     scheduling: { scheduler: 'SYNAOS-JOBS' }
   };
-  // Optionally pin the job to a specific transport resource (robot) chosen by the admin
-  if (product.resourceId) job.assignedResourceId = product.resourceId;
+  // Optionally pin the job to a specific transport resource (robot).
+  // The renderer resolves which robot may serve this product's stations; anything
+  // else (auto, sentinels, blanks) is left unassigned so the SYNAOS scheduler decides.
+  const pinned = usableResourceId(resourceId);
+  if (pinned) job.assignedResourceId = pinned;
   return job;
 }
 
@@ -196,6 +212,15 @@ function registerIpc() {
     const jobs = Array.isArray(res.data) ? res.data : [];
     const stationMap = new Map();   // id -> Set(systems)
     const robotSet = new Set();
+    // Evidence of which robot can / cannot reach which station, mined from job history.
+    // capability[stationKey] = { ok: [robotIds], no: [robotIds] }
+    const capability = {};
+    const noteCap = (stationKey, robot, kind) => {
+      if (!capability[stationKey]) capability[stationKey] = { ok: [], no: [] };
+      const bucket = capability[stationKey][kind];
+      if (!bucket.includes(robot)) bucket.push(robot);
+    };
+
     for (const job of jobs) {
       if (job.assignedResourceId) robotSet.add(job.assignedResourceId);
       for (const m of job.milestones || []) {
@@ -203,6 +228,16 @@ function registerIpc() {
         if (a && a.id != null) {
           if (!stationMap.has(a.id)) stationMap.set(a.id, new Set());
           stationMap.get(a.id).add(a.system || 'STATION');
+
+          const rid = job.assignedResourceId;
+          if (rid) {
+            const key = `${a.id}@${a.system || 'STATION'}`;
+            const events = (m.eventHistory || []).map((e) => e.name);
+            // SYNAOS reports an unreachable address as an execution-stopped reason
+            const unreachable = /UNABLE_TO_ACCESS_ADDRESS/i.test(m.executionStoppedReason || '');
+            if (unreachable) noteCap(key, rid, 'no');
+            else if (events.includes('MILESTONE_FINISHED')) noteCap(key, rid, 'ok');
+          }
         }
       }
     }
@@ -221,7 +256,7 @@ function registerIpc() {
         live: rm.ok
       });
     }
-    return { ok: true, status: res.status, jobCount: jobs.length, stations, robots };
+    return { ok: true, status: res.status, jobCount: jobs.length, stations, robots, capability };
   });
 
   // Creates one SYNAOS job per ordered unit. Returns created job descriptors.
@@ -234,7 +269,7 @@ function registerIpc() {
         results.push({ unitId: unit.unitId, ok: false, error: 'Unknown product' });
         continue;
       }
-      const payload = buildJobPayload(product, store.stations, orderId, unit.unitId);
+      const payload = buildJobPayload(product, store.stations, orderId, unit.unitId, unit.resourceId);
       const res = await apiRequest(store.settings, 'POST', '/api/v1/jobs', payload);
       if (res.ok) {
         // Best-effort: register an Operation so the job shows up in the SYNAOS frontend
@@ -251,10 +286,30 @@ function registerIpc() {
         ok: res.ok,
         status: res.status,
         jobId: payload.id,
+        assignedResourceId: payload.assignedResourceId || null,
         error: res.ok ? null : res.error || (res.raw ? String(res.raw).slice(0, 300) : `HTTP ${res.status}`)
       });
     }
     return results;
+  });
+
+  // Confirms a transport resource really exists in SYNAOS.
+  // The resource-mode endpoint answers 200 for a real robot and 404 otherwise,
+  // which is the only fleet lookup reachable with Basic auth. Ids are case-sensitive.
+  ipcMain.handle('api:validateResource', async (_ev, resourceId) => {
+    const store = loadStore();
+    const id = String(resourceId || '').trim();
+    if (!id) return { ok: false, exists: false, error: 'Enter a robot id.' };
+    const rm = await apiRequest(store.settings, 'GET', `/api/v1/resources/${encodeURIComponent(id)}/resource-mode`);
+    if (rm.status === 404) return { ok: true, exists: false, id };
+    if (!rm.ok) return { ok: false, exists: false, id, error: rm.error || `HTTP ${rm.status}` };
+    return {
+      ok: true,
+      exists: true,
+      id,
+      mode: rm.data ? rm.data.resourceMode : null,
+      supportedJobTypes: rm.data ? rm.data.supportedJobTypes : null
+    };
   });
 
   ipcMain.handle('api:getJob', async (_ev, jobId) => {

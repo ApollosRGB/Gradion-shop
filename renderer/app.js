@@ -195,13 +195,23 @@ async function onFinish() {
   const orderId = uid('ord');
   const units = [];
   const itemsSnapshot = [];
+  const fellBack = new Set();
   cart.forEach((c) => {
     const p = store.products.find((x) => x.id === c.productId);
     if (!p) return;
     itemsSnapshot.push({ productId: p.id, name: p.name, price: p.price, qty: c.qty, image: p.image, steps: p.steps });
     for (let i = 0; i < c.qty; i++) {
-      units.push({ unitId: uid('u'), productId: p.id });
+      const { resourceId, fellBack: fb } = resolveResourceForUnit(p, i);
+      if (fb) fellBack.add(`${p.name}|${fb}`);
+      units.push({ unitId: uid('u'), productId: p.id, resourceId });
     }
+  });
+
+  fellBack.forEach((entry) => {
+    const [name, why] = entry.split('|');
+    toast(why === 'incapable'
+      ? `${name}: the assigned robot can't reach those stations — letting SYNAOS choose instead.`
+      : `${name}: no robot is known to reach those stations — letting SYNAOS choose.`, 'error');
   });
 
   let results = [];
@@ -220,6 +230,7 @@ async function onFinish() {
     productId: units[i].productId,
     jobId: r.jobId,
     created: r.ok,
+    assignedResourceId: r.assignedResourceId || null,
     error: r.error || null
   }));
 
@@ -260,6 +271,66 @@ async function onFinish() {
 
   btn.textContent = 'Finish & Send to Robot';
   openProgress(orderId);
+}
+
+// ===========================================================================
+// Robot ↔ station access
+//
+// SYNAOS will not tell us over Basic auth which robot can reach which station,
+// and its scheduler has been observed assigning a robot that then reports
+// UNABLE_TO_ACCESS_ADDRESS. So access is decided from two sources:
+//   1. the admin's explicit per-station allow-list (authoritative when set), and
+//   2. evidence mined from job history (a robot that failed with
+//      UNABLE_TO_ACCESS_ADDRESS at a station is never offered for it again).
+// ===========================================================================
+const AUTO_ANY = '';              // let SYNAOS pick (may pick an unreachable robot)
+const AUTO_CAPABLE = '__capable__'; // app picks a robot known to reach every station
+
+function stationKeyOf(st) {
+  return `${st.stationId}@${st.system || 'STATION'}`;
+}
+function allRobotIds() {
+  return (store.robots || []).map((r) => r.id);
+}
+
+// Robots permitted at a single station
+function robotsAllowedAtStation(st) {
+  const all = allRobotIds();
+  if (Array.isArray(st.allowedRobots) && st.allowedRobots.length) {
+    return all.filter((id) => st.allowedRobots.includes(id));
+  }
+  const cap = (store.capability || {})[stationKeyOf(st)] || { ok: [], no: [] };
+  return all.filter((id) => !(cap.no || []).includes(id));
+}
+
+// Robots able to serve *every* station in a product's route.
+// Returns the eligible ids plus, for each excluded robot, the station that excluded it.
+function eligibleRobotsForProduct(product) {
+  const all = allRobotIds();
+  const blockedAt = {};
+  let eligible = null;
+  (product.steps || []).forEach((step) => {
+    const st = store.stations.find((s) => s.id === step.stationRef);
+    if (!st) return;
+    const allowed = robotsAllowedAtStation(st);
+    all.forEach((id) => { if (!allowed.includes(id) && !blockedAt[id]) blockedAt[id] = st.name; });
+    eligible = eligible === null ? allowed.slice() : eligible.filter((id) => allowed.includes(id));
+  });
+  return { eligible: eligible === null ? all : eligible, blockedAt };
+}
+
+// Decides the robot for one ordered unit. Never returns a robot that cannot
+// serve the route — an unreachable or unknown choice degrades to the scheduler.
+function resolveResourceForUnit(product, index) {
+  const choice = product.resourceId || AUTO_ANY;
+  const { eligible } = eligibleRobotsForProduct(product);
+  if (choice === AUTO_CAPABLE) {
+    if (!eligible.length) return { resourceId: null, fellBack: 'no-capable' };
+    return { resourceId: eligible[index % eligible.length], fellBack: null };
+  }
+  if (choice === AUTO_ANY) return { resourceId: null, fellBack: null };
+  if (!eligible.includes(choice)) return { resourceId: null, fellBack: 'incapable' };
+  return { resourceId: choice, fellBack: null };
 }
 
 // ===========================================================================
@@ -749,6 +820,19 @@ function renderProductEditor(body) {
   const actions = ['PICK', 'DROP', 'MOVE', 'PROVIDE'];
   const actionOpts = (sel) => actions.map((a) => `<option value="${a}" ${a === sel ? 'selected' : ''}>${a}</option>`).join('');
 
+  // Which robots may serve this product's whole route
+  const elig = eligibleRobotsForProduct(p);
+  let resourceHint;
+  if (!allRobotIds().length) {
+    resourceHint = `<span class="fld-hint">No robots known yet — use <b>Read from SYNAOS</b> or <b>Add robot by ID</b> on the Stations tab.</span>`;
+  } else if (!elig.eligible.length) {
+    resourceHint = `<span class="fld-hint warn">⚠️ No known robot can reach every station on this route. Check the allowed robots for each station.</span>`;
+  } else if (!p.resourceId || p.resourceId === AUTO_ANY) {
+    resourceHint = `<span class="fld-hint warn">⚠️ With plain Auto, SYNAOS may pick a robot that can't reach these stations. Robots that can: <b>${escapeHtml(elig.eligible.join(', '))}</b>.</span>`;
+  } else {
+    resourceHint = `<span class="fld-hint">Can reach this route: <b>${escapeHtml(elig.eligible.join(', '))}</b>.</span>`;
+  }
+
   const stepsHtml = p.steps.map((s, i) => `
     <div class="step-editor-row">
       <span class="chip">${i + 1}</span>
@@ -776,10 +860,16 @@ function renderProductEditor(body) {
         </label>
         <label class="fld full">Assign robot (transport resource)
           <select class="inp" id="f-resource">
-            <option value="">Auto — let SYNAOS choose</option>
-            ${(store.robots || []).map((r) => `<option value="${escapeHtml(r.id)}" ${p.resourceId === r.id ? 'selected' : ''}>${escapeHtml(r.id)}${r.mode ? ' (' + escapeHtml(r.mode) + ')' : ''}</option>`).join('')}
-            ${p.resourceId && !(store.robots || []).some((r) => r.id === p.resourceId) ? `<option value="${escapeHtml(p.resourceId)}" selected>${escapeHtml(p.resourceId)}</option>` : ''}
+            <option value="${AUTO_CAPABLE}" ${p.resourceId === AUTO_CAPABLE ? 'selected' : ''}>Auto — only robots that can reach these stations (recommended)</option>
+            <option value="" ${!p.resourceId || p.resourceId === AUTO_ANY ? 'selected' : ''}>Auto — let SYNAOS choose (may pick an unreachable robot)</option>
+            ${elig.eligible.map((id) => {
+              const r = (store.robots || []).find((x) => x.id === id) || { id };
+              return `<option value="${escapeHtml(id)}" ${p.resourceId === id ? 'selected' : ''}>${escapeHtml(id)}${r.mode ? ' (' + escapeHtml(r.mode) + ')' : ''}</option>`;
+            }).join('')}
+            ${Object.keys(elig.blockedAt).map((id) =>
+              `<option value="${escapeHtml(id)}" disabled>${escapeHtml(id)} — can't reach ${escapeHtml(elig.blockedAt[id])}</option>`).join('')}
           </select>
+          ${resourceHint}
         </label>
         <label class="fld switch full">
           <input type="checkbox" id="f-visible" ${p.visible ? 'checked' : ''}> Show this job to users
@@ -808,7 +898,7 @@ function renderProductEditor(body) {
   $('#f-rating').addEventListener('input', (e) => p.rating = parseFloat(e.target.value) || 0);
   $('#f-sold').addEventListener('input', (e) => p.sold = parseInt(e.target.value) || 0);
   $('#f-visible').addEventListener('change', (e) => p.visible = e.target.checked);
-  $('#f-resource').addEventListener('change', (e) => p.resourceId = e.target.value || null);
+  $('#f-resource').addEventListener('change', (e) => { p.resourceId = e.target.value || null; renderAdmin(); });
   $$('[data-step-station]', body).forEach((el) => el.addEventListener('change', (e) => p.steps[+el.dataset.stepStation].stationRef = e.target.value));
   $$('[data-step-action]', body).forEach((el) => el.addEventListener('change', (e) => p.steps[+el.dataset.stepAction].action = e.target.value));
   $$('[data-step-del]', body).forEach((el) => el.addEventListener('click', () => { p.steps.splice(+el.dataset.stepDel, 1); renderAdmin(); }));
@@ -866,6 +956,24 @@ function renderAdminStations() {
             <input class="inp" data-st-sys="${s.id}" value="${escapeHtml(s.system || 'STATION')}">
           </label>
         </div>
+        <div class="fld" style="margin-top:10px;">
+          Robots allowed at this station
+          <div class="robot-chips">
+            ${allRobotIds().length ? allRobotIds().map((rid) => {
+              const cap = (store.capability || {})[stationKeyOf(s)] || { ok: [], no: [] };
+              const provenNo = (cap.no || []).includes(rid);
+              const provenOk = (cap.ok || []).includes(rid);
+              const on = (s.allowedRobots || []).includes(rid);
+              return `<label class="robot-chip ${on ? 'on' : ''} ${provenNo ? 'proven-no' : ''}" title="${provenNo ? 'SYNAOS reported UNABLE_TO_ACCESS_ADDRESS for this robot here' : provenOk ? 'Confirmed by a finished job' : ''}">
+                <input type="checkbox" data-st-robot="${s.id}" value="${escapeHtml(rid)}" ${on ? 'checked' : ''}>
+                ${escapeHtml(rid)}${provenNo ? ' ✖' : provenOk ? ' ✓' : ''}
+              </label>`;
+            }).join('') : '<span class="hint">No robots known yet.</span>'}
+          </div>
+          <span class="fld-hint">${(s.allowedRobots || []).length
+            ? 'Only the ticked robots may be assigned here.'
+            : 'None ticked = any robot except those SYNAOS proved cannot reach it (✖).'}</span>
+        </div>
         <div class="row-actions" style="margin-top:8px;">
           <button class="link-btn danger" data-st-del="${s.id}">Delete station</button>
         </div>
@@ -874,18 +982,29 @@ function renderAdminStations() {
 
   const robots = store.robots || [];
   const robotsHtml = robots.length
-    ? robots.map((r) => `
+    ? robots.map((r) => {
+      // Stations this robot is barred from, according to SYNAOS job history
+      const cannot = Object.entries(store.capability || {})
+        .filter(([, v]) => (v.no || []).includes(r.id))
+        .map(([k]) => k.split('@')[0]);
+      return `
       <div class="admin-item">
         <div class="thumb">🤖</div>
         <div class="grow">
           <div class="title-row">
             <span class="nm">${escapeHtml(r.id)}</span>
             ${r.mode ? `<span class="chip on">${escapeHtml(r.mode)}</span>` : '<span class="chip off">unknown mode</span>'}
+            <span class="chip">${r.source === 'manual' ? 'added manually' : 'discovered'}</span>
           </div>
           <div class="desc">Supports: ${escapeHtml((r.supportedJobTypes || []).join(', ') || '—')}</div>
+          ${cannot.length ? `<div class="desc" style="color:#d64545;">✖ Cannot reach: ${escapeHtml(cannot.join(', '))}</div>` : ''}
+          <div class="row-actions" style="margin-top:8px;">
+            <button class="link-btn danger" data-robot-del="${escapeHtml(r.id)}">Remove</button>
+          </div>
         </div>
-      </div>`).join('')
-    : '<p class="hint">No robots loaded yet. Click “Read from SYNAOS” to fetch the transport resources this tenant is using.</p>';
+      </div>`;
+    }).join('')
+    : '<p class="hint">No robots loaded yet. Click “Read from SYNAOS”, or add one by id below.</p>';
 
   body.innerHTML = `
     <div class="panel">
@@ -902,8 +1021,9 @@ function renderAdminStations() {
         <h2>Robots (transport resources)</h2>
         <button class="btn btn-secondary" id="syncSynaos2">⟳ Read from SYNAOS</button>
       </div>
-      <p class="hint">The AGVs/robots SYNAOS is using. A product can be pinned to a specific robot in its job settings, or left to the SYNAOS scheduler.</p>
+      <p class="hint">The AGVs/robots SYNAOS is using. Discovery only finds robots that already appear in jobs — add any others by id. ✖ marks stations SYNAOS reported the robot cannot reach.</p>
       <div class="admin-list">${robotsHtml}</div>
+      <button class="btn btn-primary" id="addRobot" style="margin-top:16px;">+ Add robot by id</button>
     </div>`;
 
   $$('[data-st-name]', body).forEach((el) => el.addEventListener('change', async (e) => {
@@ -925,13 +1045,56 @@ function renderAdminStations() {
       renderAdminStations();
     });
   }));
+  $$('[data-st-robot]', body).forEach((el) => el.addEventListener('change', async () => {
+    const st = store.stations.find((s) => s.id === el.dataset.stRobot);
+    st.allowedRobots = st.allowedRobots || [];
+    if (el.checked) {
+      if (!st.allowedRobots.includes(el.value)) st.allowedRobots.push(el.value);
+    } else {
+      st.allowedRobots = st.allowedRobots.filter((r) => r !== el.value);
+    }
+    await persist();
+    renderAdminStations();
+  }));
+  $$('[data-robot-del]', body).forEach((el) => el.addEventListener('click', () => {
+    const rid = el.dataset.robotDel;
+    confirmModal('Remove robot?', `${rid} will be removed from the list and from any station's allowed robots.`, async () => {
+      store.robots = (store.robots || []).filter((r) => r.id !== rid);
+      store.stations.forEach((s) => { s.allowedRobots = (s.allowedRobots || []).filter((x) => x !== rid); });
+      store.products.forEach((p) => { if (p.resourceId === rid) p.resourceId = AUTO_CAPABLE; });
+      await persist();
+      renderAdminStations();
+    });
+  }));
+  $('#addRobot').addEventListener('click', addRobotByIdFlow);
   $('#addStation').addEventListener('click', async () => {
-    store.stations.push({ id: uid('st'), stationId: 'NEW', name: 'New station', fn: 'other', system: 'STATION' });
+    store.stations.push({ id: uid('st'), stationId: 'NEW', name: 'New station', fn: 'other', system: 'STATION', allowedRobots: [] });
     await persist();
     renderAdminStations();
   });
   $('#syncSynaos').addEventListener('click', discoverFromSynaosFlow);
   $('#syncSynaos2').addEventListener('click', discoverFromSynaosFlow);
+}
+
+// Adds a robot that discovery cannot see, verifying the id against SYNAOS first.
+function addRobotByIdFlow() {
+  promptModal('Add robot by id', 'SYNAOS transport resource id (case-sensitive, e.g. kuka01)', 'text', '', async (val, close, setErr) => {
+    const id = (val || '').trim();
+    if (!id) { setErr('Enter a robot id.'); return; }
+    if ((store.robots || []).some((r) => r.id === id)) { setErr('That robot is already in the list.'); return; }
+    setErr('Checking with SYNAOS…');
+    const res = await window.api.validateResource(id);
+    if (!res.ok) { setErr('Could not reach SYNAOS: ' + (res.error || 'unknown error')); return; }
+    if (!res.exists) { setErr(`SYNAOS has no resource “${id}”. Ids are case-sensitive.`); return; }
+    store.robots = store.robots || [];
+    store.robots.push({
+      id, mode: res.mode, supportedJobTypes: res.supportedJobTypes, live: true, source: 'manual'
+    });
+    await persist();
+    close();
+    renderAdminStations();
+    toast(`Added ${id} (${res.mode || 'unknown mode'})`, 'success');
+  });
 }
 
 // Reads stations + robots live from SYNAOS and opens an import picker
@@ -951,8 +1114,14 @@ async function discoverFromSynaosFlow() {
     renderAdminStations();
     return;
   }
-  // Cache robots immediately
-  store.robots = res.robots || [];
+  // Cache robots + learned station access immediately.
+  // Discovered robots are merged in, so manually added ones (e.g. a robot that has
+  // never appeared in a job) are never dropped.
+  const manual = (store.robots || []).filter((r) => r.source === 'manual');
+  const discovered = (res.robots || []).map((r) => ({ ...r, source: 'discovered' }));
+  const seen = new Set(discovered.map((r) => r.id));
+  store.robots = [...discovered, ...manual.filter((r) => !seen.has(r.id))];
+  store.capability = res.capability || {};
   await persist();
   openDiscoverModal(res);
 }
