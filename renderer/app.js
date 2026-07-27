@@ -392,6 +392,13 @@ function stepHasOverride(step) {
   return !!(step.resourceId && step.resourceId !== STEP_INHERIT);
 }
 
+// A hand-over tells the robotic arm to move the load between two AGVs. It is an
+// app-level instruction placed in the route by the operator, never a SYNAOS
+// milestone, and the arm only runs where one of these appears.
+function isHandoverStep(step) {
+  return step && step.kind === 'handover';
+}
+
 // The robot's configured waiting spot, appended as a trailing MOVE so it parks
 // itself once its part of the route is done. Only possible when we know which
 // robot runs the leg — an unassigned leg is chosen by SYNAOS, so it has no home.
@@ -406,26 +413,39 @@ function parkNodeFor(resourceId) {
 // robot stay in one job; a change of robot starts a new job (SYNAOS executes every
 // milestone of a job with the same resource, so a relay must be several jobs).
 function buildLegsForUnit(product, index) {
-  const steps = product.steps || [];
+  const allSteps = product.steps || [];
+  const steps = allSteps.filter((s) => !isHandoverStep(s));
   const warnings = new Set();
   const plain = (s) => ({ stationRef: s.stationRef, action: s.action });
   const withPark = (legs) => legs.map((l) => ({ ...l, parkNode: parkNodeFor(l.resourceId) }));
 
-  // No per-step overrides → one robot for the whole route (unchanged behaviour)
-  if (!steps.some(stepHasOverride)) {
+  // No per-step overrides and no hand-overs → one robot for the whole route
+  if (!steps.some(stepHasOverride) && !allSteps.some(isHandoverStep)) {
     const { resourceId, fellBack } = resolveResourceForUnit(product, index);
     if (fellBack) warnings.add(fellBack);
     return { legs: withPark([{ resourceId, steps: steps.map(plain) }]), warnings: [...warnings] };
   }
 
   const legs = [];
-  steps.forEach((step) => {
+  let pendingHandover = null;   // hand-over that must run before the next leg
+  allSteps.forEach((step) => {
+    // A hand-over is an instruction to the arm, not a SYNAOS milestone: it ends
+    // the current leg and gates the next one.
+    if (isHandoverStep(step)) {
+      pendingHandover = { method: step.method || 'grasp', quantity: Number(step.quantity) > 0 ? Number(step.quantity) : 1 };
+      return;
+    }
     const { resourceId, fellBack } = resolveStepResource(product, step, index);
     if (fellBack) warnings.add(fellBack);
     const last = legs[legs.length - 1];
-    if (last && last.resourceId === resourceId) last.steps.push(plain(step));
-    else legs.push({ resourceId, steps: [plain(step)] });
+    if (last && last.resourceId === resourceId && !pendingHandover) {
+      last.steps.push(plain(step));
+    } else {
+      legs.push({ resourceId, steps: [plain(step)], armBefore: pendingHandover });
+      pendingHandover = null;
+    }
   });
+  if (pendingHandover) warnings.add('handover-last');
   return { legs: withPark(legs), warnings: [...warnings] };
 }
 
@@ -433,15 +453,21 @@ function buildLegsForUnit(product, index) {
 // works if the outgoing robot DROPs and the incoming robot PICKs at the same station.
 function handoverIssues(product) {
   const steps = product.steps || [];
-  const label = (s) => (stepHasOverride(s) ? s.resourceId : '(job default)');
   const issues = [];
-  for (let i = 1; i < steps.length; i++) {
-    if (label(steps[i]) === label(steps[i - 1])) continue;
-    const prev = steps[i - 1], cur = steps[i];
-    if (prev.action !== 'DROP' || cur.action !== 'PICK' || prev.stationRef !== cur.stationRef) {
-      issues.push(`Steps ${i} → ${i + 1} change robot, so they need a hand-over: step ${i} should be <b>DROP</b> and step ${i + 1} a <b>PICK</b> at the same station.`);
+  steps.forEach((step, i) => {
+    if (!isHandoverStep(step)) return;
+    const prev = steps.slice(0, i).reverse().find((s) => !isHandoverStep(s));
+    const next = steps.slice(i + 1).find((s) => !isHandoverStep(s));
+    if (!prev || !next) {
+      issues.push(`Step ${i + 1} is a hand-over but has no step ${prev ? 'after' : 'before'} it — the arm needs a load to move from one AGV to another.`);
+      return;
     }
-  }
+    if (prev.action !== 'DROP' || next.action !== 'PICK') {
+      issues.push(`The hand-over at step ${i + 1} should sit between a <b>DROP</b> and a <b>PICK</b> — the outgoing AGV puts the load down and the incoming one takes it.`);
+    } else if (prev.stationRef !== next.stationRef) {
+      issues.push(`The hand-over at step ${i + 1} drops at <b>${escapeHtml(stationName(prev.stationRef))}</b> but picks up at <b>${escapeHtml(stationName(next.stationRef))}</b>. The arm moves the load between two AGVs at one place, so both should be the same station.`);
+    }
+  });
   return issues;
 }
 
@@ -977,17 +1003,32 @@ function renderProductEditor(body) {
   };
 
   const stepsHtml = p.steps.map((s, i) => {
-    const changesRobot = i > 0 &&
+    if (isHandoverStep(s)) {
+      return `
+      <div class="step-editor-row handover-row">
+        <span class="chip">${i + 1}</span>
+        <span class="handover-label">🤝 Hand-over — robotic arm</span>
+        <label class="inline-fld">method
+          <input class="inp" data-ho-method="${i}" value="${escapeHtml(s.method || 'grasp')}" style="max-width:110px;">
+        </label>
+        <label class="inline-fld">quantity
+          <input class="inp" data-ho-qty="${i}" type="number" min="1" step="1" value="${Number(s.quantity) > 0 ? Number(s.quantity) : 1}" style="max-width:80px;">
+        </label>
+        <button class="link-btn danger" data-step-del="${i}">Remove</button>
+      </div>`;
+    }
+    const prevReal = p.steps.slice(0, i).reverse().find((x) => !isHandoverStep(x));
+    const changesRobot = prevReal &&
       (stepHasOverride(s) ? s.resourceId : '(job default)') !==
-      (stepHasOverride(p.steps[i - 1]) ? p.steps[i - 1].resourceId : '(job default)');
+      (stepHasOverride(prevReal) ? prevReal.resourceId : '(job default)');
     return `
-    ${changesRobot ? '<div class="leg-divider"><span>🤝 hand-over — new robot / new job</span></div>' : ''}
+    ${changesRobot ? '<div class="leg-divider"><span>↕ robot changes — new job</span></div>' : ''}
     <div class="step-editor-row">
       <span class="chip">${i + 1}</span>
       <select class="inp" data-step-station="${i}">${stationOpts(s.stationRef)}</select>
       <select class="inp" data-step-action="${i}" style="max-width:120px;">${actionOpts(s.action)}</select>
       <select class="inp" data-step-robot="${i}" style="max-width:190px;" title="Robot for this step">${stepRobotOpts(s)}</select>
-      <button class="link-btn danger" data-step-del="${i}" ${p.steps.length <= 1 ? 'style="visibility:hidden;"' : ''}>Remove</button>
+      <button class="link-btn danger" data-step-del="${i}" ${p.steps.filter((x) => !isHandoverStep(x)).length <= 1 ? 'style="visibility:hidden;"' : ''}>Remove</button>
     </div>`;
   }).join('');
 
@@ -995,7 +1036,7 @@ function renderProductEditor(body) {
   const previewLegs = buildLegsForUnit(p, 0).legs;
   const legPreview = previewLegs.length > 1
     ? `<div class="leg-preview">This route will be sent as <b>${previewLegs.length} chained jobs</b>:
-        ${previewLegs.map((l, i) => `<div class="leg-line"><span class="chip">Job ${i + 1}</span> <b>${escapeHtml(l.resourceId || 'SYNAOS decides')}</b> — ${escapeHtml(l.steps.map((x) => `${stationName(x.stationRef)}·${x.action}`).join(' → '))}</div>`).join('')}
+        ${previewLegs.map((l, i) => `<div class="leg-line">${l.armBefore ? `<div class="leg-arm">🤝 arm: ${escapeHtml(l.armBefore.method)} ×${l.armBefore.quantity} — the next AGV waits for “${escapeHtml((store.settings.arm || {}).statusDoneValue || 'Finished')}”</div>` : ''}<span class="chip">Job ${i + 1}</span> <b>${escapeHtml(l.resourceId || 'SYNAOS decides')}</b> — ${escapeHtml(l.steps.map((x) => `${stationName(x.stationRef)}·${x.action}`).join(' → '))}${l.parkNode ? ` <span class="chip">then parks at ${escapeHtml(l.parkNode.id)}</span>` : ''}</div>`).join('')}
         <span class="fld-hint">Each job starts only after the previous one has finished.</span>
       </div>`
     : '';
@@ -1048,7 +1089,10 @@ function renderProductEditor(body) {
       <h2 style="margin-top:22px;">Job milestones (process)</h2>
       <p class="hint">Executed in order. Each step = station + action + the robot that performs it. A step set to a different robot starts a new chained job, because SYNAOS runs every milestone of one job with the same robot.</p>
       <div class="steps-editor" id="stepsEditor">${stepsHtml}</div>
-      <button class="link-btn add-step" id="addStep" style="margin-top:8px;">+ Add step</button>
+      <div class="row-actions" style="margin-top:8px;">
+        <button class="link-btn add-step" id="addStep">+ Add step</button>
+        <button class="link-btn add-step" id="addHandover">+ Add hand-over (robotic arm)</button>
+      </div>
       ${issuesHtml}
       ${legPreview}
       <div class="progress-actions" style="margin-top:20px;">
@@ -1081,6 +1125,18 @@ function renderProductEditor(body) {
     p.steps.push({ stationRef: store.stations[0] ? store.stations[0].id : '', action: 'MOVE', resourceId: STEP_INHERIT });
     renderAdmin();
   });
+  $('#addHandover').addEventListener('click', () => {
+    p.steps.push({ kind: 'handover', method: 'grasp', quantity: 1 });
+    renderAdmin();
+  });
+  $$('[data-ho-method]', body).forEach((el) => el.addEventListener('change', (e) => {
+    p.steps[+el.dataset.hoMethod].method = e.target.value.trim() || 'grasp';
+    renderAdmin();
+  }));
+  $$('[data-ho-qty]', body).forEach((el) => el.addEventListener('change', (e) => {
+    p.steps[+el.dataset.hoQty].quantity = Math.max(1, parseInt(e.target.value, 10) || 1);
+    renderAdmin();
+  }));
   $('#f-pickimg').addEventListener('click', async () => {
     const res = await window.api.pickImage();
     if (!res) return;
@@ -1094,7 +1150,8 @@ function renderProductEditor(body) {
   $('#cancelProduct').addEventListener('click', () => { productDraft = null; renderAdmin(); });
   $('#saveProduct').addEventListener('click', async () => {
     if (!p.name.trim()) { toast('Please enter a product name.', 'error'); return; }
-    if (!p.steps.length || p.steps.some((s) => !s.stationRef)) { toast('Each step needs a station.', 'error'); return; }
+    const realSteps = p.steps.filter((s) => !isHandoverStep(s));
+    if (!realSteps.length || realSteps.some((s) => !s.stationRef)) { toast('Each step needs a station.', 'error'); return; }
     delete p._new;
     const idx = store.products.findIndex((x) => x.id === p.id);
     if (idx >= 0) store.products[idx] = p; else store.products.push(p);
@@ -1417,6 +1474,10 @@ function renderAdminSettings() {
           <input class="inp" id="a-url" value="${escapeHtml(a.brokerUrl || '')}" placeholder="mqtt://192.168.1.50:1883">
           <span class="fld-hint">mqtt:// · mqtts:// (TLS) · ws:// · wss:// are all supported.</span>
         </label>
+        <label class="fld switch full">
+          <input type="checkbox" id="a-tlsinsecure" ${a.tlsInsecure ? 'checked' : ''}> Don't validate the broker's TLS certificate
+          <span class="fld-hint">Match this to “Validate certificate” being off in MQTT Explorer.</span>
+        </label>
         <label class="fld">Username
           <input class="inp" id="a-user" value="${escapeHtml(a.username || '')}" placeholder="(optional)">
         </label>
@@ -1497,6 +1558,7 @@ function renderAdminSettings() {
   const readArmForm = () => ({
     enabled: $('#a-enabled').checked,
     brokerUrl: $('#a-url').value.trim(),
+    tlsInsecure: $('#a-tlsinsecure').checked,
     username: $('#a-user').value,
     password: $('#a-pass').value,
     commandTopic: $('#a-cmd').value.trim(),

@@ -21,18 +21,19 @@ function defaultStore() {
       // hand-over station. Credentials are entered by the operator and only
       // ever stored locally.
       arm: {
-        enabled: false,
-        brokerUrl: 'mqtt://localhost:1883',
-        username: '',
-        password: '',
+        enabled: true,
+        brokerUrl: 'mqtts://mqtt.ace.one.stg.synaos.cloud:8883',
+        tlsInsecure: true,           // broker uses TLS but its certificate is not validated
+        username: 'synaos',
+        password: 'MpUWLrfoXlPBC4BXADgYjXtYO',
         clientId: '',
-        commandTopic: 'arm/command',
-        statusTopic: 'arm/status',
-        // Placeholders: {from} {to} {fromStation} {toStation} {orderId} {unitId} {transferId}
-        payloadTemplate: '{\n  "command": "transfer",\n  "from": "{from}",\n  "to": "{to}",\n  "orderId": "{orderId}",\n  "transferId": "{transferId}"\n}',
+        commandTopic: 'Openmind/robot01/cmd',
+        statusTopic: 'Openmind/robot01/status',
+        // Placeholders: {taskId} {method} {quantity} {from} {to} {orderId} {unitId}
+        payloadTemplate: '{\n  "task_id": "{taskId}",\n  "method": "{method}",\n  "quantity": {quantity}\n}',
         statusField: 'status',       // JSON field to read from the status message ('' = match raw text)
-        statusDoneValue: 'done',     // value/substring meaning "transfer finished"
-        statusMatchField: 'transferId', // optional field tying a status back to its transfer
+        statusDoneValue: 'Finished', // value meaning the arm has completed the task
+        statusMatchField: 'task_id', // field tying a status back to its command
         timeoutSeconds: 120          // give up waiting and continue anyway
       }
     },
@@ -193,7 +194,7 @@ function armLog(direction, topic, message) {
 }
 
 function armConfigKey(arm) {
-  return [arm.brokerUrl, arm.username, arm.password, arm.clientId, arm.statusTopic].join('|');
+  return [arm.brokerUrl, arm.username, arm.password, arm.clientId, arm.statusTopic, arm.tlsInsecure].join('|');
 }
 
 // A refused connection surfaces as an AggregateError (one failure per resolved
@@ -228,7 +229,10 @@ function connectArm(arm) {
       clientId: arm.clientId || `gradion-shop-${crypto.randomUUID().slice(0, 8)}`,
       connectTimeout: 8000,
       reconnectPeriod: 5000,
-      clean: true
+      clean: true,
+      // The broker encrypts but presents a certificate that does not validate,
+      // matching "Encryption (tls)" on with "Validate certificate" off.
+      rejectUnauthorized: !arm.tlsInsecure
     });
     armState.client = client;
     armState.url = key;
@@ -286,6 +290,16 @@ function handleArmStatus(arm, text) {
   }
 }
 
+// Sequential task ids in the arm's own style (task-0001, task-0002, …) so its
+// logs line up with ours. The status message echoes this back.
+function nextArmTaskId() {
+  const store = loadStore();
+  const next = (Number(store.armTaskSeq) || 0) + 1;
+  store.armTaskSeq = next;
+  saveStore(store);
+  return `task-${String(next).padStart(4, '0')}`;
+}
+
 function renderArmPayload(template, values) {
   return String(template || '').replace(/\{(\w+)\}/g, (match, key) =>
     (values[key] !== undefined ? String(values[key]) : match));
@@ -303,7 +317,9 @@ async function runArmTransfer(arm, values) {
   if (!arm.statusTopic) return { ok: true, via: 'no-status-topic' };
 
   return new Promise((resolve) => {
-    const waiter = { transferId: values.transferId };
+    // The arm echoes the task id back in its status, so that is what a status
+    // message is matched against.
+    const waiter = { transferId: values.taskId !== undefined ? values.taskId : values.transferId };
     let timer = null;
     waiter.done = (via) => {
       if (!armState.waiters.has(waiter)) return;
@@ -389,7 +405,9 @@ function buildRelayPayloads(legs, stations, orderId, unitId) {
     const pinned = usableResourceId(leg.resourceId);
     if (pinned) job.assignedResourceId = pinned;
 
-    jobs.push({ payload: job, legIndex, totalLegs: legs.length });
+    // armBefore describes a hand-over the operator placed in the route that has
+    // to happen before this leg may start. Absent = no arm involvement.
+    jobs.push({ payload: job, legIndex, totalLegs: legs.length, armBefore: leg.armBefore || null });
   });
 
   return jobs;
@@ -457,32 +475,39 @@ async function runRelaySupervisor() {
       const watch = (jobRes.data.milestones || []).find((m) => m.id === watchId);
       if (!watch || !milestoneIsFinished(watch)) continue;   // AGV has not dropped yet
 
-      // Drop is done — run the transfer, then create the receiving AGV's job.
+      // The outgoing AGV has dropped. Run the hand-over if the operator put one
+      // here, then create the receiving AGV's job.
       const arm = store.settings.arm || {};
-      const transferId = `${relay.unitId}-${relay.nextIndex}`;
-      relay.state = 'arm-running';
-      relay.lastError = null;
-      saveStore(store);
-      notifyRelayChanged();
+      const handover = (relay.armPlan || [])[relay.nextIndex];
+      let armResult = { ok: true, via: 'no-handover' };
 
-      let armResult;
-      try {
-        armResult = await runArmTransfer(arm, {
-          from: (watch.address && watch.address.id) || '',
-          to: (next.milestones[0].address && next.milestones[0].address.id) || '',
-          fromStation: (watch.address && watch.address.id) || '',
-          toStation: (next.milestones[0].address && next.milestones[0].address.id) || '',
-          orderId: relay.orderId,
-          unitId: relay.unitId,
-          transferId
-        });
-      } catch (err) {
-        // Could not reach the broker — leave it queued and retry on the next tick
-        const s = loadStore();
-        const r = (s.pendingRelays || []).find((x) => x.id === relay.id);
-        if (r) { r.state = 'waiting-for-drop'; r.lastError = `Arm unreachable: ${err.message}`; saveStore(s); }
+      if (handover) {
+        relay.state = 'arm-running';
+        relay.lastError = null;
+        saveStore(store);
         notifyRelayChanged();
-        continue;
+
+        try {
+          armResult = await runArmTransfer(arm, {
+            taskId: nextArmTaskId(),
+            method: handover.method || 'grasp',
+            quantity: Number(handover.quantity) > 0 ? Number(handover.quantity) : 1,
+            from: (watch.address && watch.address.id) || '',
+            to: (next.milestones[0].address && next.milestones[0].address.id) || '',
+            fromStation: (watch.address && watch.address.id) || '',
+            toStation: (next.milestones[0].address && next.milestones[0].address.id) || '',
+            orderId: relay.orderId,
+            unitId: relay.unitId,
+            transferId: `${relay.unitId}-${relay.nextIndex}`
+          });
+        } catch (err) {
+          // Could not reach the broker — leave it queued and retry on the next tick
+          const s = loadStore();
+          const r = (s.pendingRelays || []).find((x) => x.id === relay.id);
+          if (r) { r.state = 'waiting-for-drop'; r.lastError = `Arm unreachable: ${err.message}`; saveStore(s); }
+          notifyRelayChanged();
+          continue;
+        }
       }
 
       const fresh = loadStore();
@@ -625,15 +650,15 @@ function registerIpc() {
 
       const planned = buildRelayPayloads(legs, store.stations, orderId, unit.unitId);
 
-      // With the robotic arm in play the load has to be moved between the two
-      // AGVs before the receiving one may pick up, so only the first leg is
-      // dispatched now. The rest are created by the relay supervisor once the
-      // arm reports each transfer done. Ids are already fixed, so the renderer
-      // can track the deferred jobs from the start.
+      // Hand-overs are only performed where the operator put one in the route.
+      // Everything up to the first hand-over goes out now; from that point on
+      // the relay supervisor creates each leg after the arm reports done.
       const armCfg = (store.settings && store.settings.arm) || {};
-      const armGated = !!armCfg.enabled && planned.length > 1;
-      const dispatchNow = armGated ? planned.slice(0, 1) : planned;
-      const deferred = armGated ? planned.slice(1) : [];
+      const armPlan = planned.map((p) => (armCfg.enabled ? p.armBefore : null) || null);
+      const firstGate = armPlan.findIndex((a) => a);
+      const splitAt = firstGate === -1 ? planned.length : firstGate;
+      const dispatchNow = planned.slice(0, splitAt);
+      const deferred = planned.slice(splitAt);
 
       let aborted = false;
       for (const { payload, legIndex, totalLegs } of dispatchNow) {
@@ -678,7 +703,8 @@ function registerIpc() {
           unitId: unit.unitId,
           productName: product.name,
           legs: planned.map((p) => p.payload),
-          nextIndex: 1,
+          armPlan,
+          nextIndex: splitAt,
           state: 'waiting-for-drop',
           lastError: null,
           createdAt: new Date().toISOString()
@@ -723,6 +749,7 @@ function registerIpc() {
     const arm = Object.assign({}, store.settings.arm, armOverride || {});
     try {
       const res = await runArmTransfer(arm, {
+        taskId: nextArmTaskId(), method: 'grasp', quantity: 1,
         from: 'K1', to: 'T2', fromStation: 'K1', toStation: 'T2',
         orderId: 'test-order', unitId: 'test-unit', transferId: 'test-transfer'
       });

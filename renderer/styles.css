@@ -352,6 +352,12 @@ input.inp:focus, select.inp:focus, textarea.inp:focus { outline: 2px solid var(-
 }
 :root[data-theme="dark"] .handover-warn { color: #f0b429; background: rgba(240, 180, 41, 0.1); }
 
+/* Hand-over step in the route editor */
+.step-editor-row.handover-row { background: rgba(238, 77, 45, 0.08); border: 1px dashed var(--accent); border-radius: 10px; padding: 8px 10px; }
+.handover-label { font-weight: 700; font-size: 13px; color: var(--accent); flex: 1; }
+.inline-fld { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: var(--text-muted); }
+.leg-arm { font-size: 12px; color: var(--accent); font-weight: 600; margin: 6px 0 2px; }
+
 /* Robotic arm log */
 .arm-log { margin-top: 14px; }
 .arm-log-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); margin: 12px 0 6px; font-weight: 700; }
