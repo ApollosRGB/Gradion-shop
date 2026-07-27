@@ -44,6 +44,7 @@ function defaultStore() {
     robots: [],
     capability: {},
     pendingRelays: [],
+    armConfigVersion: ARM_CONFIG_VERSION,
     products: [
       {
         id: 'p-pen',
@@ -78,15 +79,60 @@ function defaultStore() {
   };
 }
 
+// Bumped whenever the shipped arm configuration changes. Saved settings always
+// win over defaults, so without this an install that already has an older arm
+// block would never pick up new broker details.
+const ARM_CONFIG_VERSION = 2;
+
+// The values the arm block shipped with before the real broker was known. A
+// field still holding one of these was never configured by the operator, so it
+// is safe to replace with the current default; anything they changed is kept.
+const SUPERSEDED_ARM_VALUES = {
+  enabled: false,
+  brokerUrl: 'mqtt://localhost:1883',
+  username: '',
+  password: '',
+  commandTopic: 'arm/command',
+  statusTopic: 'arm/status',
+  payloadTemplate: '{\n  "command": "transfer",\n  "from": "{from}",\n  "to": "{to}",\n  "orderId": "{orderId}",\n  "transferId": "{transferId}"\n}',
+  statusDoneValue: 'done',
+  statusMatchField: 'transferId'
+};
+
+// `defaultArm` must be a pristine copy of the shipped defaults — never the
+// object that the saved settings were merged into, or every comparison below
+// would be against the saved value itself and nothing would ever migrate.
+function migrateArmConfig(data, defaultArm) {
+  if ((Number(data.armConfigVersion) || 1) >= ARM_CONFIG_VERSION) return false;
+  const arm = data.settings.arm;
+  let changed = false;
+  Object.keys(SUPERSEDED_ARM_VALUES).forEach((key) => {
+    if (arm[key] === SUPERSEDED_ARM_VALUES[key] && arm[key] !== defaultArm[key]) {
+      arm[key] = defaultArm[key];
+      changed = true;
+    }
+  });
+  if (arm.tlsInsecure === undefined) { arm.tlsInsecure = defaultArm.tlsInsecure; changed = true; }
+  data.armConfigVersion = ARM_CONFIG_VERSION;
+  return changed;
+}
+
 function loadStore() {
   try {
     const raw = fs.readFileSync(storePath, 'utf8');
     const data = JSON.parse(raw);
-    // Merge with defaults so new fields appear after app updates
+    // Merge with defaults so new fields appear after app updates. Assign into a
+    // fresh object so the defaults themselves stay pristine for the migration.
     const def = defaultStore();
-    const arm = Object.assign({}, def.settings.arm, (data.settings && data.settings.arm) || {});
-    data.settings = Object.assign(def.settings, data.settings || {});
+    const defaultArm = Object.assign({}, def.settings.arm);
+    const arm = Object.assign({}, defaultArm, (data.settings && data.settings.arm) || {});
+    data.settings = Object.assign({}, def.settings, data.settings || {});
     data.settings.arm = arm;
+
+    // Carry an existing install forward onto the current arm configuration
+    if (migrateArmConfig(data, defaultArm) && storePath) {
+      try { saveStore(data); } catch (e) { /* read-only run; migration still applies in memory */ }
+    }
     data.pendingRelays = data.pendingRelays || [];
     data.stations = data.stations || def.stations;
     data.stations.forEach((s) => {
@@ -870,6 +916,8 @@ app.on('window-all-closed', () => {
 
 // Exposed so the arm/relay logic can be exercised by tests against a real broker.
 module.exports = {
+  __setStorePathForTest: (p) => { storePath = p; },
+  __loadStoreForTest: () => loadStore(),
   renderArmPayload,
   handleArmStatus,
   connectArm,
