@@ -41,7 +41,9 @@ async function boot() {
   renderCatalog();
   renderCart();
   renderOrdersBadge();
-  showView('shop');
+  applyMode();
+  // No system chosen yet → ask before showing the shop
+  showView(store.settings.mode ? 'shop' : 'start');
 }
 
 function wireChrome() {
@@ -57,9 +59,34 @@ function wireChrome() {
   }
   $('#themeToggle').addEventListener('click', toggleTheme);
   $('#adminToggle').addEventListener('click', onAdminToggle);
+  $('#modeBadge').addEventListener('click', () => showView('start'));
+  $$('[data-mode]').forEach((b) => b.addEventListener('click', async () => {
+    store.settings.mode = b.dataset.mode;
+    await persist();
+    applyMode();
+    showView('shop');
+  }));
   $$('.nav-btn').forEach((b) =>
     b.addEventListener('click', () => showView(b.dataset.view)));
   $('#finishBtn').addEventListener('click', onFinish);
+}
+
+// ===========================================================================
+// Which system orders are dispatched to
+// ===========================================================================
+function isMpdv() {
+  return (store.settings || {}).mode === 'mpdv';
+}
+
+function applyMode() {
+  const mpdv = isMpdv();
+  $('#modeBadge').textContent = mpdv ? '🏭 MPDV' : '🤖 SYNAOS';
+  $('#brandTitle').textContent = mpdv ? 'Gradion Shop — Production' : 'Gradion Shop';
+  $('#finishBtn').textContent = mpdv ? 'Finish & Send to Production' : 'Finish & Send to Robot';
+  // Order history and live tracking are SYNAOS concepts
+  $$('.nav-btn').forEach((b) => {
+    if (b.dataset.view === 'orders') b.classList.toggle('hidden', mpdv);
+  });
 }
 
 // ===========================================================================
@@ -81,10 +108,9 @@ async function toggleTheme() {
 // ===========================================================================
 function showView(view) {
   currentView = view;
-  ['shop', 'progress', 'orders', 'admin'].forEach((v) =>
+  ['start', 'shop', 'progress', 'orders', 'admin', 'mpdv-result'].forEach((v) =>
     $('#view-' + v).classList.toggle('hidden', v !== view));
 
-  const isUserView = view === 'shop' || view === 'orders' || view === 'progress';
   $('#bottomNav').classList.toggle('hidden', !(view === 'shop' || view === 'orders'));
   $('#adminToggle').textContent = view === 'admin' ? 'Exit Admin' : 'Admin';
 
@@ -198,6 +224,7 @@ function renderCart() {
 // ===========================================================================
 async function onFinish() {
   if (!cart.length) return;
+  if (isMpdv()) return onFinishMpdv();
   const btn = $('#finishBtn');
   btn.disabled = true;
   btn.textContent = 'Sending to robot…';
@@ -206,15 +233,18 @@ async function onFinish() {
   const units = [];
   const itemsSnapshot = [];
   const fellBack = new Set();
-  cart.forEach((c) => {
+  // One trip per cart line: an AGV carries the whole line in a single job chain,
+  // and the arm is told to move that many items at the hand-over.
+  cart.forEach((c, lineIndex) => {
     const p = store.products.find((x) => x.id === c.productId);
     if (!p) return;
     itemsSnapshot.push({ productId: p.id, name: p.name, price: p.price, qty: c.qty, image: p.image, steps: p.steps });
-    for (let i = 0; i < c.qty; i++) {
-      const { legs, warnings } = buildLegsForUnit(p, i);
-      warnings.forEach((w) => fellBack.add(`${p.name}|${w}`));
-      units.push({ unitId: uid('u'), productId: p.id, legs, resourceId: legs[0] ? legs[0].resourceId : null });
-    }
+    const { legs, warnings } = buildLegsForUnit(p, lineIndex, c.qty);
+    warnings.forEach((w) => fellBack.add(`${p.name}|${w}`));
+    units.push({
+      unitId: uid('u'), productId: p.id, quantity: c.qty, legs,
+      resourceId: legs[0] ? legs[0].resourceId : null
+    });
   });
 
   fellBack.forEach((entry) => {
@@ -288,6 +318,86 @@ async function onFinish() {
 
   btn.textContent = 'Finish & Send to Robot';
   openProgress(orderId);
+}
+
+// ===========================================================================
+// MPDV ordering — one workplan order per cart line
+// ===========================================================================
+async function onFinishMpdv() {
+  const btn = $('#finishBtn');
+  btn.disabled = true;
+  btn.textContent = 'Sending to production…';
+
+  const lines = cart.map((c) => {
+    const p = store.products.find((x) => x.id === c.productId);
+    return p ? { productId: p.id, name: p.name, quantity: c.qty, price: p.price, image: p.image } : null;
+  }).filter(Boolean);
+
+  let results = [];
+  try {
+    results = await window.api.mpdvCreateOrders({ lines });
+  } catch (e) {
+    toast('Could not reach MPDV: ' + e.message, 'error');
+    btn.disabled = false;
+    applyMode();
+    return;
+  }
+
+  const total = lines.reduce((s, l) => s + l.price * l.quantity, 0);
+  if (results.some((r) => r.ok)) {
+    results.forEach((r) => {
+      if (!r.ok) return;
+      const p = store.products.find((x) => x.id === (lines.find((l) => l.name === r.productName) || {}).productId);
+      if (p) p.sold = (p.sold || 0) + r.quantity;
+    });
+    await persist();
+    renderCatalog();
+  }
+
+  cart = [];
+  renderCart();
+  btn.disabled = false;
+  applyMode();
+  renderMpdvResult(results, total);
+  showView('mpdv-result');
+}
+
+function renderMpdvResult(results, total) {
+  const okCount = results.filter((r) => r.ok).length;
+  const rows = results.map((r) => `
+    <div class="oi-row">
+      <div class="thumb">${r.ok ? '✅' : '⚠️'}</div>
+      <div class="nm">
+        ${escapeHtml(r.productName || '(item)')}
+        <div class="step-sub">${r.orderNumber
+          ? `Order no. <b>${escapeHtml(r.orderNumber)}</b>`
+          : 'No order number was issued'}</div>
+        ${r.ok ? '' : `<div class="err-text">${escapeHtml(r.error || 'Rejected by MPDV')}</div>`}
+      </div>
+      <div class="qty-lbl">Qty: ${r.quantity}</div>
+    </div>`).join('');
+
+  const allOk = okCount === results.length && results.length > 0;
+  $('#mpdvResultWrap').innerHTML = `
+    <div class="order-card" style="text-align:center;">
+      <div style="font-size:56px;">${allOk ? '🏭' : okCount ? '⚠️' : '❌'}</div>
+      <h2 style="color:var(--text);">${allOk
+        ? 'Sent to production'
+        : okCount ? 'Partly sent to production' : 'MPDV did not accept the order'}</h2>
+      <p class="hint">${okCount} of ${results.length} line(s) reached MPDV.</p>
+    </div>
+    <div class="order-items-card">
+      <h3>Order lines</h3>
+      ${rows}
+      <div class="oi-row" style="border-top:2px solid var(--border);margin-top:6px;">
+        <div class="nm">Total</div>
+        <div class="pr">${money(total)}</div>
+      </div>
+    </div>
+    <div class="progress-actions" style="margin-top:16px;">
+      <button class="btn btn-primary" id="mpdvBackToShop">← Back to Shop</button>
+    </div>`;
+  $('#mpdvBackToShop').addEventListener('click', () => showView('shop'));
 }
 
 // ===========================================================================
@@ -412,7 +522,10 @@ function parkNodeFor(resourceId) {
 // Splits a product's route into legs — one per robot. Consecutive steps sharing a
 // robot stay in one job; a change of robot starts a new job (SYNAOS executes every
 // milestone of a job with the same resource, so a relay must be several jobs).
-function buildLegsForUnit(product, index) {
+// `orderQuantity` is how many of this product the customer asked for. The whole
+// line travels together, so it is also how many the arm moves at a hand-over.
+function buildLegsForUnit(product, index, orderQuantity) {
+  const quantity = Number(orderQuantity) > 0 ? Number(orderQuantity) : 1;
   const allSteps = product.steps || [];
   const steps = allSteps.filter((s) => !isHandoverStep(s));
   const warnings = new Set();
@@ -432,7 +545,7 @@ function buildLegsForUnit(product, index) {
     // A hand-over is an instruction to the arm, not a SYNAOS milestone: it ends
     // the current leg and gates the next one.
     if (isHandoverStep(step)) {
-      pendingHandover = { method: step.method || 'grasp', quantity: Number(step.quantity) > 0 ? Number(step.quantity) : 1 };
+      pendingHandover = { method: step.method || 'grasp', quantity };
       return;
     }
     const { resourceId, fellBack } = resolveStepResource(product, step, index);
@@ -1011,9 +1124,7 @@ function renderProductEditor(body) {
         <label class="inline-fld">method
           <input class="inp" data-ho-method="${i}" value="${escapeHtml(s.method || 'grasp')}" style="max-width:110px;">
         </label>
-        <label class="inline-fld">quantity
-          <input class="inp" data-ho-qty="${i}" type="number" min="1" step="1" value="${Number(s.quantity) > 0 ? Number(s.quantity) : 1}" style="max-width:80px;">
-        </label>
+        <span class="inline-fld" title="The whole cart line travels in one trip, so the arm moves as many as the customer ordered">quantity: <b>from the order</b></span>
         <button class="link-btn danger" data-step-del="${i}">Remove</button>
       </div>`;
     }
@@ -1033,10 +1144,11 @@ function renderProductEditor(body) {
   }).join('');
 
   // Preview of how the route will be split into jobs
-  const previewLegs = buildLegsForUnit(p, 0).legs;
+  // Previewed as if a customer ordered one; the arm's quantity follows the order
+  const previewLegs = buildLegsForUnit(p, 0, 1).legs;
   const legPreview = previewLegs.length > 1
     ? `<div class="leg-preview">This route will be sent as <b>${previewLegs.length} chained jobs</b>:
-        ${previewLegs.map((l, i) => `<div class="leg-line">${l.armBefore ? `<div class="leg-arm">🤝 arm: ${escapeHtml(l.armBefore.method)} ×${l.armBefore.quantity} — the next AGV waits for “${escapeHtml((store.settings.arm || {}).statusDoneValue || 'Finished')}”</div>` : ''}<span class="chip">Job ${i + 1}</span> <b>${escapeHtml(l.resourceId || 'SYNAOS decides')}</b> — ${escapeHtml(l.steps.map((x) => `${stationName(x.stationRef)}·${x.action}`).join(' → '))}${l.parkNode ? ` <span class="chip">then parks at ${escapeHtml(l.parkNode.id)}</span>` : ''}</div>`).join('')}
+        ${previewLegs.map((l, i) => `<div class="leg-line">${l.armBefore ? `<div class="leg-arm">🤝 arm: ${escapeHtml(l.armBefore.method)} × the ordered quantity — the next AGV waits for “${escapeHtml((store.settings.arm || {}).statusDoneValue || 'Finished')}”</div>` : ''}<span class="chip">Job ${i + 1}</span> <b>${escapeHtml(l.resourceId || 'SYNAOS decides')}</b> — ${escapeHtml(l.steps.map((x) => `${stationName(x.stationRef)}·${x.action}`).join(' → '))}${l.parkNode ? ` <span class="chip">then parks at ${escapeHtml(l.parkNode.id)}</span>` : ''}</div>`).join('')}
         <span class="fld-hint">Each job starts only after the previous one has finished.</span>
       </div>`
     : '';
@@ -1131,10 +1243,6 @@ function renderProductEditor(body) {
   });
   $$('[data-ho-method]', body).forEach((el) => el.addEventListener('change', (e) => {
     p.steps[+el.dataset.hoMethod].method = e.target.value.trim() || 'grasp';
-    renderAdmin();
-  }));
-  $$('[data-ho-qty]', body).forEach((el) => el.addEventListener('change', (e) => {
-    p.steps[+el.dataset.hoQty].quantity = Math.max(1, parseInt(e.target.value, 10) || 1);
     renderAdmin();
   }));
   $('#f-pickimg').addEventListener('click', async () => {
@@ -1442,6 +1550,7 @@ function renderAdminSettings() {
   const body = $('#adminBody');
   const s = store.settings;
   const a = s.arm || {};
+  const m = s.mpdv || {};
   body.innerHTML = `
     <div class="panel">
       <h2>SYNAOS connection</h2>
@@ -1462,6 +1571,50 @@ function renderAdminSettings() {
         <button class="btn btn-secondary" id="testConn">Test connection</button>
         <span class="api-status" id="connStatus"><span class="dot"></span> Not tested</span>
       </div>
+    </div>
+    <div class="panel">
+      <h2>MPDV production orders</h2>
+      <p class="hint">Used when the shop is set to <b>MPDV</b>. Each cart line becomes a workplan order; the ordered quantity becomes <code>plan.yield.base</code>.</p>
+      <div class="form-grid">
+        <label class="fld full">Endpoint
+          <input class="inp" id="m-endpoint" value="${escapeHtml(m.endpoint || '')}">
+        </label>
+        <label class="fld">Username
+          <input class="inp" id="m-user" value="${escapeHtml(m.username || '')}">
+        </label>
+        <label class="fld">Password
+          <input class="inp" id="m-pass" type="password" value="${escapeHtml(m.password || '')}">
+        </label>
+        <label class="fld switch full">
+          <input type="checkbox" id="m-tls" ${m.tlsInsecure ? 'checked' : ''}> Don't validate the TLS certificate
+          <span class="fld-hint">Needed here: the host serves a valid DigiCert certificate but not its full chain.</span>
+        </label>
+        <label class="fld">workplanorder.id
+          <input class="inp" id="m-woid" value="${escapeHtml(m.workplanOrderId || '')}">
+          <span class="fld-hint">Sent unchanged on every order.</span>
+        </label>
+        <label class="fld">ordertype
+          <input class="inp" id="m-otype" value="${escapeHtml(m.orderType || '')}">
+        </label>
+        <label class="fld full">latest_end_ts (deadline)
+          <input class="inp" id="m-end" value="${escapeHtml(m.latestEndTs || '')}">
+          <span class="fld-hint">Sent as-is, e.g. <code>2026-08-05T00:00:00.000+08:00</code>.</span>
+        </label>
+        <label class="fld">language
+          <input class="inp" id="m-lang" value="${escapeHtml(m.language || 'en')}">
+        </label>
+        <label class="fld">timeZoneId
+          <input class="inp" id="m-tz" value="${escapeHtml(m.timeZoneId || 'Asia/Singapore')}">
+          <span class="fld-hint">Also decides which day the order number belongs to.</span>
+        </label>
+      </div>
+      <div class="progress-actions" style="margin-top:16px; align-items:center; flex-wrap:wrap;">
+        <button class="btn btn-secondary" id="saveMpdv">Save MPDV settings</button>
+        <span class="api-status" id="mpdvNext"></span>
+      </div>
+      <div class="arm-log-title">Order log — did it reach MPDV?</div>
+      <div id="mpdvLog" class="arm-log"></div>
+      <button class="link-btn" id="clearMpdvLog">Clear log</button>
     </div>
     <div class="panel">
       <h2>Robotic arm (MQTT)</h2>
@@ -1554,6 +1707,44 @@ function renderAdminSettings() {
     if (res.ok) status.innerHTML = '<span class="dot ok"></span> Connected (HTTP ' + res.status + ')';
     else status.innerHTML = `<span class="dot bad"></span> Failed (${res.error || 'HTTP ' + res.status})`;
   });
+  // ---- MPDV ----
+  const readMpdvForm = () => ({
+    endpoint: $('#m-endpoint').value.trim(),
+    username: $('#m-user').value,
+    password: $('#m-pass').value,
+    tlsInsecure: $('#m-tls').checked,
+    workplanOrderId: $('#m-woid').value.trim(),
+    orderType: $('#m-otype').value.trim(),
+    latestEndTs: $('#m-end').value.trim(),
+    language: $('#m-lang').value.trim() || 'en',
+    timeZoneId: $('#m-tz').value.trim() || 'Asia/Singapore'
+  });
+  const showMpdvState = async () => {
+    const [preview, log] = await Promise.all([window.api.mpdvPreview(), window.api.mpdvLog()]);
+    $('#mpdvNext').innerHTML = `<span class="dot ok"></span> Next order no. <b>${escapeHtml(preview.orderNumber)}</b>
+      — ${preview.usedToday} used today, ${preview.remainingToday} left`;
+    $('#mpdvLog').innerHTML = log.length
+      ? log.map((l) => `<div class="arm-log-row">
+          <span class="dir ${l.ok ? 'in' : 'out'}">${l.ok ? '✅ sent' : '❌ failed'}</span>
+          <code>${escapeHtml(l.orderNumber || '—')}</code>
+          <span class="msg">${escapeHtml(l.productName || '')} ×${l.quantity}
+            ${l.ok ? '' : '— ' + escapeHtml(l.error || '')}
+            <span style="opacity:.6">${escapeHtml(new Date(l.at).toLocaleString())}</span></span>
+        </div>`).join('')
+      : '<p class="hint">No MPDV orders sent yet.</p>';
+  };
+  $('#saveMpdv').addEventListener('click', async () => {
+    store.settings.mpdv = Object.assign({}, store.settings.mpdv, readMpdvForm());
+    await persist();
+    showMpdvState();
+    toast('MPDV settings saved', 'success');
+  });
+  $('#clearMpdvLog').addEventListener('click', async () => {
+    await window.api.mpdvClearLog();
+    showMpdvState();
+  });
+  showMpdvState();
+
   // ---- Robotic arm ----
   const readArmForm = () => ({
     enabled: $('#a-enabled').checked,

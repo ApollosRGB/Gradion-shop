@@ -1,8 +1,8 @@
 {
   "name": "treat-stand-order-app",
   "productName": "Gradion Shop",
-  "version": "1.7.1",
-  "description": "Gradion Shop — Shopee-style order app driving SYNAOS intralogistics jobs (AGV transport orders).",
+  "version": "1.8.0",
+  "description": "Gradion Shop — Shopee-style order app dispatching to SYNAOS (AGV transport jobs) or MPDV (production orders).",
   "main": "main.js",
   "author": "ApollosRGB",
   "license": "MIT",

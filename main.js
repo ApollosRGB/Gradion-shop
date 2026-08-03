@@ -35,8 +35,24 @@ function defaultStore() {
         statusDoneValue: 'Finished', // value meaning the arm has completed the task
         statusMatchField: 'task_id', // field tying a status back to its command
         timeoutSeconds: 120          // give up waiting and continue anyway
+      },
+      // MPDV MES — an alternative to dispatching AGV jobs: an order placed here
+      // becomes a workplan order in MPDV instead.
+      mpdv: {
+        endpoint: 'https://azu-tr-vhxw-10.mpdv.cloud:8080/data/MDWorkplanOrder/generateOrder?X-Access-Id=00099831',
+        username: '12345',
+        password: 'mpdv',
+        tlsInsecure: true,           // host does not serve its full certificate chain
+        workplanOrderId: '00003150', // workplanorder.id — same on every order
+        orderType: '0',
+        latestEndTs: '2026-08-05T00:00:00.000+08:00',
+        language: 'en',
+        timeZoneId: 'Asia/Singapore'
       }
     },
+    // Running order number: DDMMYY + a 4-digit counter that restarts each day
+    mpdvCounter: { date: '', seq: 0 },
+    mpdvLog: [],
     stations: [
       { id: 'st-k2', stationId: 'K2', name: 'Production', fn: 'production', system: 'STATION', allowedRobots: [] },
       { id: 'st-k1', stationId: 'K1', name: 'Shop', fn: 'shop', system: 'STATION', allowedRobots: [] }
@@ -126,8 +142,12 @@ function loadStore() {
     const def = defaultStore();
     const defaultArm = Object.assign({}, def.settings.arm);
     const arm = Object.assign({}, defaultArm, (data.settings && data.settings.arm) || {});
+    const mpdv = Object.assign({}, def.settings.mpdv, (data.settings && data.settings.mpdv) || {});
     data.settings = Object.assign({}, def.settings, data.settings || {});
     data.settings.arm = arm;
+    data.settings.mpdv = mpdv;
+    data.mpdvCounter = data.mpdvCounter || { date: '', seq: 0 };
+    data.mpdvLog = data.mpdvLog || [];
 
     // Carry an existing install forward onto the current arm configuration
     if (migrateArmConfig(data, defaultArm) && storePath) {
@@ -378,6 +398,134 @@ async function runArmTransfer(arm, values) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// MPDV MES
+//
+// An order can be sent to MPDV as a workplan order instead of being dispatched
+// to the AGVs. Each order gets a running number of the form DDMMYY0001 that
+// restarts every day, and the quantity ordered becomes the planned yield.
+// ---------------------------------------------------------------------------
+
+// The date part follows the configured time zone, so the number matches the day
+// MPDV itself will record rather than whatever the PC's clock is set to.
+function mpdvDateKey(timeZoneId, when) {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: timeZoneId || 'Asia/Singapore',
+    day: '2-digit', month: '2-digit', year: '2-digit'
+  }).formatToParts(when || new Date());
+  const get = (t) => (parts.find((p) => p.type === t) || {}).value || '';
+  return `${get('day')}${get('month')}${get('year')}`;   // DDMMYY
+}
+
+// MPDV stores this id in an 8-character field, so the running number is
+// DDMMYY plus a two-digit counter (030826 + 01 -> "03082601"). A longer number
+// would be truncated, and every order of the day would collide on one id.
+const MPDV_MAX_ORDERS_PER_DAY = 99;
+
+function formatMpdvOrderNumber(dateKey, seq) {
+  return `${dateKey}${String(seq).padStart(2, '0')}`;
+}
+
+// Reserves the next number for today. Persisted, so numbering survives restarts.
+function nextMpdvOrderNumber(timeZoneId, when) {
+  const store = loadStore();
+  const key = mpdvDateKey(timeZoneId, when);
+  const counter = store.mpdvCounter || { date: '', seq: 0 };
+  const seq = (counter.date === key ? Number(counter.seq) || 0 : 0) + 1;
+  if (seq > MPDV_MAX_ORDERS_PER_DAY) {
+    // Refuse rather than send a 9-character number that MPDV would truncate
+    // into a duplicate of an earlier order.
+    const err = new Error(`Daily limit reached: MPDV order ids only hold ${MPDV_MAX_ORDERS_PER_DAY} orders per day (${key}).`);
+    err.code = 'MPDV_DAILY_LIMIT';
+    throw err;
+  }
+  store.mpdvCounter = { date: key, seq };
+  saveStore(store);
+  return formatMpdvOrderNumber(key, seq);
+}
+
+function buildMpdvPayload(cfg, orderNumber, quantity, requestId) {
+  return {
+    params: [
+      { acronym: 'workplanorder.id', operator: 'EQUAL', value: cfg.workplanOrderId },
+      { acronym: 'workplanorder.target.id', operator: 'EQUAL', value: orderNumber },
+      { acronym: 'workplanorder.ordertype', operator: 'EQUAL', value: cfg.orderType },
+      { acronym: 'workplanorder.plan.yield.base', operator: 'EQUAL', value: Number(quantity) > 0 ? Number(quantity) : 1 },
+      { acronym: 'workplanorder.latest_end_ts', operator: 'EQUAL', value: cfg.latestEndTs }
+    ],
+    columns: [],
+    requestId: Number(requestId) > 0 ? Number(requestId) : 1,
+    language: cfg.language || 'en',
+    timeZoneId: cfg.timeZoneId || 'Asia/Singapore',
+    returnAsObject: true
+  };
+}
+
+function mpdvRequest(cfg, body) {
+  return new Promise((resolve) => {
+    let url;
+    try {
+      url = new URL(cfg.endpoint);
+    } catch (e) {
+      resolve({ ok: false, status: 0, error: 'Invalid MPDV endpoint URL' });
+      return;
+    }
+    const transport = url.protocol === 'http:' ? require('http') : require('https');
+    const payload = JSON.stringify(body);
+    const req = transport.request({
+      hostname: url.hostname,
+      port: url.port || (url.protocol === 'http:' ? 80 : 443),
+      path: url.pathname + url.search,
+      method: 'POST',
+      timeout: 25000,
+      rejectUnauthorized: !cfg.tlsInsecure,
+      headers: {
+        Authorization: 'Basic ' + Buffer.from(`${cfg.username}:${cfg.password}`).toString('base64'),
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'Content-Length': Buffer.byteLength(payload)
+      }
+    }, (res) => {
+      let raw = '';
+      res.on('data', (d) => (raw += d));
+      res.on('end', () => {
+        let data = null;
+        try { data = raw ? JSON.parse(raw) : null; } catch (e) { /* not json */ }
+        resolve({ ok: res.statusCode >= 200 && res.statusCode < 300, status: res.statusCode, data, raw });
+      });
+    });
+    req.on('timeout', () => { req.destroy(); resolve({ ok: false, status: 0, error: 'Request timed out' }); });
+    req.on('error', (err) => resolve({ ok: false, status: 0, error: err.message }));
+    req.write(payload);
+    req.end();
+  });
+}
+
+// MPDV answers 200 even for a rejected order, with the problem described in the
+// body, so success is judged on the body as well as the status code.
+function interpretMpdvResponse(res) {
+  if (!res.ok) {
+    return { ok: false, error: res.error || `HTTP ${res.status}`, detail: (res.raw || '').slice(0, 600) };
+  }
+  const body = res.data;
+  const text = typeof res.raw === 'string' ? res.raw : '';
+  const errorish = body && (body.error || body.errorMessage || body.exception
+    || (Array.isArray(body.errors) && body.errors.length ? body.errors : null)
+    || (body.result && body.result.error));
+  if (errorish) {
+    return { ok: false, error: typeof errorish === 'string' ? errorish : JSON.stringify(errorish).slice(0, 400), detail: text.slice(0, 600) };
+  }
+  return { ok: true, detail: text.slice(0, 600) };
+}
+
+function recordMpdvLog(entry) {
+  const store = loadStore();
+  store.mpdvLog = store.mpdvLog || [];
+  store.mpdvLog.unshift(Object.assign({ at: new Date().toISOString() }, entry));
+  store.mpdvLog.length = Math.min(store.mpdvLog.length, 50);
+  saveStore(store);
+}
+
 // Correlation id marking the trailing "go to the waiting spot" milestone, so the
 // customer-facing progress screen can tell parking apart from the actual delivery.
 const WAITING_SPOT_TAG = 'waitingSpot';
@@ -396,11 +544,13 @@ function usableResourceId(value) {
 // dependency, so a leg cannot start approaching until the previous leg has FINISHED.
 //
 // legs: [{ resourceId, steps: [{ stationRef, action }] }]
-function buildRelayPayloads(legs, stations, orderId, unitId) {
+function buildRelayPayloads(legs, stations, orderId, unitId, quantity) {
   const correlations = [
     { kind: 'order', id: orderId },
     { kind: 'orderUnit', id: unitId }
   ];
+  // One job now carries a whole cart line, so record how many it is carrying
+  if (Number(quantity) > 0) correlations.push({ kind: 'quantity', id: String(Number(quantity)) });
   const jobs = [];
   let previousMilestoneId = null;
 
@@ -694,7 +844,7 @@ function registerIpc() {
         ? unit.legs
         : [{ resourceId: unit.resourceId, steps: product.steps }];
 
-      const planned = buildRelayPayloads(legs, store.stations, orderId, unit.unitId);
+      const planned = buildRelayPayloads(legs, store.stations, orderId, unit.unitId, unit.quantity);
 
       // Hand-overs are only performed where the operator put one in the route.
       // Everything up to the first hand-over goes out now; from that point on
@@ -774,6 +924,70 @@ function registerIpc() {
     }
     if (store.pendingRelays && store.pendingRelays.length) scheduleRelaySupervisor();
     return results;
+  });
+
+  // Creates one MPDV workplan order per cart line. Returns a result per line so
+  // the shop can show exactly which ones reached MPDV and which did not.
+  ipcMain.handle('mpdv:createOrders', async (_ev, { lines }) => {
+    const cfg = loadStore().settings.mpdv || {};
+    const results = [];
+    let requestId = 1;
+    for (const line of lines || []) {
+      let orderNumber;
+      try {
+        orderNumber = nextMpdvOrderNumber(cfg.timeZoneId);
+      } catch (err) {
+        const entry = {
+          productName: line.name || '', orderNumber: null,
+          quantity: Number(line.quantity) > 0 ? Number(line.quantity) : 1,
+          ok: false, status: 0, error: err.message, response: ''
+        };
+        recordMpdvLog(entry);
+        results.push(entry);
+        continue;
+      }
+      const payload = buildMpdvPayload(cfg, orderNumber, line.quantity, requestId++);
+      const res = await mpdvRequest(cfg, payload);
+      const verdict = interpretMpdvResponse(res);
+      const entry = {
+        productName: line.name || '',
+        orderNumber,
+        quantity: Number(line.quantity) > 0 ? Number(line.quantity) : 1,
+        ok: verdict.ok,
+        status: res.status,
+        error: verdict.ok ? null : verdict.error,
+        response: verdict.detail || ''
+      };
+      recordMpdvLog(entry);
+      results.push(entry);
+    }
+    return results;
+  });
+
+  // Sends nothing; just reports what the next number would look like.
+  ipcMain.handle('mpdv:preview', (_ev, cfgOverride) => {
+    const store = loadStore();
+    const cfg = Object.assign({}, store.settings.mpdv, cfgOverride || {});
+    const key = mpdvDateKey(cfg.timeZoneId);
+    const counter = store.mpdvCounter || { date: '', seq: 0 };
+    const nextSeq = (counter.date === key ? Number(counter.seq) || 0 : 0) + 1;
+    const orderNumber = formatMpdvOrderNumber(key, nextSeq);
+    return {
+      orderNumber,
+      todayKey: key,
+      usedToday: counter.date === key ? counter.seq : 0,
+      remainingToday: Math.max(0, MPDV_MAX_ORDERS_PER_DAY - (counter.date === key ? Number(counter.seq) || 0 : 0)),
+      payload: buildMpdvPayload(cfg, orderNumber, 1, 1)
+    };
+  });
+
+  ipcMain.handle('mpdv:log', () => (loadStore().mpdvLog || []).slice(0, 20));
+
+  ipcMain.handle('mpdv:clearLog', () => {
+    const store = loadStore();
+    store.mpdvLog = [];
+    saveStore(store);
+    return true;
   });
 
   // Connects to the arm's broker and reports what happened, so the operator can
@@ -918,6 +1132,11 @@ app.on('window-all-closed', () => {
 module.exports = {
   __setStorePathForTest: (p) => { storePath = p; },
   __loadStoreForTest: () => loadStore(),
+  mpdvDateKey,
+  nextMpdvOrderNumber,
+  buildMpdvPayload,
+  mpdvRequest,
+  interpretMpdvResponse,
   renderArmPayload,
   handleArmStatus,
   connectArm,

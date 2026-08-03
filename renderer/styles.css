@@ -352,6 +352,23 @@ input.inp:focus, select.inp:focus, textarea.inp:focus { outline: 2px solid var(-
 }
 :root[data-theme="dark"] .handover-warn { color: #f0b429; background: rgba(240, 180, 41, 0.1); }
 
+/* Start menu — choose the system */
+.start-wrap { max-width: 860px; margin: 0 auto; padding: 60px 22px; text-align: center; }
+.start-title { margin: 0 0 8px; font-size: 30px; }
+.start-sub { color: var(--text-muted); margin: 0 0 34px; }
+.start-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 20px; }
+.start-card {
+  background: var(--surface); border: 2px solid var(--border); border-radius: var(--radius);
+  box-shadow: var(--shadow); padding: 30px 24px; cursor: pointer; text-align: center;
+  display: flex; flex-direction: column; align-items: center; gap: 10px; color: var(--text);
+  transition: border-color .12s, transform .12s;
+}
+.start-card:hover { border-color: var(--accent); transform: translateY(-2px); }
+.start-emoji { font-size: 52px; }
+.start-name { font-size: 21px; font-weight: 800; }
+.start-desc { font-size: 14px; color: var(--text-muted); line-height: 1.45; }
+.nav-btn.hidden { display: none; }
+
 /* Hand-over step in the route editor */
 .step-editor-row.handover-row { background: rgba(238, 77, 45, 0.08); border: 1px dashed var(--accent); border-radius: 10px; padding: 8px 10px; }
 .handover-label { font-weight: 700; font-size: 13px; color: var(--accent); flex: 1; }

@@ -1,15 +1,20 @@
-# 🎁 Gradion Shop — SYNAOS Order App
+# 🎁 Gradion Shop — SYNAOS &amp; MPDV Order App
 
-A Shopee-style desktop ordering app that dispatches **SYNAOS intralogistics jobs** (AGV transport orders) through the SYNAOS Job Management API. Built with Electron for Windows and macOS, with light/dark mode and separate **user** and **admin** interfaces.
+A Shopee-style desktop ordering app that dispatches orders to either of two systems, chosen from a start menu:
 
-![status](https://img.shields.io/badge/version-1.7.1-e0563f)
+- **SYNAOS** — creates AGV transport jobs through the SYNAOS Job Management API and tracks them live.
+- **MPDV** — creates workplan orders in the MPDV MES.
+
+Built with Electron for Windows and macOS, with light/dark mode and separate **user** and **admin** interfaces.
+
+![status](https://img.shields.io/badge/version-1.8.0-e0563f)
 
 ## Features
 
 ### 🛍️ User interface
 - Browse the products/jobs an admin has published, in a mobile-store style catalog.
 - Add any item multiple times; a live order panel on the right shows quantities, per-item prices, and the running total.
-- **Finish & Send to Robot** creates one SYNAOS transport job per ordered unit and jumps to a live **order-progress** screen. Ordering an item adds its quantity to the product's **sold** count.
+- **Finish** dispatches the order to whichever system is selected. In SYNAOS mode each **cart line** travels as one job chain — the whole line rides together rather than one trip per item — and the screen switches to live order progress. Ordering an item adds its quantity to the product's **sold** count.
 - **Rate your order** — once an order is delivered, the customer rates each item 1–5 stars; the product's displayed rating becomes the **running average** of all ratings received.
 - The progress screen polls the Job API and narrates the AGV journey — *Order placed → On the way to Production → Picked up → Delivering to Shop → Delivered!* — using each station's configured **function** label.
 - **My Orders** keeps a history; reopen any order to see its live status. Confirm receipt ("👍 Got it!") or cancel (discards the SYNAOS jobs).
@@ -21,13 +26,29 @@ A Shopee-style desktop ordering app that dispatches **SYNAOS intralogistics jobs
 - **Robots** — **Read from SYNAOS** lists the transport resources (AGVs) the tenant uses, with their mode and supported job types. **Add robot by id** registers robots discovery can't see (it only finds robots already used in jobs), validated live against SYNAOS — ids are case-sensitive.
 - **Robot ↔ station access** — each station has an *allowed robots* list. The app also mines job history for `UNABLE_TO_ACCESS_ADDRESS` and marks those robots ✖ for that station. A product's robot dropdown only offers robots that can reach **every** station on its route; the rest are disabled with the reason. Products default to **“Auto — only robots that can reach these stations”**, which pins a capable robot (spread across them) instead of leaving it to the SYNAOS scheduler, which has been observed picking unreachable robots. A pinned-but-incapable robot is never sent — the job degrades to scheduler assignment with a warning.
 - **Waiting spots** — each robot can be given a home node on its navigation graph (e.g. `00` on `TUSK/NODES`). Once a robot finishes its part of an order, the app appends a `MOVE` to that node at the end of *its* job, so it parks itself. The trailing move is tagged with a correlation and excluded from the customer's progress, and the next robot in a relay waits on the previous robot's last **delivery** milestone — not on it finishing parking. Robots left to the SYNAOS scheduler get no waiting spot, since the app can't know which robot will run the leg.
-- **Hand-overs are placed by hand** — a hand-over is a step you add to a route with **+ Add hand-over (robotic arm)**, with its own `method` and `quantity`. The arm is only ever asked to move something where you put one; a robot change on its own just splits the route into two jobs. The editor previews exactly which jobs will be created and where the arm runs, and warns if a hand-over doesn't sit between a **DROP** and a **PICK at the same station**.
+- **Hand-overs are placed by hand** — a hand-over is a step you add to a route with **+ Add hand-over (robotic arm)**, with its own `method`; the quantity the arm moves is the quantity the customer ordered. The arm is only ever asked to move something where you put one; a robot change on its own just splits the route into two jobs. The editor previews exactly which jobs will be created and where the arm runs, and warns if a hand-over doesn't sit between a **DROP** and a **PICK at the same station**.
 - **Robotic arm (MQTT)** — the arm is driven over MQTT. Configure the broker URL (`mqtt://`, `mqtts://`, `ws://`, `wss://`), TLS certificate validation, credentials, the command/status topics, and a **payload template** with `{taskId}` `{method}` `{quantity}` `{from}` `{to}` `{orderId}` `{unitId}` placeholders so the JSON matches the arm exactly. At a hand-over the app publishes the command, waits for the configured “finished” value on the status topic — matched back by the echoed task id, so an interim `Started` or another task's status can't release it — and only then creates the receiving AGV's job. A configurable timeout stops a silent arm from wedging an order. **Test connection** and **Send test transfer** verify the setup without placing an order, and a live log shows recent MQTT traffic and hand-overs in progress. The supervisor runs in the main process, so it keeps going even if the customer leaves the progress screen, and resumes hand-overs left in flight after a restart.
 - **Settings** — SYNAOS connection (base URL, username, password) with a **Test connection** button, plus a **change admin password** form and dark-mode toggle.
 - Admin is locked behind a password (default `Ts13`) that can only be changed from within the admin session.
 
 ### 🌗 Light & dark mode
 Toggle from the top bar; the choice is saved.
+
+## MPDV production orders
+
+Selected from the start menu (or the badge in the top bar). Each **cart line** becomes one workplan order via `POST .../MDWorkplanOrder/generateOrder`, authenticated with HTTP Basic.
+
+| Field | Value |
+|---|---|
+| `workplanorder.id` | fixed, from admin (e.g. `00003150`) |
+| `workplanorder.target.id` | **the running order number** |
+| `workplanorder.ordertype` | fixed, from admin |
+| `workplanorder.plan.yield.base` | **the quantity the customer ordered**, as a JSON number |
+| `workplanorder.latest_end_ts` | fixed deadline, from admin |
+
+The running number is **`DDMMYY` + a two-digit counter** that restarts each day — `03082601`, `03082602`, … `04082601`. It is deliberately 8 characters: MPDV stores this id in an 8-character field, and a longer number is silently truncated, which would make every order of a day collide on one id. That caps the app at **99 MPDV orders per day**; beyond that it refuses to send rather than create a duplicate. The date follows the configured `timeZoneId`, not the PC clock, so the number matches the day MPDV records.
+
+Every send is logged in **Admin → Settings → MPDV**, showing the order number, quantity and whether MPDV accepted it, with the error text when it did not — MPDV answers `200` even for a rejected order, so the response body is inspected too. The host serves a valid DigiCert certificate but not its full chain, so a "don't validate the TLS certificate" option is provided and enabled by default for it.
 
 ## SYNAOS connection
 
@@ -45,8 +66,8 @@ Authentication is HTTP Basic. All admin configuration (products, stations, price
 ## Download
 
 Grab the latest installers from the [Releases page](../../releases):
-- **Windows** — `GradionShop-Setup-1.7.1.exe`
-- **macOS** — `GradionShop-1.7.1.dmg`
+- **Windows** — `GradionShop-Setup-1.8.0.exe`
+- **macOS** — `GradionShop-1.8.0.dmg`
 
 ## Development
 

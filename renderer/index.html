@@ -13,10 +13,36 @@
     <header class="topbar">
       <div class="brand"><span class="brand-emoji">🎁</span> <span id="brandTitle">Gradion Shop</span></div>
       <div class="topbar-actions">
+        <button id="modeBadge" class="ghost-btn" title="Switch between SYNAOS and MPDV">🤖 SYNAOS</button>
         <button id="themeToggle" class="icon-btn" title="Toggle light / dark">🌙</button>
         <button id="adminToggle" class="ghost-btn">Admin</button>
       </div>
     </header>
+
+    <!-- START: which system to order through -->
+    <main id="view-start" class="view hidden">
+      <div class="start-wrap">
+        <h1 class="start-title">Where should orders go?</h1>
+        <p class="start-sub">Pick the system this shop dispatches to. You can switch at any time.</p>
+        <div class="start-cards">
+          <button class="start-card" data-mode="synaos">
+            <span class="start-emoji">🤖</span>
+            <span class="start-name">SYNAOS</span>
+            <span class="start-desc">Robot delivery — creates AGV transport jobs and tracks them live.</span>
+          </button>
+          <button class="start-card" data-mode="mpdv">
+            <span class="start-emoji">🏭</span>
+            <span class="start-name">MPDV</span>
+            <span class="start-desc">Production order — creates a workplan order in the MPDV MES.</span>
+          </button>
+        </div>
+      </div>
+    </main>
+
+    <!-- MPDV: order result -->
+    <main id="view-mpdv-result" class="view hidden">
+      <div class="progress-wrap" id="mpdvResultWrap"></div>
+    </main>
 
     <!-- USER: SHOP -->
     <main id="view-shop" class="view">
