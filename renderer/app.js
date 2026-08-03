@@ -373,6 +373,16 @@ async function onFinishMpdv() {
   showView('mpdv-result');
 }
 
+// MPDV keeps this id in an 8-character field, so what it stored can be a
+// truncated version of what we sent — say so plainly rather than let it pass.
+function mpdvCreatedIdNote(entry) {
+  if (!entry.createdId) return '';
+  const same = entry.orderNumber && entry.createdId === entry.orderNumber;
+  return same
+    ? ` — MPDV created <b>${escapeHtml(entry.createdId)}</b>`
+    : ` — <span class="mpdv-id-warn">MPDV stored it as <b>${escapeHtml(entry.createdId)}</b></span>`;
+}
+
 function renderMpdvResult(results, total) {
   const okCount = results.filter((r) => r.ok).length;
   const rows = results.map((r) => `
@@ -382,9 +392,9 @@ function renderMpdvResult(results, total) {
         ${escapeHtml(r.productName || '(item)')}
         <div class="step-sub">${r.orderNumber
           ? `Order no. <b>${escapeHtml(r.orderNumber)}</b>`
-          : 'No order number was issued'}</div>
+          : 'No order number was issued'}${mpdvCreatedIdNote(r)}</div>
         ${r.ok ? '' : `<div class="err-text">${escapeHtml(r.error || 'Rejected by MPDV')}</div>`}
-        ${r.ok || !r.response ? '' : `<details class="mpdv-log-raw"><summary>What MPDV replied (HTTP ${r.status === 0 ? 'no reply' : r.status})</summary><pre>${escapeHtml(prettyJson(r.response))}</pre></details>`}
+        ${r.response ? `<details class="mpdv-log-raw"><summary>What MPDV replied (HTTP ${r.status === 0 ? 'no reply' : r.status})</summary><pre>${escapeHtml(prettyJson(r.response))}</pre></details>` : ''}
       </div>
       <div class="qty-lbl">Qty: ${r.quantity}</div>
     </div>`).join('');
@@ -1745,7 +1755,10 @@ function renderAdminSettings() {
             <span class="mpdv-log-time">${escapeHtml(new Date(l.at).toLocaleString())}</span>
           </div>
           ${l.ok ? '' : `<div class="mpdv-log-err">${escapeHtml(l.error || 'Rejected')}</div>`}
-          ${l.response ? `<details class="mpdv-log-raw"><summary>MPDV response</summary><pre>${escapeHtml(prettyJson(l.response))}</pre></details>` : ''}
+          ${l.createdId ? `<div class="mpdv-log-created">${l.createdId === l.orderNumber
+            ? `MPDV created <b>${escapeHtml(l.createdId)}</b>`
+            : `<span class="mpdv-id-warn">MPDV stored it as <b>${escapeHtml(l.createdId)}</b>, not ${escapeHtml(l.orderNumber || '—')}</span>`}</div>` : ''}
+          ${l.response ? `<details class="mpdv-log-raw"><summary>MPDV response${l.ok ? ' (accepted)' : ''}</summary><pre>${escapeHtml(prettyJson(l.response))}</pre></details>` : ''}
           ${l.request ? `<details class="mpdv-log-raw"><summary>Request we sent</summary><pre>${escapeHtml(prettyJson(l.request))}</pre></details>` : ''}
         </div>`).join('')
       : '<p class="hint">No MPDV orders sent yet.</p>';

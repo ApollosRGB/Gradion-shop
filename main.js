@@ -545,6 +545,22 @@ function extractMpdvMessage(value, depth) {
   return null;
 }
 
+// The id MPDV actually created, read from its __rowType: OBJECT row. Worth
+// surfacing because MPDV truncates the id to 8 characters, so what it stored
+// can differ from what was sent.
+function extractMpdvCreatedId(body) {
+  const rows = Array.isArray(body) ? body : [body];
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue;
+    const obj = row.obj || row.data;
+    if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+      const value = obj['workplanorder.id'] || obj['workplanorder.target.id'];
+      if (value !== undefined && value !== null && String(value).trim()) return String(value).trim();
+    }
+  }
+  return null;
+}
+
 // True when the body itself signals a failure even though the status said 200.
 function mpdvBodyLooksFailed(body) {
   if (!body) return false;
@@ -577,7 +593,7 @@ function interpretMpdvResponse(res) {
     return { ok: false, error: message || 'MPDV rejected the order', detail, httpStatus: res.status };
   }
 
-  return { ok: true, detail, httpStatus: res.status };
+  return { ok: true, detail, httpStatus: res.status, createdId: extractMpdvCreatedId(res.data) };
 }
 
 function recordMpdvLog(entry) {
@@ -1018,7 +1034,9 @@ function registerIpc() {
         ok: verdict.ok,
         status: res.status,
         error: verdict.ok ? null : verdict.error,
-        // Exactly what MPDV sent back, kept verbatim for diagnosis
+        // The id MPDV stored — may differ from ours, since it truncates to 8 chars
+        createdId: verdict.createdId || null,
+        // Exactly what MPDV sent back, kept verbatim whether it succeeded or not
         response: verdict.detail || '',
         request: JSON.stringify(payload)
       };

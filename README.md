@@ -7,7 +7,7 @@ A Shopee-style desktop ordering app that dispatches orders to either of two syst
 
 Built with Electron for Windows and macOS, with light/dark mode and separate **user** and **admin** interfaces.
 
-![status](https://img.shields.io/badge/version-1.8.1-e0563f)
+![status](https://img.shields.io/badge/version-1.8.2-e0563f)
 
 ## Features
 
@@ -48,7 +48,7 @@ Selected from the start menu (or the badge in the top bar). Each **cart line** b
 
 The running number is **`DDMMYY` + a two-digit counter** that restarts each day — `03082601`, `03082602`, … `04082601`. It is deliberately 8 characters: MPDV stores this id in an 8-character field, and a longer number is silently truncated, which would make every order of a day collide on one id. That caps the app at **99 MPDV orders per day**; beyond that it refuses to send rather than create a duplicate. The date follows the configured `timeZoneId`, not the PC clock, so the number matches the day MPDV records.
 
-Every send is logged in **Admin → Settings → MPDV** with the order number, quantity, HTTP status and whether MPDV accepted it. A failure shows MPDV's own message, and the **full response body and the request that was sent** are both expandable next to it, pretty-printed — so a rejection can be diagnosed without going near the network tab. The message is dug out of whatever shape MPDV uses (`message`, `errorMessage`, `error`, an `errors` array, a nested `result`, or its `__rowType` rows); if the shape is unrecognised the raw body is shown verbatim, so nothing is ever hidden. MPDV also answers `200` for some rejected orders, so the body is inspected as well as the status code. The host serves a valid DigiCert certificate but not its full chain, so a "don't validate the TLS certificate" option is provided and enabled by default for it.
+Every send is logged in **Admin → Settings → MPDV** with the order number, quantity, HTTP status and whether MPDV accepted it. **The full response body and the request that produced it are kept for every order, successful or not**, expandable and pretty-printed in the log and on the order result screen. A success also reports the id MPDV actually stored; because that field truncates to 8 characters, the app flags it when what MPDV kept differs from what was sent. A failure additionally shows MPDV's own message. The message is dug out of whatever shape MPDV uses (`message`, `errorMessage`, `error`, an `errors` array, a nested `result`, or its `__rowType` rows); if the shape is unrecognised the raw body is shown verbatim, so nothing is ever hidden. MPDV also answers `200` for some rejected orders, so the body is inspected as well as the status code. The host serves a valid DigiCert certificate but not its full chain, so a "don't validate the TLS certificate" option is provided and enabled by default for it.
 
 ## SYNAOS connection
 
@@ -66,8 +66,8 @@ Authentication is HTTP Basic. All admin configuration (products, stations, price
 ## Download
 
 Grab the latest installers from the [Releases page](../../releases):
-- **Windows** — `GradionShop-Setup-1.8.1.exe`
-- **macOS** — `GradionShop-1.8.1.dmg`
+- **Windows** — `GradionShop-Setup-1.8.2.exe`
+- **macOS** — `GradionShop-1.8.2.dmg`
 
 ## Development
 
