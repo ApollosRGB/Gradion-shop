@@ -503,19 +503,81 @@ function mpdvRequest(cfg, body) {
 
 // MPDV answers 200 even for a rejected order, with the problem described in the
 // body, so success is judged on the body as well as the status code.
+// Digs the human-readable message out of whatever MPDV sends back. It is not
+// consistent: a rejection can arrive as HTTP 400 with a JSON body, or as HTTP
+// 200 whose body describes the problem, and the message may sit under any of
+// several field names or inside its __rowType row format. Whatever happens the
+// raw body is kept so nothing is hidden from the operator.
+const MPDV_MESSAGE_FIELDS = [
+  'errorMessage', 'error_message', 'message', 'error', 'errorText', 'text',
+  'detail', 'details', 'description', 'reason', 'exception', 'exceptionMessage',
+  'localizedMessage', 'msg', 'errorDescription'
+];
+
+function extractMpdvMessage(value, depth) {
+  if (value === null || value === undefined || (depth || 0) > 6) return null;
+  if (typeof value === 'string') {
+    const s = value.trim();
+    return s && s !== '{}' && s !== '[]' ? s : null;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') return null;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = extractMpdvMessage(item, (depth || 0) + 1);
+      if (found) return found;
+    }
+    return null;
+  }
+  // Prefer a recognised message field on this object
+  for (const field of MPDV_MESSAGE_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(value, field)) {
+      const found = extractMpdvMessage(value[field], (depth || 0) + 1);
+      if (found) return found;
+    }
+  }
+  // MPDV wraps payloads in rows; the useful part hides under obj/data/result
+  for (const container of ['obj', 'data', 'result', 'response', 'body', 'errors', 'faults']) {
+    if (Object.prototype.hasOwnProperty.call(value, container)) {
+      const found = extractMpdvMessage(value[container], (depth || 0) + 1);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+// True when the body itself signals a failure even though the status said 200.
+function mpdvBodyLooksFailed(body) {
+  if (!body) return false;
+  const rows = Array.isArray(body) ? body : [body];
+  return rows.some((row) => row && typeof row === 'object'
+    && (/error|fault|exception/i.test(String(row.__rowType || ''))
+      || row.error !== undefined || row.errorMessage !== undefined
+      || row.exception !== undefined
+      || (Array.isArray(row.errors) && row.errors.length > 0)));
+}
+
 function interpretMpdvResponse(res) {
+  const raw = typeof res.raw === 'string' ? res.raw : '';
+  const detail = raw.slice(0, 4000);
+
+  // Never reached the server (DNS, TLS, timeout) — there is no body to read
+  if (res.status === 0) {
+    return { ok: false, error: res.error || 'Could not reach MPDV', detail, httpStatus: 0 };
+  }
+
+  const message = extractMpdvMessage(res.data, 0);
+
   if (!res.ok) {
-    return { ok: false, error: res.error || `HTTP ${res.status}`, detail: (res.raw || '').slice(0, 600) };
+    // MPDV's own words if it gave any, otherwise the raw body, otherwise status
+    const fallback = raw.trim() ? raw.trim().slice(0, 400) : `HTTP ${res.status}`;
+    return { ok: false, error: message || fallback, detail, httpStatus: res.status };
   }
-  const body = res.data;
-  const text = typeof res.raw === 'string' ? res.raw : '';
-  const errorish = body && (body.error || body.errorMessage || body.exception
-    || (Array.isArray(body.errors) && body.errors.length ? body.errors : null)
-    || (body.result && body.result.error));
-  if (errorish) {
-    return { ok: false, error: typeof errorish === 'string' ? errorish : JSON.stringify(errorish).slice(0, 400), detail: text.slice(0, 600) };
+
+  if (mpdvBodyLooksFailed(res.data)) {
+    return { ok: false, error: message || 'MPDV rejected the order', detail, httpStatus: res.status };
   }
-  return { ok: true, detail: text.slice(0, 600) };
+
+  return { ok: true, detail, httpStatus: res.status };
 }
 
 function recordMpdvLog(entry) {
@@ -956,7 +1018,9 @@ function registerIpc() {
         ok: verdict.ok,
         status: res.status,
         error: verdict.ok ? null : verdict.error,
-        response: verdict.detail || ''
+        // Exactly what MPDV sent back, kept verbatim for diagnosis
+        response: verdict.detail || '',
+        request: JSON.stringify(payload)
       };
       recordMpdvLog(entry);
       results.push(entry);

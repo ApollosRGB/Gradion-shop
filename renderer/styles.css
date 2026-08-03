@@ -352,6 +352,21 @@ input.inp:focus, select.inp:focus, textarea.inp:focus { outline: 2px solid var(-
 }
 :root[data-theme="dark"] .handover-warn { color: #f0b429; background: rgba(240, 180, 41, 0.1); }
 
+/* MPDV order log */
+.mpdv-log-item { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; background: var(--surface-2); }
+.mpdv-log-item.failed { border-color: #d64545; }
+.mpdv-log-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 13px; }
+.mpdv-log-head .msg { font-weight: 600; }
+.mpdv-log-time { margin-left: auto; color: var(--text-muted); font-size: 12px; }
+.mpdv-log-err { color: #d64545; font-size: 13px; font-weight: 600; margin-top: 6px; word-break: break-word; }
+.mpdv-log-raw { margin-top: 8px; }
+.mpdv-log-raw summary { cursor: pointer; font-size: 12px; color: var(--text-muted); font-weight: 600; }
+.mpdv-log-raw pre {
+  margin: 8px 0 0; padding: 10px; border-radius: 8px; background: var(--bg);
+  border: 1px solid var(--border); font-size: 12px; line-height: 1.45;
+  max-height: 260px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+}
+
 /* Start menu — choose the system */
 .start-wrap { max-width: 860px; margin: 0 auto; padding: 60px 22px; text-align: center; }
 .start-title { margin: 0 0 8px; font-size: 30px; }

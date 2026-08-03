@@ -22,6 +22,17 @@ function uid(prefix) {
 function money(n) {
   return '$' + Number(n || 0).toFixed(2);
 }
+// Pretty-prints a JSON string when it is JSON; otherwise returns it untouched,
+// so a non-JSON error page is still shown exactly as MPDV sent it.
+function prettyJson(text) {
+  if (typeof text !== 'string' || !text.trim()) return String(text || '');
+  try {
+    return JSON.stringify(JSON.parse(text), null, 2);
+  } catch (e) {
+    return text;
+  }
+}
+
 function escapeHtml(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -373,6 +384,7 @@ function renderMpdvResult(results, total) {
           ? `Order no. <b>${escapeHtml(r.orderNumber)}</b>`
           : 'No order number was issued'}</div>
         ${r.ok ? '' : `<div class="err-text">${escapeHtml(r.error || 'Rejected by MPDV')}</div>`}
+        ${r.ok || !r.response ? '' : `<details class="mpdv-log-raw"><summary>What MPDV replied (HTTP ${r.status === 0 ? 'no reply' : r.status})</summary><pre>${escapeHtml(prettyJson(r.response))}</pre></details>`}
       </div>
       <div class="qty-lbl">Qty: ${r.quantity}</div>
     </div>`).join('');
@@ -1724,12 +1736,17 @@ function renderAdminSettings() {
     $('#mpdvNext').innerHTML = `<span class="dot ok"></span> Next order no. <b>${escapeHtml(preview.orderNumber)}</b>
       — ${preview.usedToday} used today, ${preview.remainingToday} left`;
     $('#mpdvLog').innerHTML = log.length
-      ? log.map((l) => `<div class="arm-log-row">
-          <span class="dir ${l.ok ? 'in' : 'out'}">${l.ok ? '✅ sent' : '❌ failed'}</span>
-          <code>${escapeHtml(l.orderNumber || '—')}</code>
-          <span class="msg">${escapeHtml(l.productName || '')} ×${l.quantity}
-            ${l.ok ? '' : '— ' + escapeHtml(l.error || '')}
-            <span style="opacity:.6">${escapeHtml(new Date(l.at).toLocaleString())}</span></span>
+      ? log.map((l, i) => `<div class="mpdv-log-item ${l.ok ? '' : 'failed'}">
+          <div class="mpdv-log-head">
+            <span class="dir ${l.ok ? 'in' : 'out'}">${l.ok ? '✅ sent' : '❌ failed'}</span>
+            <code>${escapeHtml(l.orderNumber || '—')}</code>
+            <span class="chip">HTTP ${l.status === 0 ? 'no reply' : l.status}</span>
+            <span class="msg">${escapeHtml(l.productName || '')} ×${l.quantity}</span>
+            <span class="mpdv-log-time">${escapeHtml(new Date(l.at).toLocaleString())}</span>
+          </div>
+          ${l.ok ? '' : `<div class="mpdv-log-err">${escapeHtml(l.error || 'Rejected')}</div>`}
+          ${l.response ? `<details class="mpdv-log-raw"><summary>MPDV response</summary><pre>${escapeHtml(prettyJson(l.response))}</pre></details>` : ''}
+          ${l.request ? `<details class="mpdv-log-raw"><summary>Request we sent</summary><pre>${escapeHtml(prettyJson(l.request))}</pre></details>` : ''}
         </div>`).join('')
       : '<p class="hint">No MPDV orders sent yet.</p>';
   };
