@@ -176,9 +176,9 @@ function loadStore() {
     data.robots.forEach((r) => { if (r.homeNode === undefined) r.homeNode = null; });
     data.nodes = data.nodes || [];
     data.recalls = data.recalls || [];
-    // A recall may run itself on a timer. The countdown is measured from the end
-    // of the previous run, so the schedule cannot re-trigger a recall that is
-    // still driving; `autoState` is that run's bookkeeping, not configuration.
+    // A recall may run itself once an order has been delivered — `everyMinutes`
+    // is the wait after that delivery, and `autoState` is the bookkeeping for
+    // the pending countdown and the last run, not configuration.
     data.recalls.forEach((r) => {
       r.auto = Object.assign({ enabled: false, everyMinutes: 30, onlyWhenIdle: true }, r.auto || {});
       r.autoState = Object.assign({ jobIds: [] }, r.autoState || {});

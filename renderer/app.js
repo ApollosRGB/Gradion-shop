@@ -726,6 +726,17 @@ async function submitOrderRating(orderId) {
   toast('Thanks for your rating! ⭐', 'success');
 }
 
+// An order counts as delivered the moment its delivery milestones are done.
+// A recall's countdown hangs off that timestamp, so it is stamped in one place
+// no matter who noticed the delivery — the progress screen or the background
+// watcher that keeps running when nobody is looking at it.
+function markOrderDelivered(order) {
+  const already = order.state === 'completed' && order.completedAt;
+  order.state = 'completed';
+  if (!order.completedAt) order.completedAt = new Date().toISOString();
+  return !already;
+}
+
 function startPolling() {
   stopPolling();
   pollOnce();
@@ -766,7 +777,7 @@ async function pollOnce() {
       return d && d.status === 'FINISHED_FAILURE';
     });
     if (allFinished && !order.confirmed && order.state !== 'completed') {
-      order.state = 'completed';
+      markOrderDelivered(order);
       await persist();
       renderOrdersBadge();
       renderProgress(liveJobs, order);   // immediately reflect completion + show rating card
@@ -1002,7 +1013,7 @@ async function confirmOrder(orderId) {
   const order = store.orders.find((o) => o.id === orderId);
   if (!order) return;
   order.confirmed = true;
-  order.state = 'completed';
+  markOrderDelivered(order);
   await persist();
   stopPolling();
   renderOrdersBadge();
@@ -1400,12 +1411,12 @@ function renderAdminRecalls() {
           <div class="auto-box">
             <label class="switch">
               <input type="checkbox" data-rc-auto="${r.id}" ${autoCfg(r).enabled ? 'checked' : ''}>
-              Run this recall automatically
+              Run this recall after an order is delivered
             </label>
-            <label class="inline-fld">every
+            <label class="inline-fld">wait
               <input class="inp" type="number" min="${AUTO_MIN_MINUTES}" max="${AUTO_MAX_MINUTES}" step="1"
                 data-rc-every="${r.id}" value="${Number(autoCfg(r).everyMinutes)}" style="max-width:80px;">
-              minutes <span class="hint" style="margin:0;">after the previous run has finished</span>
+              minutes <span class="hint" style="margin:0;">after the last order was delivered</span>
             </label>
             <label class="switch">
               <input type="checkbox" data-rc-idle="${r.id}" ${autoCfg(r).onlyWhenIdle ? 'checked' : ''}>
@@ -1429,7 +1440,7 @@ function renderAdminRecalls() {
     <div class="panel">
       <h2>Recalls</h2>
       <p class="hint">Routes you run on demand — fetching a rack back from the shop to production, returning an empty carrier, repositioning a load. They never show in the shop, so an order can simply deliver without also hauling everything back.</p>
-      <p class="hint">A recall can also run itself on a timer. The countdown only starts once the previous run has <b>finished</b> — the AGV is never sent out again on top of a trip it is still driving — and the app has to stay open for the timer to run.</p>
+      <p class="hint">A recall can also run itself: the countdown starts when a customer <b>order is delivered</b>, so the rack comes back a set time after it went out. Another delivery while waiting pushes the run back rather than adding a second one, and nothing is ever sent while this recall's own last run is still driving. The app has to stay open for it to run.</p>
       <div class="admin-list">${list || '<p class="hint">No recalls yet. Add one below.</p>'}</div>
       <button class="btn btn-primary" id="addRecall" style="margin-top:16px;">+ New recall</button>
       ${(store.recallLog || []).length ? `<div class="arm-log-title">Recently sent</div><div class="arm-log">${log}</div>` : ''}
@@ -1475,14 +1486,19 @@ function renderAdminRecalls() {
     if (el.checked) armAutoRecall(r);
     await persist();
     renderAdminRecalls();
-    toast(el.checked ? `Automatic runs on — first one in ${autoCfg(r).everyMinutes} min` : 'Automatic runs off', 'success');
+    toast(el.checked
+      ? `Automatic runs on — ${autoCfg(r).everyMinutes} min after the next order is delivered`
+      : 'Automatic runs off', 'success');
   }));
   $$('[data-rc-every]', body).forEach((el) => el.addEventListener('change', async () => {
     const r = findRecall(el.dataset.rcEvery);
     if (!r) return;
     const mins = Math.min(AUTO_MAX_MINUTES, Math.max(AUTO_MIN_MINUTES, Math.round(Number(el.value) || 0)));
     autoCfg(r).everyMinutes = mins;
-    armAutoRecall(r);              // re-measure the wait from now
+    // A countdown already running is re-measured from the delivery that started
+    // it, so changing the wait adjusts it instead of throwing it away.
+    const st = autoState(r);
+    if (st.armedAt) st.nextDueAt = new Date(new Date(st.armedAt).getTime() + autoIntervalMs(r)).toISOString();
     await persist();
     renderAdminRecalls();
   }));
@@ -1571,12 +1587,17 @@ async function sendRecall(recallId, button) {
 
 // ---- Automatic recalls ----
 //
-// A recall can repeat on a timer. The whole design is built around one hazard:
-// sending a recall to an AGV that is still executing the previous one puts the
-// vehicle into an error state. So the countdown never runs while a run is out
-// there — it is started from the moment the previous run *finished*, a run is
-// only considered finished when every one of its jobs (parking move included)
-// reports FINISHED, and a settling gap is added on top before the next send.
+// A recall can run itself after a delivery. What starts the clock is a customer
+// order being **delivered** — the rack is only worth fetching once something has
+// been taken to the shop — so the countdown is measured from the order's
+// completion, not from when the option was switched on.
+//
+// The rest of the design is built around one hazard: sending a recall to an AGV
+// that is still executing the previous one puts the vehicle into an error state.
+// So a recall is never dispatched while its own last run is out there, a run
+// only counts as finished when every one of its jobs (parking move included)
+// reports FINISHED, and finishing a run does not re-arm the clock — only the
+// next delivered order does.
 const AUTO_TICK_MS = 5000;
 const AUTO_MIN_MINUTES = 1;
 const AUTO_MAX_MINUTES = 24 * 60;
@@ -1585,9 +1606,11 @@ const AUTO_MAX_FAILURES = 3;               // then stop trying by itself
 const AUTO_WATCHDOG_MS = 60 * 60 * 1000;   // a run that never finishes pauses the timer
 const AUTO_BOOT_GRACE_MS = 60000;          // nothing drives off the moment the app opens
 const ORDER_STALE_MS = 30 * 60 * 1000;     // an order older than this no longer counts as live
+const ORDER_WATCH_TICKS = 3;               // check live orders every third tick (~15s)
 
 let autoRecallTimer = null;
 let autoRecallBusy = false;
+let orderWatchCounter = 0;
 
 function autoCfg(recall) {
   const a = recall.auto || (recall.auto = {});
@@ -1608,14 +1631,79 @@ function autoIntervalMs(recall) {
   return m * 60000;
 }
 
-// Start (or restart) the wait from now — used when the operator switches the
-// timer on or changes the interval.
+// Switching the option on (or changing the wait) does not start a countdown —
+// the next delivered order does. Everything already delivered is written off as
+// history, so ticking the box never reaches back and fires on an old order.
 function armAutoRecall(recall) {
   const st = autoState(recall);
-  if (st.jobIds.length) return;      // a run is out there; it will set the time itself
-  st.nextDueAt = new Date(Date.now() + autoIntervalMs(recall)).toISOString();
+  const last = latestOrderDelivery();
+  st.watermark = last ? last.completedAt : new Date().toISOString();
+  st.armedAt = null;
+  st.armedBy = null;
+  st.nextDueAt = null;
   if (st.lastResult === 'stalled') st.lastResult = null;
   st.failures = 0;
+}
+
+// The most recently delivered order, whichever way it was completed.
+function latestOrderDelivery() {
+  let best = null;
+  (store.orders || []).forEach((o) => {
+    if (!o.completedAt || !(o.state === 'completed' || o.confirmed)) return;
+    if (!best || new Date(o.completedAt).getTime() > new Date(best.completedAt).getTime()) best = o;
+  });
+  return best;
+}
+
+// Hang the countdown off the newest delivery this recall has not accounted for.
+// A further delivery while waiting pushes the run back rather than adding a
+// second one: the AGV goes in once the deliveries have settled.
+function armFromDeliveries(recall) {
+  const st = autoState(recall);
+  const last = latestOrderDelivery();
+  if (!last) return false;
+  const at = new Date(last.completedAt).getTime();
+  if (st.watermark && at <= new Date(st.watermark).getTime()) return false;   // already accounted for
+  st.watermark = last.completedAt;
+  st.armedAt = last.completedAt;
+  st.armedBy = last.shortId || last.id;
+  st.nextDueAt = new Date(at + autoIntervalMs(recall)).toISOString();
+  return true;
+}
+
+// Watches orders that are still running even when nobody is on the progress
+// screen — that screen only polls while it is open, and the recall has to know
+// about a delivery whether or not the customer stayed to watch it.
+async function refreshLiveOrders() {
+  const live = (store.orders || []).filter((o) => o.state === 'in_progress' && !o.confirmed);
+  let changed = false;
+  for (const order of live) {
+    const created = (order.jobs || []).filter((j) => j.created && j.jobId);
+    if (!created.length) continue;
+    let delivered = true;
+    let failed = false;
+    for (const j of created) {
+      let res = null;
+      try {
+        res = await window.api.getJob(j.jobId);
+      } catch (e) {
+        delivered = false;
+        break;
+      }
+      if (!res || !res.ok || !res.data) { delivered = false; break; }
+      const d = res.data;
+      if (d.status === 'FINISHED_FAILURE') { failed = true; delivered = false; break; }
+      if (d.status === 'FINISHED_SUCCESS' || d.finishedExternally) continue;
+      // Delivered once the delivery milestones are done — the robot driving off
+      // to its waiting spot afterwards does not hold the order open.
+      const delivery = (d.milestones || []).filter((m) => !isWaitingSpotMilestone(m));
+      if (!delivery.length || !delivery.every((m) => milestonePhase(m) === 4)) { delivered = false; break; }
+    }
+    if (delivered) { markOrderDelivered(order); changed = true; }
+    else if (failed) { order.state = 'failed'; changed = true; }
+  }
+  if (changed) renderOrdersBadge();
+  return changed;
 }
 
 function pauseAutoRecall(recall, why) {
@@ -1624,12 +1712,17 @@ function pauseAutoRecall(recall, why) {
   toast(`${recall.name}: automatic runs paused — ${why}.`, 'error');
 }
 
-// A run is settled: start the countdown to the next one from *now*.
+// A run is settled. It deliberately does NOT schedule another one — only the
+// next delivered order does that — and it holds the recall back for a settling
+// gap so nothing can go out on the heels of the AGV that has just parked.
 function settleAutoRecall(recall, verdict) {
   const st = autoState(recall);
   st.jobIds = [];
   st.finishedAt = new Date().toISOString();
-  st.nextDueAt = new Date(Date.now() + AUTO_SETTLE_MS + autoIntervalMs(recall)).toISOString();
+  st.holdUntil = new Date(Date.now() + AUTO_SETTLE_MS).toISOString();
+  st.nextDueAt = null;
+  st.armedAt = null;
+  st.armedBy = null;
   st.lastResult = verdict;
   st.failures = verdict === 'ok' ? 0 : (st.failures || 0) + 1;
   if (verdict !== 'ok' && st.failures >= AUTO_MAX_FAILURES && autoCfg(recall).enabled) {
@@ -1706,6 +1799,8 @@ async function serviceAutoRecall(recall) {
         st.jobIds = [];
         st.lastResult = 'stalled';
         st.nextDueAt = null;
+        st.armedAt = null;
+        st.armedBy = null;
         if (cfg.enabled) pauseAutoRecall(recall, 'the last run never reported finished');
         return true;
       }
@@ -1717,12 +1812,16 @@ async function serviceAutoRecall(recall) {
 
   if (!cfg.enabled || isMpdv()) return false;
   if (st.lastResult === 'stalled') return false;
-  if (!st.nextDueAt) { armAutoRecall(recall); return true; }
-  if (Date.now() < new Date(st.nextDueAt).getTime()) return false;
+
+  // 2. A newly delivered order starts (or pushes back) the countdown.
+  const armed = armFromDeliveries(recall);
+  if (!st.nextDueAt) return armed;                                  // nothing delivered to wait on
+  if (Date.now() < new Date(st.nextDueAt).getTime()) return armed;
+  if (st.holdUntil && Date.now() < new Date(st.holdUntil).getTime()) return armed;
 
   // Due — but only if the floor is clear.
-  if (autoRecallInFlight(recall)) return false;
-  if (cfg.onlyWhenIdle && anOrderIsRunning()) return false;
+  if (autoRecallInFlight(recall)) return armed;
+  if (cfg.onlyWhenIdle && anOrderIsRunning()) return armed;
   if (!(recall.steps || []).filter((s) => !isHandoverStep(s)).length) {
     pauseAutoRecall(recall, 'it has no steps');
     return true;
@@ -1747,6 +1846,12 @@ async function autoRecallTick() {
     // Judge a run against the relay supervisor's latest hand-over state, not a
     // copy that may be minutes old.
     if (watched.some((r) => ((r.autoState || {}).jobIds || []).length)) await syncRelaysFromMain();
+    // Notice deliveries that finish while nobody is watching the progress
+    // screen — they are what starts a recall's countdown.
+    if (watched.some((r) => r.auto && r.auto.enabled)) {
+      orderWatchCounter = (orderWatchCounter + 1) % ORDER_WATCH_TICKS;
+      if (orderWatchCounter === 0 && (await refreshLiveOrders())) changed = true;
+    }
     for (const recall of watched) {
       changed = (await serviceAutoRecall(recall)) || changed;
     }
@@ -1787,16 +1892,18 @@ function fmtCountdown(ms) {
 function autoStatusText(recall) {
   const cfg = autoCfg(recall);
   const st = autoState(recall);
-  if (st.jobIds.length) return '🚚 Running now — the next one waits until this AGV is finished';
+  if (st.jobIds.length) return '🚚 Running now — nothing else goes out until this AGV is finished';
   if (st.lastResult === 'stalled') return '⏸️ Paused — the last run never reported finished; send it by hand to check the AGV';
   if (!cfg.enabled) {
     return st.finishedAt ? `Automatic runs off — last run ${shortDateTime(st.finishedAt)}` : '';
   }
-  if (!st.nextDueAt) return '⏱️ Waiting for the last run to finish';
+  if (!st.nextDueAt) return '⏱️ Waiting for the next order to be delivered';
+  const by = st.armedBy ? ` — order #${st.armedBy} was delivered ${shortDateTime(st.armedAt)}` : '';
   const left = new Date(st.nextDueAt).getTime() - Date.now();
-  if (left > 0) return `⏱️ Next run in ${fmtCountdown(left)}`;
+  if (left > 0) return `⏱️ Runs in ${fmtCountdown(left)}${by}`;
   if (cfg.onlyWhenIdle && anOrderIsRunning()) return '⏳ Due — holding until the customer order is finished';
   if (autoRecallInFlight(recall)) return '⏳ Due — holding until the other recall is finished';
+  if (st.holdUntil && Date.now() < new Date(st.holdUntil).getTime()) return '⏳ Due — letting the AGV settle first';
   return '⏳ Due — starting…';
 }
 
