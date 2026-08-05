@@ -180,7 +180,12 @@ function loadStore() {
     // is the wait after that delivery, and `autoState` is the bookkeeping for
     // the pending countdown and the last run, not configuration.
     data.recalls.forEach((r) => {
-      r.auto = Object.assign({ enabled: false, everyMinutes: 30, onlyWhenIdle: true }, r.auto || {});
+      r.auto = Object.assign({
+        enabled: false, everyMinutes: 30, onlyWhenIdle: true,
+        // Which deliveries wake it: any, only orders containing certain
+        // products, or only orders a certain AGV delivered.
+        triggerMode: 'any', triggerProducts: [], triggerRobots: []
+      }, r.auto || {});
       r.autoState = Object.assign({ jobIds: [] }, r.autoState || {});
     });
     data.recallLog = data.recallLog || [];

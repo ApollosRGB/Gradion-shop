@@ -449,6 +449,12 @@ input.inp:focus, select.inp:focus, textarea.inp:focus { outline: 2px solid var(-
 .auto-box .switch { font-size: 13px; font-weight: 600; color: var(--text); }
 .auto-box .inp { padding: 4px 8px; font-size: 13px; }
 .auto-box .hint { font-weight: 400; }
+.auto-picks {
+  flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 6px 16px;
+  padding: 8px 10px; border-radius: 10px; background: var(--surface);
+  border: 1px solid var(--border);
+}
+.auto-picks .switch { font-size: 13px; font-weight: 500; color: var(--text); }
 .auto-status { flex-basis: 100%; font-size: 13px; font-weight: 600; color: var(--text-muted); min-height: 18px; }
 
 /* Robot scanner */

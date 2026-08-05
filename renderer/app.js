@@ -752,12 +752,17 @@ async function pollOnce() {
   if (order.confirmed || order.state === 'completed') { stopPolling(); }
 
   const liveJobs = {};
+  let noted = false;
   await Promise.all(order.jobs.filter((j) => j.created && j.jobId).map(async (j) => {
     try {
       const res = await window.api.getJob(j.jobId);
-      if (res && res.ok && res.data) liveJobs[j.jobId] = res.data;
+      if (res && res.ok && res.data) {
+        liveJobs[j.jobId] = res.data;
+        if (noteAssignedResource(order, j.jobId, res.data)) noted = true;
+      }
     } catch (e) { /* ignore transient */ }
   }));
+  if (noted) await persist();   // which AGV ran it — a recall may be waiting on that
   renderProgress(liveJobs, order);
 
   // Auto-complete when the API reports all jobs finished
@@ -1418,10 +1423,18 @@ function renderAdminRecalls() {
                 data-rc-every="${r.id}" value="${Number(autoCfg(r).everyMinutes)}" style="max-width:80px;">
               minutes <span class="hint" style="margin:0;">after the last order was delivered</span>
             </label>
+            <label class="inline-fld">triggered by
+              <select class="inp" data-rc-trigger="${r.id}" style="max-width:230px;">
+                <option value="any" ${autoCfg(r).triggerMode === 'any' ? 'selected' : ''}>any delivered order</option>
+                <option value="product" ${autoCfg(r).triggerMode === 'product' ? 'selected' : ''}>deliveries of chosen products</option>
+                <option value="robot" ${autoCfg(r).triggerMode === 'robot' ? 'selected' : ''}>deliveries by chosen robots</option>
+              </select>
+            </label>
             <label class="switch">
               <input type="checkbox" data-rc-idle="${r.id}" ${autoCfg(r).onlyWhenIdle ? 'checked' : ''}>
               Only when no customer order is running
             </label>
+            ${triggerPicks(r)}
             <div class="auto-status" data-rc-auto-status="${r.id}">${escapeHtml(autoStatusText(r))}</div>
           </div>
         </div>
@@ -1487,7 +1500,7 @@ function renderAdminRecalls() {
     await persist();
     renderAdminRecalls();
     toast(el.checked
-      ? `Automatic runs on — ${autoCfg(r).everyMinutes} min after the next order is delivered`
+      ? `Automatic runs on — ${autoCfg(r).everyMinutes} min after ${triggerSummary(r) || 'the trigger you pick'}`
       : 'Automatic runs off', 'success');
   }));
   $$('[data-rc-every]', body).forEach((el) => el.addEventListener('change', async () => {
@@ -1509,6 +1522,49 @@ function renderAdminRecalls() {
     await persist();
     renderAdminRecalls();
   }));
+  $$('[data-rc-trigger]', body).forEach((el) => el.addEventListener('change', async () => {
+    const r = findRecall(el.dataset.rcTrigger);
+    if (!r) return;
+    autoCfg(r).triggerMode = el.value;
+    // A pending countdown was armed under the old rule, so drop it and wait for
+    // a delivery that matches the new one.
+    if (autoCfg(r).enabled) armAutoRecall(r);
+    await persist();
+    renderAdminRecalls();
+  }));
+  const togglePick = async (el, key) => {
+    const r = findRecall(el.dataset.rcTp || el.dataset.rcTr);
+    if (!r) return;
+    const list = autoCfg(r)[key];
+    const at = list.indexOf(el.value);
+    if (el.checked && at < 0) list.push(el.value);
+    if (!el.checked && at >= 0) list.splice(at, 1);
+    if (autoCfg(r).enabled) armAutoRecall(r);
+    await persist();
+    renderAdminRecalls();
+  };
+  $$('[data-rc-tp]', body).forEach((el) => el.addEventListener('change', () => togglePick(el, 'triggerProducts')));
+  $$('[data-rc-tr]', body).forEach((el) => el.addEventListener('change', () => togglePick(el, 'triggerRobots')));
+}
+
+// The products / robots a recall answers to, as a row of tick boxes. Only shown
+// once the operator has narrowed the trigger down from "any delivered order".
+function triggerPicks(recall) {
+  const cfg = autoCfg(recall);
+  if (cfg.triggerMode === 'any') return '';
+  const items = cfg.triggerMode === 'product'
+    ? store.products.map((p) => ({ id: p.id, label: p.name, on: cfg.triggerProducts.includes(p.id) }))
+    : allRobotIds().map((id) => ({ id, label: id, on: cfg.triggerRobots.includes(id) }));
+  if (!items.length) {
+    return `<div class="auto-picks"><span class="hint" style="margin:0;">${cfg.triggerMode === 'product'
+      ? 'No products defined yet.' : 'No robots added yet.'}</span></div>`;
+  }
+  const attr = cfg.triggerMode === 'product' ? 'data-rc-tp' : 'data-rc-tr';
+  return `<div class="auto-picks">${items.map((it) => `
+    <label class="switch">
+      <input type="checkbox" ${attr}="${recall.id}" value="${escapeHtml(it.id)}" ${it.on ? 'checked' : ''}>
+      ${escapeHtml(it.label)}
+    </label>`).join('')}</div>`;
 }
 
 // Dispatches a recall down the same path as an order: legs are planned from the
@@ -1617,7 +1673,25 @@ function autoCfg(recall) {
   if (typeof a.enabled !== 'boolean') a.enabled = false;
   if (!(Number(a.everyMinutes) > 0)) a.everyMinutes = 30;
   if (typeof a.onlyWhenIdle !== 'boolean') a.onlyWhenIdle = true;
+  if (a.triggerMode !== 'product' && a.triggerMode !== 'robot') a.triggerMode = 'any';
+  if (!Array.isArray(a.triggerProducts)) a.triggerProducts = [];
+  if (!Array.isArray(a.triggerRobots)) a.triggerRobots = [];
   return a;
+}
+
+// What the operator chose, in words — used in the status line and the log.
+function triggerSummary(recall) {
+  const cfg = autoCfg(recall);
+  if (cfg.triggerMode === 'product') {
+    const names = cfg.triggerProducts
+      .map((id) => (store.products.find((p) => p.id === id) || {}).name)
+      .filter(Boolean);
+    return names.length ? `a delivery of ${names.join(' or ')}` : null;
+  }
+  if (cfg.triggerMode === 'robot') {
+    return cfg.triggerRobots.length ? `a delivery by ${cfg.triggerRobots.join(' or ')}` : null;
+  }
+  return 'the next order to be delivered';
 }
 
 function autoState(recall) {
@@ -1632,12 +1706,11 @@ function autoIntervalMs(recall) {
 }
 
 // Switching the option on (or changing the wait) does not start a countdown —
-// the next delivered order does. Everything already delivered is written off as
-// history, so ticking the box never reaches back and fires on an old order.
+// the next delivered order does. Everything delivered up to now is written off
+// as history, so ticking the box never reaches back and fires on an old order.
 function armAutoRecall(recall) {
   const st = autoState(recall);
-  const last = latestOrderDelivery();
-  st.watermark = last ? last.completedAt : new Date().toISOString();
+  st.watermark = new Date().toISOString();
   st.armedAt = null;
   st.armedBy = null;
   st.nextDueAt = null;
@@ -1645,14 +1718,43 @@ function armAutoRecall(recall) {
   st.failures = 0;
 }
 
-// The most recently delivered order, whichever way it was completed.
-function latestOrderDelivery() {
+// Which deliveries wake this recall. Left on "any", several recalls on auto
+// would all arm off the same order — one rack coming back is right, three AGVs
+// converging on the shop because one order landed is not. So a recall can be
+// tied to the products it fetches back, or to the AGV that has just delivered.
+function orderMatchesTrigger(recall, order) {
+  const cfg = autoCfg(recall);
+  if (cfg.triggerMode === 'product') {
+    if (!cfg.triggerProducts.length) return false;    // nothing chosen yet — never fire on a guess
+    return (order.items || []).some((i) => cfg.triggerProducts.includes(i.productId));
+  }
+  if (cfg.triggerMode === 'robot') {
+    if (!cfg.triggerRobots.length) return false;
+    return (order.jobs || []).some((j) => j.assignedResourceId && cfg.triggerRobots.includes(j.assignedResourceId));
+  }
+  return true;
+}
+
+// The most recently delivered order this recall answers to.
+function latestOrderDelivery(recall) {
   let best = null;
   (store.orders || []).forEach((o) => {
     if (!o.completedAt || !(o.state === 'completed' || o.confirmed)) return;
+    if (recall && !orderMatchesTrigger(recall, o)) return;
     if (!best || new Date(o.completedAt).getTime() > new Date(best.completedAt).getTime()) best = o;
   });
   return best;
+}
+
+// SYNAOS may pick the robot itself, so an order often only learns which AGV ran
+// it from the live job. A recall triggered by robot depends on that being
+// written down, so record it wherever a job is polled.
+function noteAssignedResource(order, jobId, data) {
+  if (!data || !data.assignedResourceId) return false;
+  const job = (order.jobs || []).find((j) => j.jobId === jobId);
+  if (!job || job.assignedResourceId === data.assignedResourceId) return false;
+  job.assignedResourceId = data.assignedResourceId;
+  return true;
 }
 
 // Hang the countdown off the newest delivery this recall has not accounted for.
@@ -1660,7 +1762,7 @@ function latestOrderDelivery() {
 // second one: the AGV goes in once the deliveries have settled.
 function armFromDeliveries(recall) {
   const st = autoState(recall);
-  const last = latestOrderDelivery();
+  const last = latestOrderDelivery(recall);
   if (!last) return false;
   const at = new Date(last.completedAt).getTime();
   if (st.watermark && at <= new Date(st.watermark).getTime()) return false;   // already accounted for
@@ -1692,6 +1794,7 @@ async function refreshLiveOrders() {
       }
       if (!res || !res.ok || !res.data) { delivered = false; break; }
       const d = res.data;
+      if (noteAssignedResource(order, j.jobId, d)) changed = true;
       if (d.status === 'FINISHED_FAILURE') { failed = true; delivered = false; break; }
       if (d.status === 'FINISHED_SUCCESS' || d.finishedExternally) continue;
       // Delivered once the delivery milestones are done — the robot driving off
@@ -1897,7 +2000,12 @@ function autoStatusText(recall) {
   if (!cfg.enabled) {
     return st.finishedAt ? `Automatic runs off — last run ${shortDateTime(st.finishedAt)}` : '';
   }
-  if (!st.nextDueAt) return '⏱️ Waiting for the next order to be delivered';
+  if (!st.nextDueAt) {
+    const what = triggerSummary(recall);
+    return what
+      ? `⏱️ Waiting for ${what}`
+      : `⚠️ Nothing chosen to trigger it — tick the ${cfg.triggerMode === 'product' ? 'products' : 'robots'} it should follow`;
+  }
   const by = st.armedBy ? ` — order #${st.armedBy} was delivered ${shortDateTime(st.armedAt)}` : '';
   const left = new Date(st.nextDueAt).getTime() - Date.now();
   if (left > 0) return `⏱️ Runs in ${fmtCountdown(left)}${by}`;
