@@ -1345,6 +1345,8 @@ function renderAdminStations() {
     </div>`).join('');
 
   const robots = store.robots || [];
+  // Left over from when reading SYNAOS saved every robot it saw
+  const autoAdded = robots.filter((r) => r.source === 'discovered');
   const robotsHtml = robots.length
     ? robots.map((r) => {
       // Stations this robot is barred from, according to SYNAOS job history
@@ -1358,7 +1360,7 @@ function renderAdminStations() {
           <div class="title-row">
             <span class="nm">${escapeHtml(r.id)}</span>
             ${r.mode ? `<span class="chip on">${escapeHtml(r.mode)}</span>` : '<span class="chip off">unknown mode</span>'}
-            <span class="chip">${r.source === 'manual' ? 'added manually' : 'discovered'}</span>
+            <span class="chip ${r.source === 'manual' ? '' : 'off'}">${r.source === 'manual' ? 'added by you' : 'auto-added'}</span>
             <span class="chip ${robotKind(r) === 'simulated' ? '' : 'on'}">${robotKind(r) === 'simulated' ? '🧪 simulated' : '🚚 real'}</span>
             <select class="inp kind-select" data-robot-kind="${escapeHtml(r.id)}" title="SYNAOS doesn't tell us this — correct it if the guess is wrong">
               <option value="" ${!r.kind ? 'selected' : ''}>auto (from the name)</option>
@@ -1430,11 +1432,13 @@ function renderAdminStations() {
         <h2>Robots (transport resources)</h2>
         <button class="btn btn-secondary" id="syncSynaos2">⟳ Read from SYNAOS</button>
       </div>
-      <p class="hint">The AGVs/robots SYNAOS is using. Reading from jobs only finds robots that have already run one, so a registered but unused AGV stays invisible — use the scanner below to find those. ✖ marks stations SYNAOS reported the robot cannot reach.</p>
+      <p class="hint">Only the robots you add yourself — a tenant carries plenty of AGVs that have nothing to do with this shop, so nothing is saved automatically. Every id is checked against SYNAOS before it is added. ✖ marks stations SYNAOS reported the robot cannot reach.</p>
       <div class="admin-list">${robotsHtml}</div>
       <div class="row-actions" style="margin-top:16px;">
         <button class="btn btn-primary" id="addRobot">+ Add robot by id</button>
+        ${autoAdded.length ? `<button class="btn btn-secondary" id="dropAutoAdded">Remove ${autoAdded.length} auto-added robot(s)</button>` : ''}
       </div>
+      ${autoAdded.length ? `<span class="fld-hint">Earlier versions saved every robot seen in job history. Those are marked <b>auto-added</b> — remove the ones this shop doesn't use.</span>` : ''}
       <div class="scan-box">
         <div class="arm-log-title">Find robots in SYNAOS</div>
         <p class="hint">SYNAOS does not let this app list the fleet — that page is behind its web login — so ids have to be checked one by one.
@@ -1570,6 +1574,23 @@ function renderAdminStations() {
     });
   }));
   $('#addRobot').addEventListener('click', addRobotByIdFlow);
+  const dropAuto = $('#dropAutoAdded');
+  if (dropAuto) dropAuto.addEventListener('click', () => {
+    const ids = (store.robots || []).filter((r) => r.source === 'discovered').map((r) => r.id);
+    confirmModal('Remove auto-added robots?',
+      `${ids.join(', ')} will be removed. Robots you added yourself are kept, and any station allow-lists mentioning these are cleaned up.`,
+      async () => {
+        store.robots = (store.robots || []).filter((r) => r.source !== 'discovered');
+        store.stations.forEach((s) => { s.allowedRobots = (s.allowedRobots || []).filter((x) => !ids.includes(x)); });
+        store.products.forEach((p) => {
+          if (ids.includes(p.resourceId)) p.resourceId = AUTO_CAPABLE;
+          (p.steps || []).forEach((st) => { if (ids.includes(st.resourceId)) st.resourceId = STEP_INHERIT; });
+        });
+        await persist();
+        renderAdminStations();
+        toast(`Removed ${ids.length} auto-added robot(s)`, 'success');
+      });
+  });
   $('#addStation').addEventListener('click', async () => {
     store.stations.push({ id: uid('st'), stationId: 'NEW', name: 'New station', fn: 'other', system: 'STATION', allowedRobots: [] });
     await persist();
@@ -1684,12 +1705,9 @@ async function discoverFromSynaosFlow() {
   // Cache robots + learned station access immediately.
   // Discovered robots are merged in, so manually added ones (e.g. a robot that has
   // never appeared in a job) are never dropped.
-  // Manually added and scanned robots must survive a re-read; discovery only
-  // ever sees robots that have already run a job.
-  const manual = (store.robots || []).filter((r) => r.source === 'manual');
-  const discovered = (res.robots || []).map((r) => ({ ...r, source: 'discovered' }));
-  const seen = new Set(discovered.map((r) => r.id));
-  store.robots = [...discovered, ...manual.filter((r) => !seen.has(r.id))];
+  // Robots are never added on their own: a tenant carries plenty of AGVs that
+  // have nothing to do with this shop. Only the station/robot access evidence is
+  // kept, which merely drives the "cannot reach" warnings.
   store.capability = res.capability || {};
   await persist();
   openDiscoverModal(res);
@@ -1721,21 +1739,34 @@ function openDiscoverModal(res) {
       </label>`;
   }).join('');
 
-  const robotLines = (res.robots || []).map((r) =>
-    `<span class="chip">${escapeHtml(r.id)}${r.mode ? ' · ' + escapeHtml(r.mode) : ''}</span>`).join(' ');
+  // Offered, never taken automatically — tick only the ones this shop uses.
+  const knownRobots = new Set((store.robots || []).map((r) => r.id));
+  const discoveredRobots = res.robots || [];
+  const robotRows = discoveredRobots.map((r, i) => {
+    const already = knownRobots.has(r.id);
+    return `
+      <label class="disc-row">
+        <input type="checkbox" data-disc-robot="${i}" ${already ? 'disabled' : ''}>
+        <span class="disc-id">${escapeHtml(r.id)}</span>
+        ${r.mode ? `<span class="chip on">${escapeHtml(r.mode)}</span>` : ''}
+        <span class="chip ${looksSimulated(r.id) ? '' : 'on'}">${looksSimulated(r.id) ? 'looks simulated' : 'looks real'}</span>
+        ${already ? '<span class="disc-note">already added</span>' : ''}
+      </label>`;
+  }).join('');
 
   const host = modalHost();
   host.innerHTML = `
     <div class="modal-backdrop">
       <div class="modal" style="max-width:560px;">
         <h3>Read from SYNAOS</h3>
-        <p>Found <b>${res.stations.length}</b> station(s), <b>${discoveredNodes.length}</b> node(s) and <b>${(res.robots || []).length}</b> robot(s) across <b>${res.jobCount}</b> jobs.
-          This only sees what has already been used in a job — scan a range in the Robots panel to find the rest.</p>
+        <p>Found <b>${res.stations.length}</b> station(s), <b>${discoveredNodes.length}</b> node(s) and <b>${discoveredRobots.length}</b> robot(s) across <b>${res.jobCount}</b> jobs.
+          Nothing is saved unless you tick it. This only sees what has already been used in a job — paste the vehicle list in the Robots panel to add the rest.</p>
         <div class="arm-log-title">Stations</div>
         <div class="disc-list">${rows || '<p class="hint">No station addresses found.</p>'}</div>
         <div class="arm-log-title">Navigation-graph nodes</div>
         <div class="disc-list">${nodeRows || '<p class="hint">No node addresses found.</p>'}</div>
-        ${robotLines ? `<div style="margin-top:14px;"><div class="hint" style="margin-bottom:6px;">Robots (saved automatically):</div>${robotLines}</div>` : ''}
+        <div class="arm-log-title">Robots — none are added unless you tick them</div>
+        <div class="disc-list">${robotRows || '<p class="hint">No robots found in job history.</p>'}</div>
         <div class="modal-actions">
           <button class="btn btn-secondary" id="discCancel">Close</button>
           <button class="btn btn-primary" id="discImport">Import selected</button>
@@ -1768,6 +1799,16 @@ function openDiscoverModal(res) {
       addedNodes++;
     });
 
+    const pickedRobots = $$('[data-disc-robot]').filter((c) => c.checked && !c.disabled)
+      .map((c) => discoveredRobots[+c.dataset.discRobot]);
+    store.robots = store.robots || [];
+    let addedRobots = 0;
+    pickedRobots.forEach((r) => {
+      if (store.robots.some((x) => x.id === r.id)) return;
+      store.robots.push({ ...r, source: 'manual', homeNode: null });
+      addedRobots++;
+    });
+
     await persist();
     closeModal();
     renderCatalog();
@@ -1775,6 +1816,7 @@ function openDiscoverModal(res) {
     const parts = [];
     if (added) parts.push(`${added} station(s)`);
     if (addedNodes) parts.push(`${addedNodes} node(s)`);
+    if (addedRobots) parts.push(`${addedRobots} robot(s)`);
     toast(parts.length ? `Imported ${parts.join(' and ')} from SYNAOS` : 'Nothing new to import',
       parts.length ? 'success' : undefined);
   });

@@ -7,7 +7,7 @@ A Shopee-style desktop ordering app that dispatches orders to either of two syst
 
 Built with Electron for Windows and macOS, with light/dark mode and separate **user** and **admin** interfaces.
 
-![status](https://img.shields.io/badge/version-1.8.4-e0563f)
+![status](https://img.shields.io/badge/version-1.8.5-e0563f)
 
 ## Features
 
@@ -23,7 +23,7 @@ Built with Electron for Windows and macOS, with light/dark mode and separate **u
 - **Jobs / Products** — define each product as a sequence of job milestones (station + action + **the robot that performs it**, e.g. *Production · PICK → Shop · DROP*), set its price, attach an image file, and choose whether users can see it.
 - **Multi-robot relays** — a SYNAOS job is executed by exactly one transport resource, so when consecutive steps use different robots the app splits the route into **one job per robot** and chains them with a milestone dependency (`requiredPredecessorStatus: FINISHED`), meaning a leg cannot start approaching until the previous leg has finished. The editor previews the split and warns if a robot change isn't a **DROP → PICK at the same station**, which is what a physical hand-over requires.
 - **Stations** — map a friendly name + **function** (production, storage, shop, charging…) to a SYNAOS station address ID used in job milestones. **Add from SYNAOS** reads the real station addresses the tenant uses (derived from the job-manager, the only data reachable with Basic auth — the layout/fleet services sit behind an OAuth2 gateway), so you don't hand-type IDs.
-- **Robots** — SYNAOS does not let this app list the fleet (that page sits behind its own web login), and reading job history only reveals robots that have already run a job. So **paste the vehicle list** copied from SYNAOS's Fleet Management page: every id in the text is verified against SYNAOS before being offered, and surrounding words are harmless because anything that isn't a real resource simply fails the check. **Ids & patterns** covers ranges and wildcards (`36020-36040`, `#` a digit, `?` a digit or letter, `[1-9]` a set, 600 ids per scan) for predictable naming, but an id with an unguessable part such as `sc-aware-JQ3H0018` can only be found by pasting it. Each robot is also marked **real** or **simulated** — guessed from the name, since SYNAOS exposes no such flag over this API, and overridable per robot.
+- **Robots** — **nothing is added automatically.** A tenant carries plenty of AGVs that have nothing to do with this shop, so reading from SYNAOS only *offers* what it found and saves only what you tick. SYNAOS does not let this app list the fleet (that page sits behind its own web login), and reading job history only reveals robots that have already run a job. So **paste the vehicle list** copied from SYNAOS's Fleet Management page: every id in the text is verified against SYNAOS before being offered, and surrounding words are harmless because anything that isn't a real resource simply fails the check. **Ids & patterns** covers ranges and wildcards (`36020-36040`, `#` a digit, `?` a digit or letter, `[1-9]` a set, 600 ids per scan) for predictable naming, but an id with an unguessable part such as `sc-aware-JQ3H0018` can only be found by pasting it. Each robot is also marked **real** or **simulated** — guessed from the name, since SYNAOS exposes no such flag over this API, and overridable per robot.
 - **Nodes** — an address book of navigation-graph points (waiting spots, parking, staging) kept separate from handling stations, each with a friendly name. A robot's waiting spot is chosen from this list rather than typed by hand, and reading from SYNAOS files node addresses here instead of mixing them in with stations.
 - **Robot ↔ station access** — each station has an *allowed robots* list. The app also mines job history for `UNABLE_TO_ACCESS_ADDRESS` and marks those robots ✖ for that station. A product's robot dropdown only offers robots that can reach **every** station on its route; the rest are disabled with the reason. Products default to **“Auto — only robots that can reach these stations”**, which pins a capable robot (spread across them) instead of leaving it to the SYNAOS scheduler, which has been observed picking unreachable robots. A pinned-but-incapable robot is never sent — the job degrades to scheduler assignment with a warning.
 - **Waiting spots** — each robot can be given a home node on its navigation graph (e.g. `00` on `TUSK/NODES`). Once a robot finishes its part of an order, the app appends a `MOVE` to that node at the end of *its* job, so it parks itself. The trailing move is tagged with a correlation and excluded from the customer's progress, and the next robot in a relay waits on the previous robot's last **delivery** milestone — not on it finishing parking. Robots left to the SYNAOS scheduler get no waiting spot, since the app can't know which robot will run the leg.
@@ -67,8 +67,8 @@ Authentication is HTTP Basic. All admin configuration (products, stations, price
 ## Download
 
 Grab the latest installers from the [Releases page](../../releases):
-- **Windows** — `GradionShop-Setup-1.8.4.exe`
-- **macOS** — `GradionShop-1.8.4.dmg`
+- **Windows** — `GradionShop-Setup-1.8.5.exe`
+- **macOS** — `GradionShop-1.8.5.dmg`
 
 ## Development
 
