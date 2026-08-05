@@ -6,7 +6,7 @@ contextBridge.exposeInMainWorld('api', {
   apiTest: (settings) => ipcRenderer.invoke('api:test', settings),
   discoverFromSynaos: (settings) => ipcRenderer.invoke('api:discoverFromSynaos', settings),
   validateResource: (resourceId) => ipcRenderer.invoke('api:validateResource', resourceId),
-  scanResources: (patterns) => ipcRenderer.invoke('api:scanResources', patterns),
+  scanResources: (patterns, mode) => ipcRenderer.invoke('api:scanResources', patterns, mode),
   onScanProgress: (fn) => ipcRenderer.on('scan:progress', (_e, p) => fn(p)),
   createOrderJobs: (payload) => ipcRenderer.invoke('api:createOrderJobs', payload),
   getJob: (jobId) => ipcRenderer.invoke('api:getJob', jobId),

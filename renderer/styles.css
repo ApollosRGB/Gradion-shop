@@ -354,8 +354,10 @@ input.inp:focus, select.inp:focus, textarea.inp:focus { outline: 2px solid var(-
 
 /* Robot scanner */
 .scan-box { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
-.scan-row { display: flex; gap: 10px; align-items: center; margin: 8px 0; }
-.scan-row .inp { flex: 1; font-family: ui-monospace, monospace; }
+.scan-row { display: flex; gap: 10px; align-items: center; margin: 8px 0; flex-wrap: wrap; }
+.scan-box .inp { width: 100%; font-family: ui-monospace, monospace; margin: 8px 0 2px; }
+.scan-tabs { display: flex; gap: 8px; margin-top: 10px; }
+.kind-select { padding: 3px 8px; font-size: 12px; max-width: 160px; }
 .scan-box code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
 #scanResults { margin-top: 10px; }
 

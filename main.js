@@ -644,9 +644,14 @@ function expandScanPattern(pattern) {
   return expandCharClasses(token);
 }
 
-// Expands [1-9] / [abc] classes, `*` (any digit) and `?` (any digit) one at a time.
+const DIGITS = '0123456789'.split('');
+const ALNUM = '0123456789abcdefghijklmnopqrstuvwxyz'.split('');
+
+// Expands [1-9] / [abc] classes and the single-character wildcards:
+//   #  or  *   one digit
+//   ?           one digit or letter — needed for ids like AFS1000-Sim01
 function expandCharClasses(token, depth) {
-  if ((depth || 0) > 6) return [token];
+  if ((depth || 0) > 8) return [token];
 
   const cls = token.match(/\[([^\]]+)\]/);
   if (cls) {
@@ -658,17 +663,49 @@ function expandCharClasses(token, depth) {
         i += 2;
       } else chars.push(spec[i]);
     }
-    return chars.flatMap((c) =>
-      expandCharClasses(token.replace(cls[0], c), (depth || 0) + 1));
+    return chars.flatMap((c) => expandCharClasses(token.replace(cls[0], c), (depth || 0) + 1));
   }
 
-  const wild = token.indexOf('*') >= 0 ? '*' : (token.indexOf('?') >= 0 ? '?' : null);
-  if (wild) {
-    const out = [];
-    for (let d = 0; d <= 9; d++) out.push(token.replace(wild, String(d)));
-    return out.flatMap((t) => expandCharClasses(t, (depth || 0) + 1));
+  for (const [mark, alphabet] of [['#', DIGITS], ['*', DIGITS], ['?', ALNUM]]) {
+    const at = token.indexOf(mark);
+    if (at >= 0) {
+      return alphabet.flatMap((ch) =>
+        expandCharClasses(token.slice(0, at) + ch + token.slice(at + 1), (depth || 0) + 1));
+    }
   }
   return [token];
+}
+
+// Pulls candidate ids out of arbitrary pasted text — e.g. a vehicle list copied
+// from the SYNAOS Fleet Management page. Anything that is not a real resource
+// simply fails validation, so stray words cost a lookup but never a false entry.
+const PASTE_NOISE = new Set([
+  'total', 'select', 'vehicles', 'vehicle', 'in', 'fleet', 'order', 'mode', 'manual',
+  'automatic', 'filters', 'search', 'by', 'id', 'communication', 'interface', 'type',
+  'diffdrive', 'add', 'automated', 'management', 'dashboard', 'shop', 'floor'
+]);
+
+function extractIdsFromText(text) {
+  const tokens = String(text || '').split(/[\s,;|\t\r\n]+/).filter(Boolean);
+  const seen = new Set();
+  const out = [];
+  for (const raw of tokens) {
+    const token = raw.trim().replace(/^[("'\[]+|[)"'\].,:]+$/g, '');
+    if (!token || token.length < 2 || token.length > 64) continue;
+    if (PASTE_NOISE.has(token.toLowerCase())) continue;
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(token)) continue;   // id-shaped only
+    if (seen.has(token)) continue;
+    seen.add(token);
+    out.push(token);
+    if (out.length >= SCAN_LIMIT) return { ids: out, truncated: true };
+  }
+  return { ids: out, truncated: false };
+}
+
+// Best-effort guess from the name alone. SYNAOS exposes no simulated flag over
+// Basic auth, so this is a hint the operator can override, never a fact.
+function guessSimulated(id) {
+  return /(^sim|[-_. ]sim|sim[-_.\d])/i.test(String(id || ''));
 }
 
 function expandScanInput(input) {
@@ -1197,10 +1234,17 @@ function registerIpc() {
   // Checks a batch of candidate ids against SYNAOS and reports which are real,
   // so an AGV that has never run a job can still be found. Progress is streamed
   // back because a wide range takes a while.
-  ipcMain.handle('api:scanResources', async (ev, patterns) => {
+  ipcMain.handle('api:scanResources', async (ev, patterns, mode) => {
     const store = loadStore();
-    const { ids, truncated } = expandScanInput(patterns);
-    if (!ids.length) return { ok: false, error: 'Nothing to scan — enter an id, range or pattern.' };
+    // "paste" takes ids out of copied text; "pattern" expands ranges/wildcards
+    const { ids, truncated } = mode === 'paste'
+      ? extractIdsFromText(patterns)
+      : expandScanInput(patterns);
+    if (!ids.length) {
+      return { ok: false, error: mode === 'paste'
+        ? 'No ids found in that text.'
+        : 'Nothing to scan — enter an id, range or pattern.' };
+    }
 
     const found = [];
     const CONCURRENCY = 5;
@@ -1218,7 +1262,8 @@ function registerIpc() {
             id,
             mode: rm.data.resourceMode || null,
             supportedJobTypes: rm.data.supportedJobTypes || null,
-            live: true
+            live: true,
+            simulated: guessSimulated(id)
           });
         }
       });
@@ -1335,6 +1380,8 @@ module.exports = {
   __loadStoreForTest: () => loadStore(),
   expandScanInput,
   expandScanPattern,
+  extractIdsFromText,
+  guessSimulated,
   mpdvDateKey,
   nextMpdvOrderNumber,
   buildMpdvPayload,

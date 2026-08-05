@@ -1359,6 +1359,12 @@ function renderAdminStations() {
             <span class="nm">${escapeHtml(r.id)}</span>
             ${r.mode ? `<span class="chip on">${escapeHtml(r.mode)}</span>` : '<span class="chip off">unknown mode</span>'}
             <span class="chip">${r.source === 'manual' ? 'added manually' : 'discovered'}</span>
+            <span class="chip ${robotKind(r) === 'simulated' ? '' : 'on'}">${robotKind(r) === 'simulated' ? '🧪 simulated' : '🚚 real'}</span>
+            <select class="inp kind-select" data-robot-kind="${escapeHtml(r.id)}" title="SYNAOS doesn't tell us this — correct it if the guess is wrong">
+              <option value="" ${!r.kind ? 'selected' : ''}>auto (from the name)</option>
+              <option value="real" ${r.kind === 'real' ? 'selected' : ''}>real</option>
+              <option value="simulated" ${r.kind === 'simulated' ? 'selected' : ''}>simulated</option>
+            </select>
           </div>
           <div class="desc">Supports: ${escapeHtml((r.supportedJobTypes || []).join(', ') || '—')}</div>
           ${cannot.length ? `<div class="desc" style="color:#d64545;">✖ Cannot reach: ${escapeHtml(cannot.join(', '))}</div>` : ''}
@@ -1430,14 +1436,26 @@ function renderAdminStations() {
         <button class="btn btn-primary" id="addRobot">+ Add robot by id</button>
       </div>
       <div class="scan-box">
-        <div class="arm-log-title">Scan SYNAOS for robots</div>
-        <p class="hint">Enter ids, ranges or patterns — the app asks SYNAOS about each and adds the ones that exist. Examples:
-          <code>36029</code>, <code>36020-36040</code>, <code>kuka0*</code>, <code>VNP15-0[1-9]</code>. Up to 600 per scan.</p>
-        <div class="scan-row">
-          <input class="inp" id="scanPatterns" placeholder="36020-36040, kuka0*, 00[1-9]" value="${escapeHtml(lastScanPatterns)}">
-          <button class="btn btn-secondary" id="runScan">Scan</button>
+        <div class="arm-log-title">Find robots in SYNAOS</div>
+        <p class="hint">SYNAOS does not let this app list the fleet — that page is behind its web login — so ids have to be checked one by one.
+          <b>Pasting the list is the reliable way</b>: open Fleet Management in SYNAOS, select the vehicles, copy, and paste here. Every id is verified against SYNAOS before it is offered.</p>
+        <div class="scan-tabs">
+          <button class="tab-btn ${scanMode === 'paste' ? 'active' : ''}" data-scan-mode="paste">Paste a list</button>
+          <button class="tab-btn ${scanMode === 'pattern' ? 'active' : ''}" data-scan-mode="pattern">Ids &amp; patterns</button>
         </div>
-        <div id="scanStatus" class="fld-hint"></div>
+        ${scanMode === 'paste' ? `
+          <textarea class="inp" id="scanPatterns" rows="6" spellcheck="false"
+            placeholder="Paste anything containing the ids — e.g. copied straight from the Fleet Management table:&#10;001  KMP 400P-1-5G diffDrive&#10;36029  E10&#10;sc-aware-JQ3H0018  aware">${escapeHtml(lastScanPatterns)}</textarea>
+          <span class="fld-hint">Surrounding words are harmless — anything that is not a real resource simply fails the check and is ignored.</span>
+        ` : `
+          <input class="inp" id="scanPatterns" placeholder="36020-36040, kuka0#, AFS1000-Sim?#" value="${escapeHtml(lastScanPatterns)}">
+          <span class="fld-hint"><code>36020-36040</code> range · <code>#</code> a digit · <code>?</code> a digit or letter · <code>[1-9]</code> a set. Up to 600 ids per scan.
+            Ids with unpredictable parts, like <code>sc-aware-JQ3H0018</code>, can only be found by pasting them.</span>
+        `}
+        <div class="scan-row">
+          <button class="btn btn-secondary" id="runScan">Check against SYNAOS</button>
+          <div id="scanStatus" class="fld-hint"></div>
+        </div>
         <div id="scanResults"></div>
       </div>
     </div>
@@ -1526,7 +1544,21 @@ function renderAdminStations() {
 
   // ---- scan ----
   $('#runScan').addEventListener('click', runResourceScan);
-  $('#scanPatterns').addEventListener('keydown', (e) => { if (e.key === 'Enter') runResourceScan(); });
+  $('#scanPatterns').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey && scanMode === 'pattern') runResourceScan();
+  });
+  $$('[data-scan-mode]', body).forEach((b) => b.addEventListener('click', () => {
+    scanMode = b.dataset.scanMode;
+    lastScanPatterns = '';
+    renderAdminStations();
+  }));
+  $$('[data-robot-kind]', body).forEach((el) => el.addEventListener('change', async () => {
+    const robot = (store.robots || []).find((r) => r.id === el.dataset.robotKind);
+    if (!robot) return;
+    robot.kind = el.value || null;
+    await persist();
+    renderAdminStations();
+  }));
   $$('[data-robot-del]', body).forEach((el) => el.addEventListener('click', () => {
     const rid = el.dataset.robotDel;
     confirmModal('Remove robot?', `${rid} will be removed from the list and from any station's allowed robots.`, async () => {
@@ -1547,8 +1579,20 @@ function renderAdminStations() {
   $('#syncSynaos2').addEventListener('click', discoverFromSynaosFlow);
 }
 
-// Asks SYNAOS about every id the patterns expand to, and offers the real ones.
+// Asks SYNAOS about every id the input yields, and offers the real ones.
 let lastScanPatterns = '';
+let scanMode = 'paste';
+
+// SYNAOS exposes no simulated flag over Basic auth, so this is a guess from the
+// name that the operator can correct per robot.
+function looksSimulated(id) {
+  return /(^sim|[-_. ]sim|sim[-_.\d])/i.test(String(id || ''));
+}
+function robotKind(robot) {
+  if (robot.kind === 'real' || robot.kind === 'simulated') return robot.kind;
+  return looksSimulated(robot.id) ? 'simulated' : 'real';
+}
+
 async function runResourceScan() {
   const input = $('#scanPatterns');
   const status = $('#scanStatus');
@@ -1558,7 +1602,7 @@ async function runResourceScan() {
   status.textContent = 'Asking SYNAOS…';
   $('#runScan').disabled = true;
 
-  const res = await window.api.scanResources(lastScanPatterns);
+  const res = await window.api.scanResources(lastScanPatterns, scanMode);
   $('#runScan').disabled = false;
 
   if (!res.ok) { status.textContent = res.error || 'Scan failed.'; return; }
@@ -1577,6 +1621,7 @@ async function runResourceScan() {
           <input type="checkbox" data-scan="${i}" ${already ? 'disabled' : 'checked'}>
           <span class="disc-id">${escapeHtml(f.id)}</span>
           <span class="chip on">${escapeHtml(f.mode || 'AUTO')}</span>
+          <span class="chip ${f.simulated ? '' : 'on'}">${f.simulated ? 'looks simulated' : 'looks real'}</span>
           ${already ? '<span class="disc-note">already added</span>' : ''}
         </label>`;
       }).join('')}
