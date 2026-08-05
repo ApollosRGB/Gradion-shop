@@ -29,6 +29,14 @@ function shortTime(iso) {
   if (isNaN(d.getTime())) return '';
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
+
+// Date and time under a rail stop, e.g. "05-08 15:04"
+function shortDateTime(iso) {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getDate())}-${p(d.getMonth() + 1)} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
 // Pretty-prints a JSON string when it is JSON; otherwise returns it untouched,
 // so a non-JSON error page is still shown exactly as MPDV sent it.
 function prettyJson(text) {
@@ -790,11 +798,14 @@ function renderProgress(liveJobs, orderArg) {
   const completed = order.confirmed || order.state === 'completed';
   const failed = order.state === 'failed';
 
-  // Build the human step list
+  // Every step is a stop on the rail: a short label and its time sit under the
+  // icon, and one status line underneath says what is happening right now.
   const stepLines = [];
   stepLines.push({
+    icon: '🧾',
+    label: 'Order placed',
+    place: order.items.map((i) => `${i.qty}× ${i.name}`).join(', '),
     text: 'Order placed',
-    sub: order.items.map((i) => `${i.qty}× ${i.name}`).join(', '),
     state: 'done',
     at: order.createdAt
   });
@@ -804,65 +815,64 @@ function renderProgress(liveJobs, orderArg) {
     const fn = stationFn(step.stationRef);
     const dest = fn ? `${nm} (${fn})` : nm;
     const ph = stepPhase[idx];
-    const verb = step.action === 'PICK' ? 'Picking up at'
-      : step.action === 'DROP' ? 'Delivering to'
-      : 'Moving to';
-    const doneVerb = step.action === 'PICK' ? 'Picked up at'
-      : step.action === 'DROP' ? 'Delivered to'
-      : 'Arrived at';
-    let state = 'pending', text, sub;
-    if (completed || ph === 4) { state = 'done'; text = `${doneVerb} ${dest}`; sub = ''; }
-    else if (ph >= 1) { state = 'active'; text = `${verb} ${dest}`; sub = 'AGV on the move'; }
-    else { state = 'pending'; text = `${verb} ${dest}`; sub = ''; }
-    stepLines.push({ text, sub, state, at: stepTimes[idx] || null });
+    const done = completed || ph === 4;
+    const active = !done && ph >= 1;
+
+    const words = step.action === 'PICK'
+      ? { done: 'Picked up', now: 'Picking up', soon: 'Pick up', sentence: 'at' }
+      : step.action === 'DROP'
+        ? { done: 'Delivered', now: 'Delivering', soon: 'Deliver', sentence: 'to' }
+        : { done: 'Arrived', now: 'Moving', soon: 'Move', sentence: 'to' };
+
+    stepLines.push({
+      icon: step.action === 'PICK' ? '📦' : step.action === 'DROP' ? '🏭' : '🚚',
+      label: done ? words.done : active ? words.now : words.soon,
+      place: nm,
+      text: `${done ? words.done : active ? words.now : words.soon} ${words.sentence} ${dest}`,
+      state: done ? 'done' : active ? 'active' : 'pending',
+      at: stepTimes[idx] || null
+    });
   });
 
   stepLines.push({
-    text: completed ? 'Delivered' : 'Delivery complete',
-    sub: completed ? 'Enjoy your treat' : '',
+    icon: completed ? '🎉' : '🏁',
+    label: 'Completed',
+    place: completed ? 'Enjoy your treat' : '',
+    text: completed ? 'Delivered — enjoy your treat' : 'Order complete',
     state: completed ? 'done' : 'pending'
   });
 
-  // Rail nodes = unique stations in flow
-  const railStations = [];
-  const railSeen = new Set();
-  flow.forEach((s) => {
-    if (!railSeen.has(s.stationRef)) { railSeen.add(s.stationRef); railStations.push(s.stationRef); }
-  });
-  const stationDonePhase = {};
-  flow.forEach((s, i) => {
-    stationDonePhase[s.stationRef] = Math.max(stationDonePhase[s.stationRef] || 0, stepPhase[i]);
-  });
+  const railHtml = stepLines.map((s) => `
+    <div class="rail-node ${s.state}">
+      <div class="rail-dot">${s.icon}</div>
+      <div class="rail-label">${escapeHtml(s.label)}</div>
+      ${s.place ? `<div class="rail-place">${escapeHtml(s.place)}</div>` : ''}
+      <div class="rail-time">${s.at ? escapeHtml(shortDateTime(s.at)) : ''}</div>
+    </div>`).join('');
 
-  const railHtml = railStations.map((ref, i) => {
-    const ph = completed ? 4 : (stationDonePhase[ref] || 0);
-    const cls = ph === 4 ? 'done' : ph >= 1 ? 'active' : '';
-    const emoji = i === 0 ? '🏭' : i === railStations.length - 1 ? '🏬' : '🤖';
-    return `<div class="rail-node ${cls}">
-      <div class="rail-dot">${emoji}</div>
-      <div class="rail-label">${escapeHtml(stationName(ref))}</div>
-    </div>`;
-  }).join('');
+  // The parcel sits on the last finished stop, or halfway to the one under way,
+  // so it advances between stops rather than jumping from icon to icon.
+  const lastDone = stepLines.reduce((acc, s, i) => (s.state === 'done' ? i : acc), -1);
+  const activeIdx = stepLines.findIndex((s) => s.state === 'active');
+  const span = Math.max(1, stepLines.length - 1);
+  const position = activeIdx >= 0 ? activeIdx - 0.5 : Math.max(lastDone, 0);
+  const progress = Math.max(0, Math.min(1, position / span));
+  const moving = activeIdx >= 0;
 
-  // How far along the route the goods are, 0–1. A step that is under way counts
-  // as half, so the package creeps forward instead of jumping between stations.
-  const progress = (() => {
-    if (completed) return 1;
-    if (!flow.length) return 0;
-    const score = stepPhase.reduce((sum, ph) => sum + (ph === 4 ? 1 : ph >= 1 ? 0.5 : 0), 0);
-    return Math.max(0, Math.min(1, score / flow.length));
-  })();
-  const moving = !completed && stepPhase.some((ph) => ph >= 1 && ph < 4);
-
-  const stepsHtml = stepLines.map((s) => `
-    <li class="tl-item ${s.state}">
-      <span class="tl-dot"></span>
-      <div class="tl-body">
-        <div class="tl-title">${escapeHtml(s.text)}</div>
-        ${s.sub ? `<div class="tl-meta">${escapeHtml(s.sub)}</div>` : ''}
+  // One line that changes as the order moves on
+  const current = stepLines.find((s) => s.state === 'active')
+    || [...stepLines].reverse().find((s) => s.state === 'done')
+    || stepLines[0];
+  const nextUp = stepLines.find((s) => s.state === 'pending');
+  const statusHtml = `
+    <div class="status-line ${completed ? 'done' : moving ? 'moving' : 'waiting'}">
+      <span class="status-icon">${completed ? '🎉' : moving ? '🚚' : '⏳'}</span>
+      <div class="status-body">
+        <div class="status-now">${escapeHtml(completed ? 'Delivered — enjoy your treat' : current.text)}</div>
+        ${!completed && nextUp ? `<div class="status-next">Next: ${escapeHtml(nextUp.text)}</div>` : ''}
       </div>
-      ${s.at ? `<time class="tl-time">${escapeHtml(shortTime(s.at))}</time>` : ''}
-    </li>`).join('');
+      ${!completed && moving ? '<span class="status-pips"><i></i><i></i><i></i></span>' : ''}
+    </div>`;
 
   const itemsHtml = order.items.map((i) => `
     <div class="oi-row">
@@ -926,16 +936,18 @@ function renderProgress(liveJobs, orderArg) {
     <div class="order-card">
       <h2>Order #${escapeHtml(order.shortId)}</h2>
       ${failNote}
-      <div class="rail">
-        <div class="rail-line">
-          <div class="rail-line-fill" style="width:${(progress * 100).toFixed(1)}%"></div>
-          <div class="rail-traveller ${moving ? 'moving' : ''} ${completed ? 'arrived' : ''}" style="left:${(progress * 100).toFixed(1)}%">
-            <span class="rail-parcel">📦</span>
+      <div class="rail-scroll">
+        <div class="rail" style="--stops:${stepLines.length}">
+          <div class="rail-line">
+            <div class="rail-line-fill" style="width:${(progress * 100).toFixed(1)}%"></div>
+            <div class="rail-traveller ${moving ? 'moving' : ''} ${completed ? 'arrived' : ''}" style="left:${(progress * 100).toFixed(1)}%">
+              <span class="rail-parcel">📦</span>
+            </div>
           </div>
+          ${railHtml}
         </div>
-        ${railHtml}
       </div>
-      <ol class="steps timeline">${stepsHtml}</ol>
+      ${statusHtml}
     </div>
     ${confirmBlock}
     ${ratingBlock}
