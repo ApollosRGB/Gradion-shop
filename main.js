@@ -54,8 +54,8 @@ function defaultStore() {
     mpdvCounter: { date: '', seq: 0 },
     mpdvLog: [],
     stations: [
-      { id: 'st-k2', stationId: 'K2', name: 'Production', fn: 'production', system: 'STATION', allowedRobots: [] },
-      { id: 'st-k1', stationId: 'K1', name: 'Shop', fn: 'shop', system: 'STATION', allowedRobots: [] }
+      { id: 'st-k2', stationId: 'K2', name: 'Production', fn: 'production', system: 'STATION', allowedRobots: [], image: null },
+      { id: 'st-k1', stationId: 'K1', name: 'Shop', fn: 'shop', system: 'STATION', allowedRobots: [], image: null }
     ],
     robots: [],
     // Navigation-graph nodes (waiting spots, parking, staging) kept apart from
@@ -161,6 +161,7 @@ function loadStore() {
     data.stations.forEach((s) => {
       if (!s.system) s.system = 'STATION';
       if (!Array.isArray(s.allowedRobots)) s.allowedRobots = [];
+      if (s.image === undefined) s.image = null;   // optional station icon
     });
     data.capability = data.capability || {};
     data.products = data.products || def.products;

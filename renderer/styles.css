@@ -240,17 +240,27 @@ html, body {
   .rail-line-fill, .rail-traveller { transition: none; }
   .rail-traveller.moving .rail-parcel, .rail-traveller.arrived .rail-parcel { animation: none; }
 }
-/* Each stop carries its own label and time, like a parcel-tracking bar */
-.rail-scroll { overflow-x: auto; overflow-y: hidden; padding-bottom: 4px; }
+/* Each stop carries its own label and time, like a parcel-tracking bar.
+   Stops share the width evenly and shrink to fit, so a long route compresses
+   rather than scrolling off the side. */
+.rail-scroll { padding-bottom: 4px; }
 .rail-node {
   display: flex; flex-direction: column; align-items: center; gap: 6px; z-index: 1;
-  flex: 1 1 0; min-width: 92px; text-align: center;
+  flex: 1 1 0; min-width: 0; text-align: center; padding: 0 2px;
+}
+.rail {
+  /* Everything scales off the number of stops so nothing overflows */
+  --dot: clamp(22px, calc(480px / var(--stops, 2)), 48px);
+  --stop-font: clamp(8.5px, calc(78px / var(--stops, 2)), 12.5px);
 }
 .rail-dot {
-  width: 48px; height: 48px; border-radius: 50%; background: var(--surface);
+  width: var(--dot); height: var(--dot); flex: 0 0 auto;
+  border-radius: 50%; background: var(--surface); overflow: hidden;
   border: 3px solid var(--border); display: flex; align-items: center; justify-content: center;
-  font-size: 22px; transition: border-color .3s, background .3s, box-shadow .3s;
+  font-size: calc(var(--dot) * 0.46); line-height: 1;
+  transition: border-color .3s, background .3s, box-shadow .3s;
 }
+.rail-dot img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .rail-node.done .rail-dot { border-color: var(--green); background: var(--green-soft); }
 .rail-node.active .rail-dot {
   border-color: var(--accent); background: var(--surface);
@@ -261,14 +271,23 @@ html, body {
   0%, 100% { box-shadow: 0 0 0 4px rgba(238, 77, 45, 0.14); }
   50%      { box-shadow: 0 0 0 9px rgba(238, 77, 45, 0.05); }
 }
-.rail-label { font-size: 12.5px; font-weight: 700; color: var(--text-muted); line-height: 1.25; }
+.rail-label {
+  font-size: var(--stop-font); font-weight: 700; color: var(--text-muted); line-height: 1.25;
+  overflow-wrap: anywhere;
+}
 .rail-node.done .rail-label { color: var(--green); }
 .rail-node.active .rail-label { color: var(--accent); }
 .rail-place {
-  font-size: 11.5px; color: var(--text-muted); line-height: 1.25;
-  max-width: 100px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: calc(var(--stop-font) - 0.5px); color: var(--text-muted); line-height: 1.25;
+  width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.rail-time { font-size: 11px; color: var(--text-muted); opacity: .8; font-variant-numeric: tabular-nums; min-height: 14px; }
+.rail-time {
+  font-size: calc(var(--stop-font) - 1px); color: var(--text-muted); opacity: .8;
+  font-variant-numeric: tabular-nums; min-height: 12px; white-space: nowrap;
+}
+/* Very long routes: drop the station line and the date, keep time only */
+.rail.dense .rail-place { display: none; }
+.rail.dense .rail-time { font-size: 9px; }
 @media (prefers-reduced-motion: reduce) { .rail-node.active .rail-dot { animation: none; } }
 
 /* One line that says what is happening right now */

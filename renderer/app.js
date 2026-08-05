@@ -824,8 +824,10 @@ function renderProgress(liveJobs, orderArg) {
         ? { done: 'Delivered', now: 'Delivering', soon: 'Deliver', sentence: 'to' }
         : { done: 'Arrived', now: 'Moving', soon: 'Move', sentence: 'to' };
 
+    const st = store.stations.find((s) => s.id === step.stationRef);
     stepLines.push({
       icon: step.action === 'PICK' ? '📦' : step.action === 'DROP' ? '🏭' : '🚚',
+      iconImage: (st && st.image) || null,      // the station's own picture, when set
       label: done ? words.done : active ? words.now : words.soon,
       place: nm,
       text: `${done ? words.done : active ? words.now : words.soon} ${words.sentence} ${dest}`,
@@ -842,12 +844,17 @@ function renderProgress(liveJobs, orderArg) {
     state: completed ? 'done' : 'pending'
   });
 
+  // Past a certain number of stops the station line is dropped so the labels
+  // stay readable while everything still fits across the card.
+  const dense = stepLines.length > 8;
   const railHtml = stepLines.map((s) => `
     <div class="rail-node ${s.state}">
-      <div class="rail-dot">${s.icon}</div>
+      <div class="rail-dot">${s.iconImage
+        ? `<img src="${escapeHtml(s.iconImage)}" alt="">`
+        : s.icon}</div>
       <div class="rail-label">${escapeHtml(s.label)}</div>
       ${s.place ? `<div class="rail-place">${escapeHtml(s.place)}</div>` : ''}
-      <div class="rail-time">${s.at ? escapeHtml(shortDateTime(s.at)) : ''}</div>
+      <div class="rail-time">${s.at ? escapeHtml(dense ? shortTime(s.at) : shortDateTime(s.at)) : ''}</div>
     </div>`).join('');
 
   // The parcel sits on the last finished stop, or halfway to the one under way,
@@ -937,7 +944,7 @@ function renderProgress(liveJobs, orderArg) {
       <h2>Order #${escapeHtml(order.shortId)}</h2>
       ${failNote}
       <div class="rail-scroll">
-        <div class="rail" style="--stops:${stepLines.length}">
+        <div class="rail ${dense ? 'dense' : ''}" style="--stops:${stepLines.length}">
           <div class="rail-line">
             <div class="rail-line-fill" style="width:${(progress * 100).toFixed(1)}%"></div>
             <div class="rail-traveller ${moving ? 'moving' : ''} ${completed ? 'arrived' : ''}" style="left:${(progress * 100).toFixed(1)}%">
@@ -1349,7 +1356,7 @@ function renderAdminStations() {
   const fns = ['production', 'storage', 'shop', 'charging', 'other'];
   const list = store.stations.map((s) => `
     <div class="admin-item">
-      <div class="thumb">📍</div>
+      <div class="thumb">${s.image ? `<img src="${escapeHtml(s.image)}" alt="">` : '📍'}</div>
       <div class="grow">
         <div class="form-grid">
           <label class="fld">Display name
@@ -1366,6 +1373,14 @@ function renderAdminStations() {
           <label class="fld">Address system
             <input class="inp" data-st-sys="${s.id}" value="${escapeHtml(s.system || 'STATION')}">
           </label>
+          <div class="fld full">Station icon
+            <div class="img-pick">
+              <div class="img-preview">${s.image ? `<img src="${escapeHtml(s.image)}" alt="">` : '📍'}</div>
+              <button class="btn btn-secondary" data-st-img="${s.id}">Choose image…</button>
+              ${s.image ? `<button class="link-btn danger" data-st-img-clear="${s.id}">Remove</button>` : ''}
+            </div>
+            <span class="fld-hint">Shown on this stop in the customer's order tracking. Falls back to an emoji when empty.</span>
+          </div>
         </div>
         <div class="fld" style="margin-top:10px;">
           Robots allowed at this station
@@ -1534,6 +1549,24 @@ function renderAdminStations() {
   $$('[data-st-sys]', body).forEach((el) => el.addEventListener('change', async (e) => {
     store.stations.find((s) => s.id === el.dataset.stSys).system = e.target.value.trim() || 'STATION'; await persist();
   }));
+  $$('[data-st-img]', body).forEach((el) => el.addEventListener('click', async () => {
+    const res = await window.api.pickImage();
+    if (!res) return;
+    if (res.error) { toast(res.error, 'error'); return; }
+    const st = store.stations.find((s) => s.id === el.dataset.stImg);
+    if (!st) return;
+    st.image = res.dataUrl;
+    await persist();
+    renderAdminStations();
+    toast('Station icon set', 'success');
+  }));
+  $$('[data-st-img-clear]', body).forEach((el) => el.addEventListener('click', async () => {
+    const st = store.stations.find((s) => s.id === el.dataset.stImgClear);
+    if (!st) return;
+    st.image = null;
+    await persist();
+    renderAdminStations();
+  }));
   $$('[data-st-del]', body).forEach((el) => el.addEventListener('click', () => {
     confirmModal('Delete station?', 'Products using it will need their steps updated.', async () => {
       store.stations = store.stations.filter((s) => s.id !== el.dataset.stDel);
@@ -1641,7 +1674,7 @@ function renderAdminStations() {
       });
   });
   $('#addStation').addEventListener('click', async () => {
-    store.stations.push({ id: uid('st'), stationId: 'NEW', name: 'New station', fn: 'other', system: 'STATION', allowedRobots: [] });
+    store.stations.push({ id: uid('st'), stationId: 'NEW', name: 'New station', fn: 'other', system: 'STATION', allowedRobots: [], image: null });
     await persist();
     renderAdminStations();
   });
