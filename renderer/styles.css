@@ -441,6 +441,16 @@ input.inp:focus, select.inp:focus, textarea.inp:focus { outline: 2px solid var(-
 }
 :root[data-theme="dark"] .handover-warn { color: #f0b429; background: rgba(240, 180, 41, 0.1); }
 
+/* Recalls that run themselves on a timer */
+.auto-box {
+  margin-top: 12px; padding: 10px 12px; border: 1px dashed var(--border); border-radius: 12px;
+  background: var(--surface-2); display: flex; flex-wrap: wrap; align-items: center; gap: 8px 18px;
+}
+.auto-box .switch { font-size: 13px; font-weight: 600; color: var(--text); }
+.auto-box .inp { padding: 4px 8px; font-size: 13px; }
+.auto-box .hint { font-weight: 400; }
+.auto-status { flex-basis: 100%; font-size: 13px; font-weight: 600; color: var(--text-muted); min-height: 18px; }
+
 /* Robot scanner */
 .scan-box { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
 .scan-row { display: flex; gap: 10px; align-items: center; margin: 8px 0; flex-wrap: wrap; }

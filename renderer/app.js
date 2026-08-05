@@ -57,6 +57,18 @@ async function persist() {
   await window.api.storeSet(store);
 }
 
+// Hand-overs are bookkept by the relay supervisor in the main process, which
+// writes the same store file. Creating jobs can add a pending relay there, so
+// re-read that list before the next persist() writes our older copy over it.
+async function syncRelaysFromMain() {
+  try {
+    const fresh = await window.api.storeGet();
+    store.pendingRelays = fresh.pendingRelays || [];
+  } catch (e) {
+    /* keep what we have; the relay:changed event will correct it */
+  }
+}
+
 // ===========================================================================
 // Boot
 // ===========================================================================
@@ -68,6 +80,8 @@ async function boot() {
   renderCart();
   renderOrdersBadge();
   applyMode();
+  // Recalls that run themselves keep ticking wherever the operator is in the app
+  startAutoRecalls();
   // No system chosen yet → ask before showing the shop
   showView(store.settings.mode ? 'shop' : 'start');
 }
@@ -283,6 +297,7 @@ async function onFinish() {
   let results = [];
   try {
     results = await window.api.createOrderJobs({ orderId, units });
+    await syncRelaysFromMain();
   } catch (e) {
     toast('Failed to reach the robot service: ' + e.message, 'error');
     btn.disabled = false;
@@ -1382,6 +1397,22 @@ function renderAdminRecalls() {
             <button class="link-btn" data-rc-edit="${r.id}">Edit</button>
             <button class="link-btn danger" data-rc-del="${r.id}">Delete</button>
           </div>
+          <div class="auto-box">
+            <label class="switch">
+              <input type="checkbox" data-rc-auto="${r.id}" ${autoCfg(r).enabled ? 'checked' : ''}>
+              Run this recall automatically
+            </label>
+            <label class="inline-fld">every
+              <input class="inp" type="number" min="${AUTO_MIN_MINUTES}" max="${AUTO_MAX_MINUTES}" step="1"
+                data-rc-every="${r.id}" value="${Number(autoCfg(r).everyMinutes)}" style="max-width:80px;">
+              minutes <span class="hint" style="margin:0;">after the previous run has finished</span>
+            </label>
+            <label class="switch">
+              <input type="checkbox" data-rc-idle="${r.id}" ${autoCfg(r).onlyWhenIdle ? 'checked' : ''}>
+              Only when no customer order is running
+            </label>
+            <div class="auto-status" data-rc-auto-status="${r.id}">${escapeHtml(autoStatusText(r))}</div>
+          </div>
         </div>
       </div>`;
   }).join('');
@@ -1389,7 +1420,7 @@ function renderAdminRecalls() {
   const log = (store.recallLog || []).slice(0, 12).map((l) => `
     <div class="arm-log-row">
       <span class="dir ${l.ok ? 'in' : 'out'}">${l.ok ? '✅ sent' : '❌ failed'}</span>
-      <span class="msg">${escapeHtml(l.name)}${l.robot ? ' — ' + escapeHtml(l.robot) : ''}
+      <span class="msg">${l.auto ? '⏱ ' : ''}${escapeHtml(l.name)}${l.robot ? ' — ' + escapeHtml(l.robot) : ''}
         ${l.ok ? '' : '— ' + escapeHtml(l.error || '')}
         <span style="opacity:.6">${escapeHtml(new Date(l.at).toLocaleString())}</span></span>
     </div>`).join('');
@@ -1398,6 +1429,7 @@ function renderAdminRecalls() {
     <div class="panel">
       <h2>Recalls</h2>
       <p class="hint">Routes you run on demand — fetching a rack back from the shop to production, returning an empty carrier, repositioning a load. They never show in the shop, so an order can simply deliver without also hauling everything back.</p>
+      <p class="hint">A recall can also run itself on a timer. The countdown only starts once the previous run has <b>finished</b> — the AGV is never sent out again on top of a trip it is still driving — and the app has to stay open for the timer to run.</p>
       <div class="admin-list">${list || '<p class="hint">No recalls yet. Add one below.</p>'}</div>
       <button class="btn btn-primary" id="addRecall" style="margin-top:16px;">+ New recall</button>
       ${(store.recallLog || []).length ? `<div class="arm-log-title">Recently sent</div><div class="arm-log">${log}</div>` : ''}
@@ -1432,10 +1464,88 @@ function renderAdminRecalls() {
     });
   }));
   $$('[data-rc-send]', body).forEach((el) => el.addEventListener('click', () => sendRecall(el.dataset.rcSend, el)));
+
+  const findRecall = (id) => (store.recalls || []).find((r) => r.id === id);
+  $$('[data-rc-auto]', body).forEach((el) => el.addEventListener('change', async () => {
+    const r = findRecall(el.dataset.rcAuto);
+    if (!r) return;
+    autoCfg(r).enabled = el.checked;
+    // Switching it on starts a fresh countdown — never an immediate send, which
+    // is the one thing an operator would not expect from ticking a box.
+    if (el.checked) armAutoRecall(r);
+    await persist();
+    renderAdminRecalls();
+    toast(el.checked ? `Automatic runs on — first one in ${autoCfg(r).everyMinutes} min` : 'Automatic runs off', 'success');
+  }));
+  $$('[data-rc-every]', body).forEach((el) => el.addEventListener('change', async () => {
+    const r = findRecall(el.dataset.rcEvery);
+    if (!r) return;
+    const mins = Math.min(AUTO_MAX_MINUTES, Math.max(AUTO_MIN_MINUTES, Math.round(Number(el.value) || 0)));
+    autoCfg(r).everyMinutes = mins;
+    armAutoRecall(r);              // re-measure the wait from now
+    await persist();
+    renderAdminRecalls();
+  }));
+  $$('[data-rc-idle]', body).forEach((el) => el.addEventListener('change', async () => {
+    const r = findRecall(el.dataset.rcIdle);
+    if (!r) return;
+    autoCfg(r).onlyWhenIdle = el.checked;
+    await persist();
+    renderAdminRecalls();
+  }));
 }
 
 // Dispatches a recall down the same path as an order: legs are planned from the
 // robot each step is allowed to use, then created as chained SYNAOS jobs.
+// Used by the "Send recall now" button and by the timer, so both leave the same
+// trail and both arm the watcher that keeps the timer off a running AGV.
+async function dispatchRecall(recall, opts) {
+  const auto = !!(opts && opts.auto);
+  const { legs, warnings } = buildLegsForUnit(recall, 0, 1);
+  if (!auto) {
+    warnings.forEach((w) => toast(w === 'incapable'
+      ? `${recall.name}: the assigned robot can't reach those stations — letting SYNAOS choose instead.`
+      : `${recall.name}: no robot is known to reach those stations — letting SYNAOS choose.`, 'error'));
+  }
+
+  const runId = uid('rcl');
+  const robot = (legs[0] && legs[0].resourceId) || null;
+  let results = [];
+  try {
+    results = await window.api.createOrderJobs({
+      orderId: runId,
+      units: [{ unitId: uid('u'), productId: recall.id, name: `Recall — ${recall.name}`, quantity: 1, legs }]
+    });
+    await syncRelaysFromMain();
+  } catch (e) {
+    logRecallRun(recall, { auto, robot, ok: false, error: 'Could not reach SYNAOS: ' + e.message, jobIds: [] });
+    return { ok: false, runId, jobIds: [], legs, error: 'Could not reach SYNAOS: ' + e.message };
+  }
+
+  const ok = results.length > 0 && results.every((r) => r.ok);
+  const firstErr = results.find((r) => !r.ok);
+  const error = ok ? null : (firstErr && firstErr.error) || 'Rejected by SYNAOS';
+  // Only jobs SYNAOS accepted are worth watching; a rejected leg has no job to
+  // finish, and waiting on one would stall the schedule for good.
+  const jobIds = results.filter((r) => r.ok && r.jobId).map((r) => r.jobId);
+  logRecallRun(recall, { auto, robot, ok, error, jobIds });
+  return { ok, runId, jobIds, legs, error };
+}
+
+function logRecallRun(recall, entry) {
+  store.recallLog = store.recallLog || [];
+  store.recallLog.unshift({
+    at: new Date().toISOString(),
+    name: recall.name,
+    auto: !!entry.auto,
+    robot: entry.robot || null,
+    ok: !!entry.ok,
+    error: entry.ok ? null : entry.error || 'Rejected by SYNAOS',
+    jobIds: entry.jobIds || []
+  });
+  store.recallLog.length = Math.min(store.recallLog.length, 50);
+}
+
 async function sendRecall(recallId, button) {
   const recall = (store.recalls || []).find((r) => r.id === recallId);
   if (!recall) return;
@@ -1443,42 +1553,265 @@ async function sendRecall(recallId, button) {
     toast('This recall has no steps yet.', 'error');
     return;
   }
-  if (button) { button.disabled = true; button.textContent = 'Sending…'; }
-
-  const { legs, warnings } = buildLegsForUnit(recall, 0, 1);
-  warnings.forEach((w) => toast(w === 'incapable'
-    ? `${recall.name}: the assigned robot can't reach those stations — letting SYNAOS choose instead.`
-    : `${recall.name}: no robot is known to reach those stations — letting SYNAOS choose.`, 'error'));
-
-  const recallId2 = uid('rcl');
-  let results = [];
-  try {
-    results = await window.api.createOrderJobs({
-      orderId: recallId2,
-      units: [{ unitId: uid('u'), productId: recall.id, name: `Recall — ${recall.name}`, quantity: 1, legs }]
-    });
-  } catch (e) {
-    toast('Could not reach SYNAOS: ' + e.message, 'error');
-    renderAdminRecalls();
+  if (autoState(recall).jobIds.length) {
+    toast('This recall is still running — wait for the AGV to finish.', 'error');
     return;
   }
+  if (button) { button.disabled = true; button.textContent = 'Sending…'; }
 
-  const ok = results.every((r) => r.ok);
-  const firstErr = results.find((r) => !r.ok);
-  store.recallLog = store.recallLog || [];
-  store.recallLog.unshift({
-    at: new Date().toISOString(),
-    name: recall.name,
-    robot: (legs[0] && legs[0].resourceId) || null,
-    ok,
-    error: ok ? null : (firstErr && firstErr.error) || 'Rejected by SYNAOS',
-    jobIds: results.filter((r) => r.jobId).map((r) => r.jobId)
-  });
-  store.recallLog.length = Math.min(store.recallLog.length, 50);
+  const run = await dispatchRecall(recall, { auto: false });
+  // A run started by hand counts as this recall's last run, so the timer waits
+  // for it too instead of sending a second AGV out behind it.
+  watchRecallRun(recall, run);
   await persist();
   renderAdminRecalls();
-  toast(ok ? `Recall sent — ${legs.length} job(s) created` : `Recall failed: ${(firstErr && firstErr.error) || 'rejected'}`,
-    ok ? 'success' : 'error');
+  toast(run.ok ? `Recall sent — ${run.legs.length} job(s) created` : `Recall failed: ${run.error}`,
+    run.ok ? 'success' : 'error');
+}
+
+// ---- Automatic recalls ----
+//
+// A recall can repeat on a timer. The whole design is built around one hazard:
+// sending a recall to an AGV that is still executing the previous one puts the
+// vehicle into an error state. So the countdown never runs while a run is out
+// there — it is started from the moment the previous run *finished*, a run is
+// only considered finished when every one of its jobs (parking move included)
+// reports FINISHED, and a settling gap is added on top before the next send.
+const AUTO_TICK_MS = 5000;
+const AUTO_MIN_MINUTES = 1;
+const AUTO_MAX_MINUTES = 24 * 60;
+const AUTO_SETTLE_MS = 30000;              // quiet gap after the AGV reports done
+const AUTO_MAX_FAILURES = 3;               // then stop trying by itself
+const AUTO_WATCHDOG_MS = 60 * 60 * 1000;   // a run that never finishes pauses the timer
+const AUTO_BOOT_GRACE_MS = 60000;          // nothing drives off the moment the app opens
+const ORDER_STALE_MS = 30 * 60 * 1000;     // an order older than this no longer counts as live
+
+let autoRecallTimer = null;
+let autoRecallBusy = false;
+
+function autoCfg(recall) {
+  const a = recall.auto || (recall.auto = {});
+  if (typeof a.enabled !== 'boolean') a.enabled = false;
+  if (!(Number(a.everyMinutes) > 0)) a.everyMinutes = 30;
+  if (typeof a.onlyWhenIdle !== 'boolean') a.onlyWhenIdle = true;
+  return a;
+}
+
+function autoState(recall) {
+  const st = recall.autoState || (recall.autoState = {});
+  if (!Array.isArray(st.jobIds)) st.jobIds = [];
+  return st;
+}
+
+function autoIntervalMs(recall) {
+  const m = Math.min(AUTO_MAX_MINUTES, Math.max(AUTO_MIN_MINUTES, Number(autoCfg(recall).everyMinutes) || AUTO_MIN_MINUTES));
+  return m * 60000;
+}
+
+// Start (or restart) the wait from now — used when the operator switches the
+// timer on or changes the interval.
+function armAutoRecall(recall) {
+  const st = autoState(recall);
+  if (st.jobIds.length) return;      // a run is out there; it will set the time itself
+  st.nextDueAt = new Date(Date.now() + autoIntervalMs(recall)).toISOString();
+  if (st.lastResult === 'stalled') st.lastResult = null;
+  st.failures = 0;
+}
+
+function pauseAutoRecall(recall, why) {
+  autoCfg(recall).enabled = false;
+  logRecallRun(recall, { auto: true, ok: false, error: `Automatic runs paused — ${why}`, jobIds: [] });
+  toast(`${recall.name}: automatic runs paused — ${why}.`, 'error');
+}
+
+// A run is settled: start the countdown to the next one from *now*.
+function settleAutoRecall(recall, verdict) {
+  const st = autoState(recall);
+  st.jobIds = [];
+  st.finishedAt = new Date().toISOString();
+  st.nextDueAt = new Date(Date.now() + AUTO_SETTLE_MS + autoIntervalMs(recall)).toISOString();
+  st.lastResult = verdict;
+  st.failures = verdict === 'ok' ? 0 : (st.failures || 0) + 1;
+  if (verdict !== 'ok' && st.failures >= AUTO_MAX_FAILURES && autoCfg(recall).enabled) {
+    pauseAutoRecall(recall, `${st.failures} runs in a row failed`);
+  }
+}
+
+function watchRecallRun(recall, run) {
+  const st = autoState(recall);
+  st.runId = run.runId;
+  st.sentAt = new Date().toISOString();
+  st.jobIds = run.jobIds || [];
+  if (st.jobIds.length) {
+    st.lastResult = 'running';
+    st.nextDueAt = null;             // recomputed once these jobs report finished
+  } else {
+    settleAutoRecall(recall, run.ok ? 'ok' : 'failed');
+  }
+}
+
+// Is the previous run over? Anything uncertain — a transient API error, a job
+// the relay supervisor has not created yet — counts as still running, because
+// the cost of waiting another tick is nothing and the cost of guessing wrong is
+// an AGV error.
+async function recallRunVerdict(st) {
+  const relays = (store.pendingRelays || []).filter((p) => p.orderId === st.runId);
+  // An abandoned hand-over means the receiving leg is never created, so its job
+  // would never answer — call the run failed now instead of waiting for ever.
+  if (relays.some((p) => p.state === 'failed')) return 'failed';
+  if (relays.some((p) => p.state !== 'done')) return 'running';
+
+  let anyFailed = false;
+  for (const jobId of st.jobIds) {
+    let res = null;
+    try {
+      res = await window.api.getJob(jobId);
+    } catch (e) {
+      return 'running';
+    }
+    if (!res || !res.ok || !res.data) return 'running';
+    const d = res.data;
+    if (d.status === 'FINISHED_FAILURE') { anyFailed = true; continue; }
+    if (d.status === 'FINISHED_SUCCESS' || d.finishedExternally) continue;
+    const milestones = d.milestones || [];
+    // Every milestone, the trailing waiting-spot move included: the recall is
+    // over when the AGV has stopped driving, not when it drops its load.
+    if (!milestones.length || !milestones.every((m) => milestonePhase(m) === 4)) return 'running';
+  }
+  return anyFailed ? 'failed' : 'ok';
+}
+
+// Another recall's run is still out there. Two AGVs sent by two timers into the
+// same aisle is exactly the collision this feature must not create.
+function autoRecallInFlight(except) {
+  return (store.recalls || []).some((r) => r !== except && ((r.autoState || {}).jobIds || []).length > 0);
+}
+
+function anOrderIsRunning() {
+  return (store.orders || []).some((o) => o.state === 'in_progress' && !o.confirmed
+    && Date.now() - new Date(o.createdAt).getTime() < ORDER_STALE_MS);
+}
+
+async function serviceAutoRecall(recall) {
+  const st = autoState(recall);
+  const cfg = autoCfg(recall);
+
+  // 1. A run of this recall is still out there. Watch it; dispatch nothing.
+  if (st.jobIds.length) {
+    const verdict = await recallRunVerdict(st);
+    if (verdict === 'running') {
+      if (st.sentAt && Date.now() - new Date(st.sentAt).getTime() > AUTO_WATCHDOG_MS) {
+        // Never seen to finish — the safe reading is that something is wrong on
+        // the floor, so stop the timer rather than send another AGV after it.
+        st.jobIds = [];
+        st.lastResult = 'stalled';
+        st.nextDueAt = null;
+        if (cfg.enabled) pauseAutoRecall(recall, 'the last run never reported finished');
+        return true;
+      }
+      return false;
+    }
+    settleAutoRecall(recall, verdict);
+    return true;    // never dispatch on the same tick a run was seen to finish
+  }
+
+  if (!cfg.enabled || isMpdv()) return false;
+  if (st.lastResult === 'stalled') return false;
+  if (!st.nextDueAt) { armAutoRecall(recall); return true; }
+  if (Date.now() < new Date(st.nextDueAt).getTime()) return false;
+
+  // Due — but only if the floor is clear.
+  if (autoRecallInFlight(recall)) return false;
+  if (cfg.onlyWhenIdle && anOrderIsRunning()) return false;
+  if (!(recall.steps || []).filter((s) => !isHandoverStep(s)).length) {
+    pauseAutoRecall(recall, 'it has no steps');
+    return true;
+  }
+
+  const run = await dispatchRecall(recall, { auto: true });
+  watchRecallRun(recall, run);
+  return true;
+}
+
+async function autoRecallTick() {
+  if (!store || autoRecallBusy) return;
+  // A recall whose timer was switched off mid-run is still serviced, so its
+  // state does not stay stuck on "running" for ever.
+  const watched = (store.recalls || []).filter((r) =>
+    (r.auto && r.auto.enabled) || ((r.autoState || {}).jobIds || []).length);
+  if (!watched.length) return;
+
+  autoRecallBusy = true;
+  let changed = false;
+  try {
+    // Judge a run against the relay supervisor's latest hand-over state, not a
+    // copy that may be minutes old.
+    if (watched.some((r) => ((r.autoState || {}).jobIds || []).length)) await syncRelaysFromMain();
+    for (const recall of watched) {
+      changed = (await serviceAutoRecall(recall)) || changed;
+    }
+  } catch (e) {
+    /* a bad tick must never kill the timer */
+  } finally {
+    autoRecallBusy = false;
+  }
+  if (changed) {
+    try { await persist(); } catch (e) { /* retried on the next tick */ }
+  }
+  refreshAutoRecallStatus(changed);
+}
+
+function startAutoRecalls() {
+  if (autoRecallTimer) return;
+  // After a restart a countdown may be long overdue. Nothing should drive off
+  // the second the app opens — give the operator a minute to notice, and give a
+  // run that was in flight at shutdown a chance to be polled and settled first.
+  const grace = Date.now() + AUTO_BOOT_GRACE_MS;
+  (store.recalls || []).forEach((r) => {
+    const st = autoState(r);
+    if (st.jobIds.length) return;
+    if (st.nextDueAt && new Date(st.nextDueAt).getTime() < grace) st.nextDueAt = new Date(grace).toISOString();
+  });
+  autoRecallTimer = setInterval(autoRecallTick, AUTO_TICK_MS);
+}
+
+function fmtCountdown(ms) {
+  const total = Math.max(0, Math.round(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const p = (n) => String(n).padStart(2, '0');
+  return h ? `${h}:${p(m)}:${p(s)}` : `${m}:${p(s)}`;
+}
+
+function autoStatusText(recall) {
+  const cfg = autoCfg(recall);
+  const st = autoState(recall);
+  if (st.jobIds.length) return '🚚 Running now — the next one waits until this AGV is finished';
+  if (st.lastResult === 'stalled') return '⏸️ Paused — the last run never reported finished; send it by hand to check the AGV';
+  if (!cfg.enabled) {
+    return st.finishedAt ? `Automatic runs off — last run ${shortDateTime(st.finishedAt)}` : '';
+  }
+  if (!st.nextDueAt) return '⏱️ Waiting for the last run to finish';
+  const left = new Date(st.nextDueAt).getTime() - Date.now();
+  if (left > 0) return `⏱️ Next run in ${fmtCountdown(left)}`;
+  if (cfg.onlyWhenIdle && anOrderIsRunning()) return '⏳ Due — holding until the customer order is finished';
+  if (autoRecallInFlight(recall)) return '⏳ Due — holding until the other recall is finished';
+  return '⏳ Due — starting…';
+}
+
+// Keeps the countdown honest without redrawing the panel under the operator's
+// cursor; a full redraw only happens when something actually changed and no
+// field is being edited.
+function refreshAutoRecallStatus(changed) {
+  if (currentView !== 'admin' || adminTab !== 'recalls' || recallDraft) return;
+  const editing = document.activeElement && document.activeElement.closest
+    && document.activeElement.closest('.auto-box');
+  if (changed && !editing) { renderAdminRecalls(); return; }
+  (store.recalls || []).forEach((r) => {
+    const el = $(`[data-rc-auto-status="${r.id}"]`);
+    if (el) el.textContent = autoStatusText(r);
+  });
 }
 
 function renderRecallEditor(body) {
@@ -1577,7 +1910,15 @@ function renderRecallEditor(body) {
     delete r._new;
     store.recalls = store.recalls || [];
     const idx = store.recalls.findIndex((x) => x.id === r.id);
-    if (idx >= 0) store.recalls[idx] = r; else store.recalls.push(r);
+    if (idx >= 0) {
+      // The editor works on a copy taken when it opened; the schedule may have
+      // moved on since (a run may even have started), so keep the live one.
+      r.auto = store.recalls[idx].auto || r.auto;
+      r.autoState = store.recalls[idx].autoState || r.autoState;
+      store.recalls[idx] = r;
+    } else {
+      store.recalls.push(r);
+    }
     recallDraft = null;
     await persist();
     renderAdmin();
