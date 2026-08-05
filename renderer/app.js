@@ -1362,24 +1362,52 @@ function renderAdminStations() {
           </div>
           <div class="desc">Supports: ${escapeHtml((r.supportedJobTypes || []).join(', ') || '—')}</div>
           ${cannot.length ? `<div class="desc" style="color:#d64545;">✖ Cannot reach: ${escapeHtml(cannot.join(', '))}</div>` : ''}
-          <div class="form-grid" style="margin-top:10px;">
-            <label class="fld">Waiting spot — node id
-              <input class="inp" data-robot-home-id="${escapeHtml(r.id)}" value="${escapeHtml((r.homeNode && r.homeNode.id) || '')}" placeholder="e.g. 00">
-            </label>
-            <label class="fld">Waiting spot — navigation graph
-              <input class="inp" data-robot-home-sys="${escapeHtml(r.id)}" value="${escapeHtml((r.homeNode && r.homeNode.system) || '')}" placeholder="e.g. TUSK/NODES">
-            </label>
-          </div>
-          <span class="fld-hint">${(r.homeNode && r.homeNode.id)
-            ? `After finishing its part of an order, ${escapeHtml(r.id)} drives to <b>${escapeHtml(r.homeNode.id)}</b> on <b>${escapeHtml(r.homeNode.system || 'STATION')}</b>.`
-            : 'Leave empty to let the robot stay where it finished.'}</span>
+          <label class="fld" style="margin-top:10px;">Waiting spot
+            <select class="inp" data-robot-home="${escapeHtml(r.id)}">
+              <option value="">None — stay where it finished</option>
+              ${(store.nodes || []).map((n) => {
+                const key = `${n.nodeId}@${n.system}`;
+                const on = r.homeNode && r.homeNode.id === n.nodeId && (r.homeNode.system || '') === n.system;
+                return `<option value="${escapeHtml(n.id)}" ${on ? 'selected' : ''}>${escapeHtml(n.name || n.nodeId)} — ${escapeHtml(key)}</option>`;
+              }).join('')}
+              ${r.homeNode && r.homeNode.id && !(store.nodes || []).some((n) => n.nodeId === r.homeNode.id && (n.system || '') === (r.homeNode.system || ''))
+                ? `<option value="__keep__" selected>${escapeHtml(r.homeNode.id)}@${escapeHtml(r.homeNode.system || '')} (not in the node list)</option>` : ''}
+            </select>
+            <span class="fld-hint">${(r.homeNode && r.homeNode.id)
+              ? `After finishing its part of an order, ${escapeHtml(r.id)} drives to <b>${escapeHtml(r.homeNode.id)}</b> on <b>${escapeHtml(r.homeNode.system || 'STATION')}</b>.`
+              : (store.nodes || []).length ? 'Pick a node to send this robot home after each order.'
+              : 'Add a node below first, then pick it here.'}</span>
+          </label>
           <div class="row-actions" style="margin-top:8px;">
             <button class="link-btn danger" data-robot-del="${escapeHtml(r.id)}">Remove</button>
           </div>
         </div>
       </div>`;
     }).join('')
-    : '<p class="hint">No robots loaded yet. Click “Read from SYNAOS”, or add one by id below.</p>';
+    : '<p class="hint">No robots loaded yet. Click “Read from SYNAOS”, add one by id, or scan a range below.</p>';
+
+  const nodesHtml = (store.nodes || []).length
+    ? store.nodes.map((n) => `
+      <div class="admin-item">
+        <div class="thumb">📌</div>
+        <div class="grow">
+          <div class="form-grid">
+            <label class="fld">Name
+              <input class="inp" data-nd-name="${n.id}" value="${escapeHtml(n.name || '')}" placeholder="e.g. Kuka waiting spot">
+            </label>
+            <label class="fld">Node id
+              <input class="inp" data-nd-node="${n.id}" value="${escapeHtml(n.nodeId || '')}" placeholder="00">
+            </label>
+            <label class="fld full">Navigation graph (address system)
+              <input class="inp" data-nd-sys="${n.id}" value="${escapeHtml(n.system || '')}" placeholder="TUSK/NODES">
+            </label>
+          </div>
+          <div class="row-actions" style="margin-top:8px;">
+            <button class="link-btn danger" data-nd-del="${n.id}">Delete node</button>
+          </div>
+        </div>
+      </div>`).join('')
+    : '<p class="hint">No nodes yet. Add one, or read them from SYNAOS.</p>';
 
   body.innerHTML = `
     <div class="panel">
@@ -1396,9 +1424,31 @@ function renderAdminStations() {
         <h2>Robots (transport resources)</h2>
         <button class="btn btn-secondary" id="syncSynaos2">⟳ Read from SYNAOS</button>
       </div>
-      <p class="hint">The AGVs/robots SYNAOS is using. Discovery only finds robots that already appear in jobs — add any others by id. ✖ marks stations SYNAOS reported the robot cannot reach.</p>
+      <p class="hint">The AGVs/robots SYNAOS is using. Reading from jobs only finds robots that have already run one, so a registered but unused AGV stays invisible — use the scanner below to find those. ✖ marks stations SYNAOS reported the robot cannot reach.</p>
       <div class="admin-list">${robotsHtml}</div>
-      <button class="btn btn-primary" id="addRobot" style="margin-top:16px;">+ Add robot by id</button>
+      <div class="row-actions" style="margin-top:16px;">
+        <button class="btn btn-primary" id="addRobot">+ Add robot by id</button>
+      </div>
+      <div class="scan-box">
+        <div class="arm-log-title">Scan SYNAOS for robots</div>
+        <p class="hint">Enter ids, ranges or patterns — the app asks SYNAOS about each and adds the ones that exist. Examples:
+          <code>36029</code>, <code>36020-36040</code>, <code>kuka0*</code>, <code>VNP15-0[1-9]</code>. Up to 600 per scan.</p>
+        <div class="scan-row">
+          <input class="inp" id="scanPatterns" placeholder="36020-36040, kuka0*, 00[1-9]" value="${escapeHtml(lastScanPatterns)}">
+          <button class="btn btn-secondary" id="runScan">Scan</button>
+        </div>
+        <div id="scanStatus" class="fld-hint"></div>
+        <div id="scanResults"></div>
+      </div>
+    </div>
+    <div class="panel">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;">
+        <h2>Nodes (navigation graph)</h2>
+        <button class="btn btn-secondary" id="syncSynaos3">⟳ Read from SYNAOS</button>
+      </div>
+      <p class="hint">Points on a robot's navigation graph — waiting spots, parking, staging. Give each a friendly name, then pick it as a robot's waiting spot instead of typing the id and graph by hand.</p>
+      <div class="admin-list">${nodesHtml}</div>
+      <button class="btn btn-primary" id="addNode" style="margin-top:16px;">+ Add node</button>
     </div>`;
 
   $$('[data-st-name]', body).forEach((el) => el.addEventListener('change', async (e) => {
@@ -1431,18 +1481,52 @@ function renderAdminStations() {
     await persist();
     renderAdminStations();
   }));
-  const setHome = async (rid, patch) => {
-    const robot = (store.robots || []).find((r) => r.id === rid);
+  $$('[data-robot-home]', body).forEach((el) => el.addEventListener('change', async () => {
+    const robot = (store.robots || []).find((r) => r.id === el.dataset.robotHome);
     if (!robot) return;
-    const home = { id: '', system: '', ...(robot.homeNode || {}), ...patch };
-    robot.homeNode = home.id.trim() ? { id: home.id.trim(), system: (home.system || '').trim() || 'STATION' } : null;
+    if (el.value === '__keep__') return;                 // leave a hand-entered spot alone
+    const node = (store.nodes || []).find((n) => n.id === el.value);
+    robot.homeNode = node ? { id: node.nodeId, system: node.system || 'STATION' } : null;
+    await persist();
+    renderAdminStations();
+  }));
+
+  // ---- nodes ----
+  const patchNode = async (nid, patch) => {
+    const node = (store.nodes || []).find((n) => n.id === nid);
+    if (!node) return;
+    Object.assign(node, patch);
     await persist();
     renderAdminStations();
   };
-  $$('[data-robot-home-id]', body).forEach((el) =>
-    el.addEventListener('change', () => setHome(el.dataset.robotHomeId, { id: el.value })));
-  $$('[data-robot-home-sys]', body).forEach((el) =>
-    el.addEventListener('change', () => setHome(el.dataset.robotHomeSys, { system: el.value })));
+  $$('[data-nd-name]', body).forEach((el) =>
+    el.addEventListener('change', () => patchNode(el.dataset.ndName, { name: el.value.trim() })));
+  $$('[data-nd-node]', body).forEach((el) =>
+    el.addEventListener('change', () => patchNode(el.dataset.ndNode, { nodeId: el.value.trim() })));
+  $$('[data-nd-sys]', body).forEach((el) =>
+    el.addEventListener('change', () => patchNode(el.dataset.ndSys, { system: el.value.trim() })));
+  $$('[data-nd-del]', body).forEach((el) => el.addEventListener('click', () => {
+    const node = (store.nodes || []).find((n) => n.id === el.dataset.ndDel);
+    confirmModal('Delete node?', 'Robots using it as a waiting spot will stop parking.', async () => {
+      store.nodes = (store.nodes || []).filter((n) => n.id !== el.dataset.ndDel);
+      (store.robots || []).forEach((r) => {
+        if (node && r.homeNode && r.homeNode.id === node.nodeId && (r.homeNode.system || '') === (node.system || '')) r.homeNode = null;
+      });
+      await persist();
+      renderAdminStations();
+    });
+  }));
+  $('#addNode').addEventListener('click', async () => {
+    store.nodes = store.nodes || [];
+    store.nodes.push({ id: uid('nd'), name: 'New node', nodeId: '', system: '' });
+    await persist();
+    renderAdminStations();
+  });
+  $('#syncSynaos3').addEventListener('click', discoverFromSynaosFlow);
+
+  // ---- scan ----
+  $('#runScan').addEventListener('click', runResourceScan);
+  $('#scanPatterns').addEventListener('keydown', (e) => { if (e.key === 'Enter') runResourceScan(); });
   $$('[data-robot-del]', body).forEach((el) => el.addEventListener('click', () => {
     const rid = el.dataset.robotDel;
     confirmModal('Remove robot?', `${rid} will be removed from the list and from any station's allowed robots.`, async () => {
@@ -1461,6 +1545,57 @@ function renderAdminStations() {
   });
   $('#syncSynaos').addEventListener('click', discoverFromSynaosFlow);
   $('#syncSynaos2').addEventListener('click', discoverFromSynaosFlow);
+}
+
+// Asks SYNAOS about every id the patterns expand to, and offers the real ones.
+let lastScanPatterns = '';
+async function runResourceScan() {
+  const input = $('#scanPatterns');
+  const status = $('#scanStatus');
+  const results = $('#scanResults');
+  lastScanPatterns = input.value;
+  results.innerHTML = '';
+  status.textContent = 'Asking SYNAOS…';
+  $('#runScan').disabled = true;
+
+  const res = await window.api.scanResources(lastScanPatterns);
+  $('#runScan').disabled = false;
+
+  if (!res.ok) { status.textContent = res.error || 'Scan failed.'; return; }
+
+  const known = new Set((store.robots || []).map((r) => r.id));
+  const fresh = res.found.filter((f) => !known.has(f.id));
+  status.innerHTML = `Checked <b>${res.tried}</b> id(s) — <b>${res.found.length}</b> exist, <b>${fresh.length}</b> new.`
+    + (res.truncated ? ` <span class="mpdv-id-warn">Stopped at the ${res.limit} id limit.</span>` : '');
+
+  if (!res.found.length) { results.innerHTML = '<p class="hint">None of those ids exist in SYNAOS.</p>'; return; }
+  results.innerHTML = `
+    <div class="disc-list">
+      ${res.found.map((f, i) => {
+        const already = known.has(f.id);
+        return `<label class="disc-row">
+          <input type="checkbox" data-scan="${i}" ${already ? 'disabled' : 'checked'}>
+          <span class="disc-id">${escapeHtml(f.id)}</span>
+          <span class="chip on">${escapeHtml(f.mode || 'AUTO')}</span>
+          ${already ? '<span class="disc-note">already added</span>' : ''}
+        </label>`;
+      }).join('')}
+    </div>
+    <button class="btn btn-primary" id="addScanned" style="margin-top:12px;" ${fresh.length ? '' : 'disabled'}>Add selected robots</button>`;
+
+  $('#addScanned').addEventListener('click', async () => {
+    const picked = $$('[data-scan]').filter((c) => c.checked && !c.disabled).map((c) => res.found[+c.dataset.scan]);
+    store.robots = store.robots || [];
+    let added = 0;
+    picked.forEach((f) => {
+      if (store.robots.some((r) => r.id === f.id)) return;
+      store.robots.push({ ...f, source: 'manual', homeNode: null });
+      added++;
+    });
+    await persist();
+    renderAdminStations();
+    toast(added ? `Added ${added} robot(s) from the scan` : 'Nothing new to add', added ? 'success' : undefined);
+  });
 }
 
 // Adds a robot that discovery cannot see, verifying the id against SYNAOS first.
@@ -1504,6 +1639,8 @@ async function discoverFromSynaosFlow() {
   // Cache robots + learned station access immediately.
   // Discovered robots are merged in, so manually added ones (e.g. a robot that has
   // never appeared in a job) are never dropped.
+  // Manually added and scanned robots must survive a re-read; discovery only
+  // ever sees robots that have already run a job.
   const manual = (store.robots || []).filter((r) => r.source === 'manual');
   const discovered = (res.robots || []).map((r) => ({ ...r, source: 'discovered' }));
   const seen = new Set(discovered.map((r) => r.id));
@@ -1515,6 +1652,18 @@ async function discoverFromSynaosFlow() {
 
 function openDiscoverModal(res) {
   const existing = new Set(store.stations.map((s) => (s.stationId || '') + '|' + (s.system || 'STATION')));
+  const knownNodes = new Set((store.nodes || []).map((n) => (n.nodeId || '') + '|' + (n.system || '')));
+  const discoveredNodes = res.nodes || [];
+  const nodeRows = discoveredNodes.map((nd, i) => {
+    const already = knownNodes.has(nd.id + '|' + nd.system);
+    return `
+      <label class="disc-row">
+        <input type="checkbox" data-disc-node="${i}" ${already ? 'disabled' : 'checked'}>
+        <span class="disc-id">${escapeHtml(nd.id)}</span>
+        <span class="chip">${escapeHtml(nd.system)}</span>
+        ${already ? '<span class="disc-note">already added</span>' : ''}
+      </label>`;
+  }).join('');
   const rows = res.stations.map((st, i) => {
     const key = st.id + '|' + st.system;
     const already = existing.has(key);
@@ -1535,8 +1684,12 @@ function openDiscoverModal(res) {
     <div class="modal-backdrop">
       <div class="modal" style="max-width:560px;">
         <h3>Read from SYNAOS</h3>
-        <p>Found <b>${res.stations.length}</b> station address(es) and <b>${(res.robots || []).length}</b> robot(s) across <b>${res.jobCount}</b> jobs. Pick the stations to import.</p>
-        <div class="disc-list">${rows || '<p class="hint">No station addresses found in SYNAOS jobs.</p>'}</div>
+        <p>Found <b>${res.stations.length}</b> station(s), <b>${discoveredNodes.length}</b> node(s) and <b>${(res.robots || []).length}</b> robot(s) across <b>${res.jobCount}</b> jobs.
+          This only sees what has already been used in a job — scan a range in the Robots panel to find the rest.</p>
+        <div class="arm-log-title">Stations</div>
+        <div class="disc-list">${rows || '<p class="hint">No station addresses found.</p>'}</div>
+        <div class="arm-log-title">Navigation-graph nodes</div>
+        <div class="disc-list">${nodeRows || '<p class="hint">No node addresses found.</p>'}</div>
         ${robotLines ? `<div style="margin-top:14px;"><div class="hint" style="margin-bottom:6px;">Robots (saved automatically):</div>${robotLines}</div>` : ''}
         <div class="modal-actions">
           <button class="btn btn-secondary" id="discCancel">Close</button>
@@ -1559,11 +1712,26 @@ function openDiscoverModal(res) {
       store.stations.push({ id: uid('st'), stationId: st.id, name: st.id, fn, system: st.system });
       added++;
     });
+
+    const pickedNodes = $$('[data-disc-node]').filter((c) => c.checked && !c.disabled)
+      .map((c) => discoveredNodes[+c.dataset.discNode]);
+    store.nodes = store.nodes || [];
+    let addedNodes = 0;
+    pickedNodes.forEach((nd) => {
+      if (store.nodes.some((n) => (n.nodeId || '') === nd.id && (n.system || '') === nd.system)) return;
+      store.nodes.push({ id: uid('nd'), name: nd.id, nodeId: nd.id, system: nd.system });
+      addedNodes++;
+    });
+
     await persist();
     closeModal();
     renderCatalog();
     renderAdminStations();
-    toast(added ? `Imported ${added} station(s) from SYNAOS` : 'Nothing new to import', added ? 'success' : undefined);
+    const parts = [];
+    if (added) parts.push(`${added} station(s)`);
+    if (addedNodes) parts.push(`${addedNodes} node(s)`);
+    toast(parts.length ? `Imported ${parts.join(' and ')} from SYNAOS` : 'Nothing new to import',
+      parts.length ? 'success' : undefined);
   });
 }
 

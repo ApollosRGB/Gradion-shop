@@ -58,6 +58,9 @@ function defaultStore() {
       { id: 'st-k1', stationId: 'K1', name: 'Shop', fn: 'shop', system: 'STATION', allowedRobots: [] }
     ],
     robots: [],
+    // Navigation-graph nodes (waiting spots, parking, staging) kept apart from
+    // handling stations because they live in a graph, not the STATION system.
+    nodes: [],
     capability: {},
     pendingRelays: [],
     armConfigVersion: ARM_CONFIG_VERSION,
@@ -165,6 +168,7 @@ function loadStore() {
     data.products.forEach((p) => { if (p.ratingCount == null) p.ratingCount = p.sold || 0; });
     data.robots = data.robots || [];
     data.robots.forEach((r) => { if (r.homeNode === undefined) r.homeNode = null; });
+    data.nodes = data.nodes || [];
     data.orders = data.orders || [];
     return data;
   } catch (e) {
@@ -604,6 +608,82 @@ function recordMpdvLog(entry) {
   saveStore(store);
 }
 
+// ---------------------------------------------------------------------------
+// Resource scanning
+//
+// SYNAOS exposes no fleet listing over Basic auth, and job history only reveals
+// robots that have already run a job — which is why a registered but unused AGV
+// stays invisible. The resource-mode endpoint answers 200 for a real resource
+// and 404 otherwise, so candidate ids can be checked one by one.
+// ---------------------------------------------------------------------------
+
+const SCAN_LIMIT = 600;
+
+// Expands `36020-36040`, `kuka0*`, `VNP15-0[1-9]`, `00?` into concrete ids.
+// Ranges keep their zero padding, so `001-010` yields 001…010, not 1…10.
+function expandScanPattern(pattern) {
+  const token = String(pattern || '').trim();
+  if (!token) return [];
+
+  // A whole-token numeric range, optionally with a shared prefix/suffix
+  const range = token.match(/^(.*?)(\d+)-(\d+)(.*)$/);
+  if (range) {
+    const [, prefix, fromRaw, toRaw, suffix] = range;
+    const from = parseInt(fromRaw, 10);
+    const to = parseInt(toRaw, 10);
+    if (Number.isFinite(from) && Number.isFinite(to) && to >= from) {
+      const width = Math.max(fromRaw.length, toRaw.length);
+      const out = [];
+      // Bounded here as well as in expandScanInput, so an enormous range is
+      // trimmed rather than falling through and being scanned as a literal id.
+      const last = Math.min(to, from + SCAN_LIMIT);
+      for (let i = from; i <= last; i++) out.push(`${prefix}${String(i).padStart(width, '0')}${suffix}`);
+      return out.flatMap((t) => expandCharClasses(t));
+    }
+  }
+  return expandCharClasses(token);
+}
+
+// Expands [1-9] / [abc] classes, `*` (any digit) and `?` (any digit) one at a time.
+function expandCharClasses(token, depth) {
+  if ((depth || 0) > 6) return [token];
+
+  const cls = token.match(/\[([^\]]+)\]/);
+  if (cls) {
+    const chars = [];
+    const spec = cls[1];
+    for (let i = 0; i < spec.length; i++) {
+      if (spec[i + 1] === '-' && spec[i + 2]) {
+        for (let c = spec.charCodeAt(i); c <= spec.charCodeAt(i + 2); c++) chars.push(String.fromCharCode(c));
+        i += 2;
+      } else chars.push(spec[i]);
+    }
+    return chars.flatMap((c) =>
+      expandCharClasses(token.replace(cls[0], c), (depth || 0) + 1));
+  }
+
+  const wild = token.indexOf('*') >= 0 ? '*' : (token.indexOf('?') >= 0 ? '?' : null);
+  if (wild) {
+    const out = [];
+    for (let d = 0; d <= 9; d++) out.push(token.replace(wild, String(d)));
+    return out.flatMap((t) => expandCharClasses(t, (depth || 0) + 1));
+  }
+  return [token];
+}
+
+function expandScanInput(input) {
+  const tokens = String(input || '').split(/[\s,;\n]+/).filter(Boolean);
+  const seen = new Set();
+  const out = [];
+  for (const token of tokens) {
+    for (const id of expandScanPattern(token)) {
+      if (!seen.has(id)) { seen.add(id); out.push(id); }
+      if (out.length >= SCAN_LIMIT) return { ids: out, truncated: true };
+    }
+  }
+  return { ids: out, truncated: false };
+}
+
 // Correlation id marking the trailing "go to the waiting spot" milestone, so the
 // customer-facing progress screen can tell parking apart from the actual delivery.
 const WAITING_SPOT_TAG = 'waitingSpot';
@@ -887,9 +967,12 @@ function registerIpc() {
         }
       }
     }
-    const stations = [...stationMap.entries()]
+    const addresses = [...stationMap.entries()]
       .map(([id, sys]) => ({ id: String(id), system: sys.has('STATION') ? 'STATION' : [...sys][0] }))
       .sort((a, b) => (a.system === b.system ? a.id.localeCompare(b.id) : a.system.localeCompare(b.system)));
+    // Anything not in the STATION system is a navigation-graph node
+    const stations = addresses.filter((a) => a.system === 'STATION');
+    const nodes = addresses.filter((a) => a.system !== 'STATION');
 
     // Enrich robots with their mode / supported job types (confirms they are real)
     const robots = [];
@@ -902,7 +985,7 @@ function registerIpc() {
         live: rm.ok
       });
     }
-    return { ok: true, status: res.status, jobCount: jobs.length, stations, robots, capability };
+    return { ok: true, status: res.status, jobCount: jobs.length, stations, nodes, robots, capability };
   });
 
   // Creates the SYNAOS jobs for each ordered unit — one job per robot leg.
@@ -1111,6 +1194,42 @@ function registerIpc() {
     }))
   }));
 
+  // Checks a batch of candidate ids against SYNAOS and reports which are real,
+  // so an AGV that has never run a job can still be found. Progress is streamed
+  // back because a wide range takes a while.
+  ipcMain.handle('api:scanResources', async (ev, patterns) => {
+    const store = loadStore();
+    const { ids, truncated } = expandScanInput(patterns);
+    if (!ids.length) return { ok: false, error: 'Nothing to scan — enter an id, range or pattern.' };
+
+    const found = [];
+    const CONCURRENCY = 5;
+    let checked = 0;
+
+    for (let i = 0; i < ids.length; i += CONCURRENCY) {
+      const batch = ids.slice(i, i + CONCURRENCY);
+      const answers = await Promise.all(batch.map(async (id) => {
+        const rm = await apiRequest(store.settings, 'GET', `/api/v1/resources/${encodeURIComponent(id)}/resource-mode`);
+        return { id, rm };
+      }));
+      answers.forEach(({ id, rm }) => {
+        if (rm.ok && rm.data) {
+          found.push({
+            id,
+            mode: rm.data.resourceMode || null,
+            supportedJobTypes: rm.data.supportedJobTypes || null,
+            live: true
+          });
+        }
+      });
+      checked += batch.length;
+      if (!ev.sender.isDestroyed()) {
+        ev.sender.send('scan:progress', { checked, total: ids.length, found: found.length });
+      }
+    }
+    return { ok: true, tried: ids.length, truncated, limit: SCAN_LIMIT, found };
+  });
+
   // Confirms a transport resource really exists in SYNAOS.
   // The resource-mode endpoint answers 200 for a real robot and 404 otherwise,
   // which is the only fleet lookup reachable with Basic auth. Ids are case-sensitive.
@@ -1214,6 +1333,8 @@ app.on('window-all-closed', () => {
 module.exports = {
   __setStorePathForTest: (p) => { storePath = p; },
   __loadStoreForTest: () => loadStore(),
+  expandScanInput,
+  expandScanPattern,
   mpdvDateKey,
   nextMpdvOrderNumber,
   buildMpdvPayload,

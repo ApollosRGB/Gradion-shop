@@ -352,6 +352,13 @@ input.inp:focus, select.inp:focus, textarea.inp:focus { outline: 2px solid var(-
 }
 :root[data-theme="dark"] .handover-warn { color: #f0b429; background: rgba(240, 180, 41, 0.1); }
 
+/* Robot scanner */
+.scan-box { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
+.scan-row { display: flex; gap: 10px; align-items: center; margin: 8px 0; }
+.scan-row .inp { flex: 1; font-family: ui-monospace, monospace; }
+.scan-box code { background: var(--surface-2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+#scanResults { margin-top: 10px; }
+
 /* MPDV order log */
 .mpdv-log-item { border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; background: var(--surface-2); }
 .mpdv-log-item.failed { border-color: #d64545; }
