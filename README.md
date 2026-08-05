@@ -7,7 +7,7 @@ A Shopee-style desktop ordering app that dispatches orders to either of two syst
 
 Built with Electron for Windows and macOS, with light/dark mode and separate **user** and **admin** interfaces.
 
-![status](https://img.shields.io/badge/version-1.8.5-e0563f)
+![status](https://img.shields.io/badge/version-1.9.0-e0563f)
 
 ## Features
 
@@ -16,7 +16,7 @@ Built with Electron for Windows and macOS, with light/dark mode and separate **u
 - Add any item multiple times; a live order panel on the right shows quantities, per-item prices, and the running total.
 - **Finish** dispatches the order to whichever system is selected. In SYNAOS mode each **cart line** travels as one job chain — the whole line rides together rather than one trip per item — and the screen switches to live order progress. Ordering an item adds its quantity to the product's **sold** count.
 - **Rate your order** — once an order is delivered, the customer rates each item 1–5 stars; the product's displayed rating becomes the **running average** of all ratings received.
-- The progress screen polls the Job API and narrates the AGV journey — *Order placed → On the way to Production → Picked up → Delivering to Shop → Delivered!* — using each station's configured **function** label.
+- The progress screen polls the Job API and narrates the AGV journey using each station's configured **function** label. A **parcel travels the station rail** as the order advances — a step under way counts as half, so it creeps forward rather than jumping — bobbing while in transit and landing when it arrives, with the track filling in behind it. Below it the states read as a quiet **timeline**: small dots on a vertical line, the current step pulsing, and a clock time on each finished step instead of the word "Completed" on every line. Both respect *prefers-reduced-motion*.
 - **My Orders** keeps a history; reopen any order to see its live status. Confirm receipt ("👍 Got it!") or cancel (discards the SYNAOS jobs).
 
 ### ⚙️ Admin interface (password-protected)
@@ -67,8 +67,8 @@ Authentication is HTTP Basic. All admin configuration (products, stations, price
 ## Download
 
 Grab the latest installers from the [Releases page](../../releases):
-- **Windows** — `GradionShop-Setup-1.8.5.exe`
-- **macOS** — `GradionShop-1.8.5.dmg`
+- **Windows** — `GradionShop-Setup-1.9.0.exe`
+- **macOS** — `GradionShop-1.9.0.dmg`
 
 ## Development
 

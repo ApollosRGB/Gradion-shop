@@ -22,6 +22,13 @@ function uid(prefix) {
 function money(n) {
   return '$' + Number(n || 0).toFixed(2);
 }
+
+// Clock time for a timeline entry — quieter than repeating "Completed".
+function shortTime(iso) {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
 // Pretty-prints a JSON string when it is JSON; otherwise returns it untouched,
 // so a non-JSON error page is still shown exactly as MPDV sent it.
 function prettyJson(text) {
@@ -390,7 +397,7 @@ function renderMpdvResult(results, total) {
       <div class="thumb">${r.ok ? '✅' : '⚠️'}</div>
       <div class="nm">
         ${escapeHtml(r.productName || '(item)')}
-        <div class="step-sub">${r.orderNumber
+        <div class="tl-meta">${r.orderNumber
           ? `Order no. <b>${escapeHtml(r.orderNumber)}</b>`
           : 'No order number was issued'}${mpdvCreatedIdNote(r)}</div>
         ${r.ok ? '' : `<div class="err-text">${escapeHtml(r.error || 'Rejected by MPDV')}</div>`}
@@ -753,9 +760,11 @@ function renderProgress(liveJobs, orderArg) {
   const flow = orderFlow(order);
 
   // Aggregate milestone phase per canonical step across all live jobs
-  const stepPhase = flow.map((step) => {
+  const stepTimes = [];
+  const stepPhase = flow.map((step, stepIndex) => {
     let minPhase = 4;
     let anySeen = false;
+    let when = null;
     order.jobs.forEach((j) => {
       const d = liveJobs && liveJobs[j.jobId];
       if (!d) return;
@@ -766,9 +775,15 @@ function renderProgress(liveJobs, orderArg) {
         if (mref === wantId && (m.action || '').toUpperCase() === step.action) {
           anySeen = true;
           minPhase = Math.min(minPhase, milestonePhase(m));
+          // When it actually happened, so the timeline can show a time rather
+          // than repeating the word "Completed" on every line.
+          const finished = (m.eventHistory || []).find((e) => e.name === 'MILESTONE_FINISHED');
+          const stamp = (finished && finished.time) || m.finishTime;
+          if (stamp && !when) when = stamp;
         }
       });
     });
+    stepTimes[stepIndex] = when;
     return anySeen ? minPhase : 0;
   });
 
@@ -777,7 +792,12 @@ function renderProgress(liveJobs, orderArg) {
 
   // Build the human step list
   const stepLines = [];
-  stepLines.push({ icon: '🧾', text: 'Order placed', sub: order.items.map((i) => `${i.qty}× ${i.name}`).join(', '), state: 'done' });
+  stepLines.push({
+    text: 'Order placed',
+    sub: order.items.map((i) => `${i.qty}× ${i.name}`).join(', '),
+    state: 'done',
+    at: order.createdAt
+  });
 
   flow.forEach((step, idx) => {
     const nm = stationName(step.stationRef);
@@ -791,16 +811,15 @@ function renderProgress(liveJobs, orderArg) {
       : step.action === 'DROP' ? 'Delivered to'
       : 'Arrived at';
     let state = 'pending', text, sub;
-    if (completed || ph === 4) { state = 'done'; text = `${doneVerb} ${dest}`; sub = 'Completed'; }
-    else if (ph >= 1) { state = 'active'; text = `${verb} ${dest}`; sub = 'AGV en route…'; }
-    else { state = 'pending'; text = `On the way to ${dest}`; sub = 'Waiting for AGV'; }
-    stepLines.push({ icon: step.action === 'PICK' ? '📦' : step.action === 'DROP' ? '🏁' : '🚚', text, sub, state });
+    if (completed || ph === 4) { state = 'done'; text = `${doneVerb} ${dest}`; sub = ''; }
+    else if (ph >= 1) { state = 'active'; text = `${verb} ${dest}`; sub = 'AGV on the move'; }
+    else { state = 'pending'; text = `${verb} ${dest}`; sub = ''; }
+    stepLines.push({ text, sub, state, at: stepTimes[idx] || null });
   });
 
   stepLines.push({
-    icon: completed ? '🎉' : '🎊',
-    text: completed ? 'Delivered!' : 'Finished',
-    sub: completed ? 'Enjoy your treat' : 'Waiting for completion',
+    text: completed ? 'Delivered' : 'Delivery complete',
+    sub: completed ? 'Enjoy your treat' : '',
     state: completed ? 'done' : 'pending'
   });
 
@@ -818,22 +837,32 @@ function renderProgress(liveJobs, orderArg) {
   const railHtml = railStations.map((ref, i) => {
     const ph = completed ? 4 : (stationDonePhase[ref] || 0);
     const cls = ph === 4 ? 'done' : ph >= 1 ? 'active' : '';
-    const emoji = i === 0 ? '🏭' : i === railStations.length - 1 ? '📦' : '🤖';
+    const emoji = i === 0 ? '🏭' : i === railStations.length - 1 ? '🏬' : '🤖';
     return `<div class="rail-node ${cls}">
       <div class="rail-dot">${emoji}</div>
       <div class="rail-label">${escapeHtml(stationName(ref))}</div>
     </div>`;
   }).join('');
 
+  // How far along the route the goods are, 0–1. A step that is under way counts
+  // as half, so the package creeps forward instead of jumping between stations.
+  const progress = (() => {
+    if (completed) return 1;
+    if (!flow.length) return 0;
+    const score = stepPhase.reduce((sum, ph) => sum + (ph === 4 ? 1 : ph >= 1 ? 0.5 : 0), 0);
+    return Math.max(0, Math.min(1, score / flow.length));
+  })();
+  const moving = !completed && stepPhase.some((ph) => ph >= 1 && ph < 4);
+
   const stepsHtml = stepLines.map((s) => `
-    <div class="step-line ${s.state}">
-      <div class="step-ic">${s.icon}</div>
-      <div>
-        <div class="step-txt">${escapeHtml(s.text)}</div>
-        <div class="step-sub">${escapeHtml(s.sub || '')}</div>
+    <li class="tl-item ${s.state}">
+      <span class="tl-dot"></span>
+      <div class="tl-body">
+        <div class="tl-title">${escapeHtml(s.text)}</div>
+        ${s.sub ? `<div class="tl-meta">${escapeHtml(s.sub)}</div>` : ''}
       </div>
-      ${s.state === 'done' ? '<span class="step-check">✓</span>' : ''}
-    </div>`).join('');
+      ${s.at ? `<time class="tl-time">${escapeHtml(shortTime(s.at))}</time>` : ''}
+    </li>`).join('');
 
   const itemsHtml = order.items.map((i) => `
     <div class="oi-row">
@@ -897,8 +926,16 @@ function renderProgress(liveJobs, orderArg) {
     <div class="order-card">
       <h2>Order #${escapeHtml(order.shortId)}</h2>
       ${failNote}
-      <div class="rail">${railHtml}</div>
-      <div class="steps">${stepsHtml}</div>
+      <div class="rail">
+        <div class="rail-line">
+          <div class="rail-line-fill" style="width:${(progress * 100).toFixed(1)}%"></div>
+          <div class="rail-traveller ${moving ? 'moving' : ''} ${completed ? 'arrived' : ''}" style="left:${(progress * 100).toFixed(1)}%">
+            <span class="rail-parcel">📦</span>
+          </div>
+        </div>
+        ${railHtml}
+      </div>
+      <ol class="steps timeline">${stepsHtml}</ol>
     </div>
     ${confirmBlock}
     ${ratingBlock}
