@@ -7,7 +7,7 @@ A Shopee-style desktop ordering app that dispatches orders to either of two syst
 
 Built with Electron for Windows and macOS, with light/dark mode and separate **user** and **admin** interfaces.
 
-![status](https://img.shields.io/badge/version-1.9.2-e0563f)
+![status](https://img.shields.io/badge/version-1.10.0-e0563f)
 
 ## Features
 
@@ -22,6 +22,7 @@ Built with Electron for Windows and macOS, with light/dark mode and separate **u
 ### ⚙️ Admin interface (password-protected)
 - **Jobs / Products** — define each product as a sequence of job milestones (station + action + **the robot that performs it**, e.g. *Production · PICK → Shop · DROP*), set its price, attach an image file, and choose whether users can see it.
 - **Multi-robot relays** — a SYNAOS job is executed by exactly one transport resource, so when consecutive steps use different robots the app splits the route into **one job per robot** and chains them with a milestone dependency (`requiredPredecessorStatus: FINISHED`), meaning a leg cannot start approaching until the previous leg has finished. The editor previews the split and warns if a robot change isn't a **DROP → PICK at the same station**, which is what a physical hand-over requires.
+- **Recalls** — routes the admin runs on demand, typically fetching a rack back from the shop to production. They never appear in the shop, so a customer order can simply deliver instead of also hauling everything straight back. A recall is defined like a product route (station + action + robot per step, hand-overs included), previews how it will be split into jobs, and is dispatched with one button; recent sends are logged with the robot used and any error.
 - **Stations** — map a friendly name + **function** (production, storage, shop, charging…) to a SYNAOS station address ID used in job milestones. Each station can be given an **icon from an image file**, which is what the customer sees on that stop in the order tracking; without one it falls back to an emoji. **Add from SYNAOS** reads the real station addresses the tenant uses (derived from the job-manager, the only data reachable with Basic auth — the layout/fleet services sit behind an OAuth2 gateway), so you don't hand-type IDs.
 - **Robots** — **nothing is added automatically.** A tenant carries plenty of AGVs that have nothing to do with this shop, so reading from SYNAOS only *offers* what it found and saves only what you tick. SYNAOS does not let this app list the fleet (that page sits behind its own web login), and reading job history only reveals robots that have already run a job. So **paste the vehicle list** copied from SYNAOS's Fleet Management page: every id in the text is verified against SYNAOS before being offered, and surrounding words are harmless because anything that isn't a real resource simply fails the check. **Ids & patterns** covers ranges and wildcards (`36020-36040`, `#` a digit, `?` a digit or letter, `[1-9]` a set, 600 ids per scan) for predictable naming, but an id with an unguessable part such as `sc-aware-JQ3H0018` can only be found by pasting it. Each robot is also marked **real** or **simulated** — guessed from the name, since SYNAOS exposes no such flag over this API, and overridable per robot.
 - **Nodes** — an address book of navigation-graph points (waiting spots, parking, staging) kept separate from handling stations, each with a friendly name. A robot's waiting spot is chosen from this list rather than typed by hand, and reading from SYNAOS files node addresses here instead of mixing them in with stations.
@@ -67,8 +68,8 @@ Authentication is HTTP Basic. All admin configuration (products, stations, price
 ## Download
 
 Grab the latest installers from the [Releases page](../../releases):
-- **Windows** — `GradionShop-Setup-1.9.2.exe`
-- **macOS** — `GradionShop-1.9.2.dmg`
+- **Windows** — `GradionShop-Setup-1.10.0.exe`
+- **macOS** — `GradionShop-1.10.0.dmg`
 
 ## Development
 

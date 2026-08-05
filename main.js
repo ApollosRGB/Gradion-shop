@@ -62,6 +62,11 @@ function defaultStore() {
     // handling stations because they live in a graph, not the STATION system.
     nodes: [],
     capability: {},
+    // Admin-only routes for fetching a rack back, e.g. Shop -> Production.
+    // Kept out of the shop so a customer order does not have to include the
+    // return trip that immediately undoes the delivery.
+    recalls: [],
+    recallLog: [],
     pendingRelays: [],
     armConfigVersion: ARM_CONFIG_VERSION,
     products: [
@@ -170,6 +175,8 @@ function loadStore() {
     data.robots = data.robots || [];
     data.robots.forEach((r) => { if (r.homeNode === undefined) r.homeNode = null; });
     data.nodes = data.nodes || [];
+    data.recalls = data.recalls || [];
+    data.recallLog = data.recallLog || [];
     data.orders = data.orders || [];
     return data;
   } catch (e) {
@@ -1034,7 +1041,10 @@ function registerIpc() {
     const store = loadStore();
     const results = [];
     for (const unit of units) {
-      const product = store.products.find((p) => p.id === unit.productId);
+      // A unit that carries its own legs and label needs no catalogue entry —
+      // that is how an admin recall is dispatched down the same path.
+      const product = store.products.find((p) => p.id === unit.productId)
+        || (unit.name ? { name: unit.name, steps: [] } : null);
       if (!product) {
         results.push({ unitId: unit.unitId, ok: false, error: 'Unknown product' });
         continue;

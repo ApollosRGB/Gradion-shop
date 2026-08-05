@@ -1081,6 +1081,7 @@ function renderAdmin() {
     </div>
     <div class="admin-tabs">
       <button class="tab-btn ${adminTab === 'products' ? 'active' : ''}" data-tab="products">Jobs / Products</button>
+      <button class="tab-btn ${adminTab === 'recalls' ? 'active' : ''}" data-tab="recalls">Recalls</button>
       <button class="tab-btn ${adminTab === 'stations' ? 'active' : ''}" data-tab="stations">Stations</button>
       <button class="tab-btn ${adminTab === 'settings' ? 'active' : ''}" data-tab="settings">Settings</button>
     </div>
@@ -1089,6 +1090,7 @@ function renderAdmin() {
   $$('[data-tab]', root).forEach((b) => b.addEventListener('click', () => { adminTab = b.dataset.tab; renderAdmin(); }));
 
   if (adminTab === 'products') renderAdminProducts();
+  else if (adminTab === 'recalls') renderAdminRecalls();
   else if (adminTab === 'stations') renderAdminStations();
   else renderAdminSettings();
 }
@@ -1347,6 +1349,239 @@ function renderProductEditor(body) {
     renderCart();
     renderAdmin();
     toast('Saved', 'success');
+  });
+}
+
+// ---- Admin: recalls ----
+//
+// A recall is a route the admin runs on demand — typically fetching an empty
+// rack back from the shop to production. It uses the same job machinery as an
+// order (relays, hand-overs, waiting spots, robot access) but never appears in
+// the shop, so a customer order does not have to include a return trip.
+let recallDraft = null;
+
+function renderAdminRecalls() {
+  const body = $('#adminBody');
+  if (recallDraft) { renderRecallEditor(body); return; }
+
+  const list = (store.recalls || []).map((r) => {
+    const desc = (r.steps || []).map((s) => `${stationName(s.stationRef)}·${s.action}`).join(' → ') || 'No steps';
+    const { eligible } = eligibleRobotsForProduct(r);
+    return `
+      <div class="admin-item">
+        <div class="thumb">↩️</div>
+        <div class="grow">
+          <div class="title-row">
+            <span class="nm">${escapeHtml(r.name || 'Recall')}</span>
+            <span class="chip">${escapeHtml(r.resourceId && r.resourceId !== AUTO_CAPABLE && r.resourceId !== AUTO_ANY
+              ? r.resourceId : eligible.length ? 'auto — ' + eligible.join(', ') : 'auto')}</span>
+          </div>
+          <div class="desc">🚚 ${escapeHtml(desc)}</div>
+          <div class="row-actions" style="margin-top:10px;">
+            <button class="btn btn-primary" data-rc-send="${r.id}">▶ Send recall now</button>
+            <button class="link-btn" data-rc-edit="${r.id}">Edit</button>
+            <button class="link-btn danger" data-rc-del="${r.id}">Delete</button>
+          </div>
+        </div>
+      </div>`;
+  }).join('');
+
+  const log = (store.recallLog || []).slice(0, 12).map((l) => `
+    <div class="arm-log-row">
+      <span class="dir ${l.ok ? 'in' : 'out'}">${l.ok ? '✅ sent' : '❌ failed'}</span>
+      <span class="msg">${escapeHtml(l.name)}${l.robot ? ' — ' + escapeHtml(l.robot) : ''}
+        ${l.ok ? '' : '— ' + escapeHtml(l.error || '')}
+        <span style="opacity:.6">${escapeHtml(new Date(l.at).toLocaleString())}</span></span>
+    </div>`).join('');
+
+  body.innerHTML = `
+    <div class="panel">
+      <h2>Recalls</h2>
+      <p class="hint">Routes you run on demand — fetching a rack back from the shop to production, returning an empty carrier, repositioning a load. They never show in the shop, so an order can simply deliver without also hauling everything back.</p>
+      <div class="admin-list">${list || '<p class="hint">No recalls yet. Add one below.</p>'}</div>
+      <button class="btn btn-primary" id="addRecall" style="margin-top:16px;">+ New recall</button>
+      ${(store.recallLog || []).length ? `<div class="arm-log-title">Recently sent</div><div class="arm-log">${log}</div>` : ''}
+    </div>`;
+
+  $('#addRecall').addEventListener('click', () => {
+    // Prefill the obvious direction: from wherever the shop is, back to production
+    const shop = store.stations.find((s) => s.fn === 'shop');
+    const prod = store.stations.find((s) => s.fn === 'production');
+    const first = store.stations[0];
+    recallDraft = {
+      id: uid('rc'),
+      name: 'Bring the rack back',
+      resourceId: AUTO_CAPABLE,
+      steps: [
+        { stationRef: (shop || first || {}).id || '', action: 'PICK', resourceId: STEP_INHERIT },
+        { stationRef: (prod || first || {}).id || '', action: 'DROP', resourceId: STEP_INHERIT }
+      ],
+      _new: true
+    };
+    renderAdmin();
+  });
+  $$('[data-rc-edit]', body).forEach((el) => el.addEventListener('click', () => {
+    recallDraft = JSON.parse(JSON.stringify((store.recalls || []).find((r) => r.id === el.dataset.rcEdit)));
+    renderAdmin();
+  }));
+  $$('[data-rc-del]', body).forEach((el) => el.addEventListener('click', () => {
+    confirmModal('Delete recall?', 'This only removes the saved route; jobs already sent are unaffected.', async () => {
+      store.recalls = (store.recalls || []).filter((r) => r.id !== el.dataset.rcDel);
+      await persist();
+      renderAdminRecalls();
+    });
+  }));
+  $$('[data-rc-send]', body).forEach((el) => el.addEventListener('click', () => sendRecall(el.dataset.rcSend, el)));
+}
+
+// Dispatches a recall down the same path as an order: legs are planned from the
+// robot each step is allowed to use, then created as chained SYNAOS jobs.
+async function sendRecall(recallId, button) {
+  const recall = (store.recalls || []).find((r) => r.id === recallId);
+  if (!recall) return;
+  if (!(recall.steps || []).filter((s) => !isHandoverStep(s)).length) {
+    toast('This recall has no steps yet.', 'error');
+    return;
+  }
+  if (button) { button.disabled = true; button.textContent = 'Sending…'; }
+
+  const { legs, warnings } = buildLegsForUnit(recall, 0, 1);
+  warnings.forEach((w) => toast(w === 'incapable'
+    ? `${recall.name}: the assigned robot can't reach those stations — letting SYNAOS choose instead.`
+    : `${recall.name}: no robot is known to reach those stations — letting SYNAOS choose.`, 'error'));
+
+  const recallId2 = uid('rcl');
+  let results = [];
+  try {
+    results = await window.api.createOrderJobs({
+      orderId: recallId2,
+      units: [{ unitId: uid('u'), productId: recall.id, name: `Recall — ${recall.name}`, quantity: 1, legs }]
+    });
+  } catch (e) {
+    toast('Could not reach SYNAOS: ' + e.message, 'error');
+    renderAdminRecalls();
+    return;
+  }
+
+  const ok = results.every((r) => r.ok);
+  const firstErr = results.find((r) => !r.ok);
+  store.recallLog = store.recallLog || [];
+  store.recallLog.unshift({
+    at: new Date().toISOString(),
+    name: recall.name,
+    robot: (legs[0] && legs[0].resourceId) || null,
+    ok,
+    error: ok ? null : (firstErr && firstErr.error) || 'Rejected by SYNAOS',
+    jobIds: results.filter((r) => r.jobId).map((r) => r.jobId)
+  });
+  store.recallLog.length = Math.min(store.recallLog.length, 50);
+  await persist();
+  renderAdminRecalls();
+  toast(ok ? `Recall sent — ${legs.length} job(s) created` : `Recall failed: ${(firstErr && firstErr.error) || 'rejected'}`,
+    ok ? 'success' : 'error');
+}
+
+function renderRecallEditor(body) {
+  const r = recallDraft;
+  const stationOpts = (sel) => store.stations.map((s) =>
+    `<option value="${s.id}" ${s.id === sel ? 'selected' : ''}>${escapeHtml(s.name)} (${escapeHtml(s.stationId)})</option>`).join('');
+  const actions = ['PICK', 'DROP', 'MOVE', 'PROVIDE'];
+  const actionOpts = (sel) => actions.map((a) => `<option value="${a}" ${a === sel ? 'selected' : ''}>${a}</option>`).join('');
+  const elig = eligibleRobotsForProduct(r);
+  const stepRobotOpts = (step) => {
+    const st = store.stations.find((s) => s.id === step.stationRef);
+    const allowed = st ? robotsAllowedAtStation(st) : [];
+    return `<option value="">Use the recall's robot</option>`
+      + allowed.map((id) => `<option value="${escapeHtml(id)}" ${step.resourceId === id ? 'selected' : ''}>${escapeHtml(id)}</option>`).join('');
+  };
+
+  const stepsHtml = r.steps.map((s, i) => {
+    if (isHandoverStep(s)) {
+      return `
+      <div class="step-editor-row handover-row">
+        <span class="chip">${i + 1}</span>
+        <span class="handover-label">🤝 Hand-over — robotic arm</span>
+        <label class="inline-fld">method
+          <input class="inp" data-rc-ho="${i}" value="${escapeHtml(s.method || 'grasp')}" style="max-width:110px;">
+        </label>
+        <button class="link-btn danger" data-rc-step-del="${i}">Remove</button>
+      </div>`;
+    }
+    return `
+    <div class="step-editor-row">
+      <span class="chip">${i + 1}</span>
+      <select class="inp" data-rc-station="${i}">${stationOpts(s.stationRef)}</select>
+      <select class="inp" data-rc-action="${i}" style="max-width:120px;">${actionOpts(s.action)}</select>
+      <select class="inp" data-rc-robot="${i}" style="max-width:190px;">${stepRobotOpts(s)}</select>
+      <button class="link-btn danger" data-rc-step-del="${i}" ${r.steps.filter((x) => !isHandoverStep(x)).length <= 1 ? 'style="visibility:hidden;"' : ''}>Remove</button>
+    </div>`;
+  }).join('');
+
+  const preview = buildLegsForUnit(r, 0, 1).legs;
+  const issues = handoverIssues(r);
+
+  body.innerHTML = `
+    <div class="panel">
+      <h2>${r._new ? 'New recall' : 'Edit recall'}</h2>
+      <p class="hint">For example: pick the rack up at the Shop and drop it back at Production.</p>
+      <div class="form-grid">
+        <label class="fld full">Name
+          <input class="inp" id="rc-name" value="${escapeHtml(r.name || '')}" placeholder="Bring the rack back">
+        </label>
+        <label class="fld full">Robot
+          <select class="inp" id="rc-resource">
+            <option value="${AUTO_CAPABLE}" ${r.resourceId === AUTO_CAPABLE ? 'selected' : ''}>Auto — only robots that can reach these stations (recommended)</option>
+            <option value="" ${!r.resourceId || r.resourceId === AUTO_ANY ? 'selected' : ''}>Auto — let SYNAOS choose</option>
+            ${elig.eligible.map((id) => `<option value="${escapeHtml(id)}" ${r.resourceId === id ? 'selected' : ''}>${escapeHtml(id)}</option>`).join('')}
+            ${Object.keys(elig.blockedAt).map((id) =>
+              `<option value="${escapeHtml(id)}" disabled>${escapeHtml(id)} — can't reach ${escapeHtml(elig.blockedAt[id])}</option>`).join('')}
+          </select>
+        </label>
+      </div>
+      <h2 style="margin-top:22px;">Route</h2>
+      <div class="steps-editor">${stepsHtml}</div>
+      <div class="row-actions" style="margin-top:8px;">
+        <button class="link-btn add-step" id="rc-add-step">+ Add step</button>
+        <button class="link-btn add-step" id="rc-add-ho">+ Add hand-over (robotic arm)</button>
+      </div>
+      ${issues.length ? `<div class="handover-warn">⚠️ ${issues.join('<br>⚠️ ')}</div>` : ''}
+      ${preview.length > 1 ? `<div class="leg-preview">This recall will be sent as <b>${preview.length} chained jobs</b>:
+        ${preview.map((l, i) => `<div class="leg-line"><span class="chip">Job ${i + 1}</span> <b>${escapeHtml(l.resourceId || 'SYNAOS decides')}</b> — ${escapeHtml(l.steps.map((x) => `${stationName(x.stationRef)}·${x.action}`).join(' → '))}</div>`).join('')}
+      </div>` : ''}
+      <div class="progress-actions" style="margin-top:20px;">
+        <button class="btn btn-primary" id="rc-save">Save</button>
+        <button class="btn btn-secondary" id="rc-cancel">Cancel</button>
+      </div>
+    </div>`;
+
+  $('#rc-name').addEventListener('input', (e) => { r.name = e.target.value; });
+  $('#rc-resource').addEventListener('change', (e) => { r.resourceId = e.target.value || null; renderAdmin(); });
+  $$('[data-rc-station]', body).forEach((el) => el.addEventListener('change', (e) => { r.steps[+el.dataset.rcStation].stationRef = e.target.value; renderAdmin(); }));
+  $$('[data-rc-action]', body).forEach((el) => el.addEventListener('change', (e) => { r.steps[+el.dataset.rcAction].action = e.target.value; renderAdmin(); }));
+  $$('[data-rc-robot]', body).forEach((el) => el.addEventListener('change', (e) => { r.steps[+el.dataset.rcRobot].resourceId = e.target.value || STEP_INHERIT; renderAdmin(); }));
+  $$('[data-rc-ho]', body).forEach((el) => el.addEventListener('change', (e) => { r.steps[+el.dataset.rcHo].method = e.target.value.trim() || 'grasp'; renderAdmin(); }));
+  $$('[data-rc-step-del]', body).forEach((el) => el.addEventListener('click', () => { r.steps.splice(+el.dataset.rcStepDel, 1); renderAdmin(); }));
+  $('#rc-add-step').addEventListener('click', () => {
+    r.steps.push({ stationRef: store.stations[0] ? store.stations[0].id : '', action: 'MOVE', resourceId: STEP_INHERIT });
+    renderAdmin();
+  });
+  $('#rc-add-ho').addEventListener('click', () => {
+    r.steps.push({ kind: 'handover', method: 'grasp', quantity: 1 });
+    renderAdmin();
+  });
+  $('#rc-cancel').addEventListener('click', () => { recallDraft = null; renderAdmin(); });
+  $('#rc-save').addEventListener('click', async () => {
+    if (!(r.name || '').trim()) { toast('Give the recall a name.', 'error'); return; }
+    const real = r.steps.filter((s) => !isHandoverStep(s));
+    if (!real.length || real.some((s) => !s.stationRef)) { toast('Each step needs a station.', 'error'); return; }
+    delete r._new;
+    store.recalls = store.recalls || [];
+    const idx = store.recalls.findIndex((x) => x.id === r.id);
+    if (idx >= 0) store.recalls[idx] = r; else store.recalls.push(r);
+    recallDraft = null;
+    await persist();
+    renderAdmin();
+    toast('Recall saved', 'success');
   });
 }
 
