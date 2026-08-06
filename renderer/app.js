@@ -1435,6 +1435,17 @@ function renderAdminRecalls() {
               Only when no customer order is running
             </label>
             ${triggerPicks(r)}
+            <label class="switch">
+              <input type="checkbox" data-rc-ask="${r.id}" ${autoCfg(r).askBefore ? 'checked' : ''}>
+              Warn the shop 30 s before, and let them put it off by
+            </label>
+            <span class="delay-opts">
+              ${autoCfg(r).delayOptions.map((m, i) => `
+                <input class="inp" type="number" min="1" max="${AUTO_MAX_MINUTES}" step="1"
+                  data-rc-delay="${r.id}" data-slot="${i}" value="${m}"
+                  ${autoCfg(r).askBefore ? '' : 'disabled'} style="max-width:64px;">`).join('')}
+              <span class="hint" style="margin:0;">minutes</span>
+            </span>
             <div class="auto-status" data-rc-auto-status="${r.id}">${escapeHtml(autoStatusText(r))}</div>
           </div>
         </div>
@@ -1443,9 +1454,9 @@ function renderAdminRecalls() {
 
   const log = (store.recallLog || []).slice(0, 12).map((l) => `
     <div class="arm-log-row">
-      <span class="dir ${l.ok ? 'in' : 'out'}">${l.ok ? '✅ sent' : '❌ failed'}</span>
+      <span class="dir ${l.note ? '' : l.ok ? 'in' : 'out'}">${l.note ? '⏸ waited' : l.ok ? '✅ sent' : '❌ failed'}</span>
       <span class="msg">${l.auto ? '⏱ ' : ''}${escapeHtml(l.name)}${l.robot ? ' — ' + escapeHtml(l.robot) : ''}
-        ${l.ok ? '' : '— ' + escapeHtml(l.error || '')}
+        ${l.note ? '— ' + escapeHtml(l.note) : l.ok ? '' : '— ' + escapeHtml(l.error || '')}
         <span style="opacity:.6">${escapeHtml(new Date(l.at).toLocaleString())}</span></span>
     </div>`).join('');
 
@@ -1545,6 +1556,22 @@ function renderAdminRecalls() {
   };
   $$('[data-rc-tp]', body).forEach((el) => el.addEventListener('change', () => togglePick(el, 'triggerProducts')));
   $$('[data-rc-tr]', body).forEach((el) => el.addEventListener('change', () => togglePick(el, 'triggerRobots')));
+  $$('[data-rc-ask]', body).forEach((el) => el.addEventListener('change', async () => {
+    const r = findRecall(el.dataset.rcAsk);
+    if (!r) return;
+    autoCfg(r).askBefore = el.checked;
+    if (!el.checked) dismissRecallAsk();
+    await persist();
+    renderAdminRecalls();
+  }));
+  $$('[data-rc-delay]', body).forEach((el) => el.addEventListener('change', async () => {
+    const r = findRecall(el.dataset.rcDelay);
+    if (!r) return;
+    const mins = Math.min(AUTO_MAX_MINUTES, Math.max(1, Math.round(Number(el.value) || 0)));
+    autoCfg(r).delayOptions[Number(el.dataset.slot)] = mins;
+    await persist();
+    renderAdminRecalls();
+  }));
 }
 
 // The products / robots a recall answers to, as a row of tick boxes. Only shown
@@ -1602,6 +1629,7 @@ async function dispatchRecall(recall, opts) {
   const jobIds = results.filter((r) => r.ok && r.jobId).map((r) => r.jobId);
   logRecallRun(recall, { auto, robot, ok, error, jobIds });
   // Tell the shop something is being fetched back — by hand or on its own
+  dismissRecallAsk();                 // whatever it was warning about has now gone
   if (jobIds.length) showRecallBubble(recall.name || 'Recall');
   return { ok, runId, jobIds, legs, error };
 }
@@ -1614,6 +1642,9 @@ function logRecallRun(recall, entry) {
     auto: !!entry.auto,
     robot: entry.robot || null,
     ok: !!entry.ok,
+    // Something that happened to the schedule rather than a send — e.g. the
+    // shop putting the run off. Shown in its own right in the log.
+    note: entry.note || null,
     error: entry.ok ? null : entry.error || 'Rejected by SYNAOS',
     jobIds: entry.jobIds || []
   });
@@ -1665,6 +1696,9 @@ const AUTO_WATCHDOG_MS = 60 * 60 * 1000;   // a run that never finishes pauses t
 const AUTO_BOOT_GRACE_MS = 60000;          // nothing drives off the moment the app opens
 const ORDER_STALE_MS = 30 * 60 * 1000;     // an order older than this no longer counts as live
 const ORDER_WATCH_TICKS = 3;               // check live orders every third tick (~15s)
+const AUTO_WARN_MS = 30000;                // the shop's warning before an automatic run
+const AUTO_WARN_STALE_MS = 120000;         // a warning older than this is given again
+const DEFAULT_DELAYS = [2, 5, 10, 15];     // minutes the shop can push it back by
 
 let autoRecallTimer = null;
 let autoRecallBusy = false;
@@ -1678,6 +1712,11 @@ function autoCfg(recall) {
   if (a.triggerMode !== 'product' && a.triggerMode !== 'robot') a.triggerMode = 'any';
   if (!Array.isArray(a.triggerProducts)) a.triggerProducts = [];
   if (!Array.isArray(a.triggerRobots)) a.triggerRobots = [];
+  if (typeof a.askBefore !== 'boolean') a.askBefore = true;
+  a.delayOptions = DEFAULT_DELAYS.map((fallback, i) => {
+    const v = Math.round(Number((a.delayOptions || [])[i]));
+    return v > 0 && v <= AUTO_MAX_MINUTES ? v : fallback;
+  });
   return a;
 }
 
@@ -1835,6 +1874,47 @@ function settleAutoRecall(recall, verdict) {
   }
 }
 
+// Give the shop its full warning, then run. Called both at T-30s and when a run
+// is about to go without one, so the countdown on screen is always the real one.
+function warnRecallSoon(recall) {
+  const st = autoState(recall);
+  const soon = Date.now() + AUTO_WARN_MS;
+  if (!st.nextDueAt || new Date(st.nextDueAt).getTime() < soon) st.nextDueAt = new Date(soon).toISOString();
+  st.warnedFor = st.nextDueAt;
+  showRecallAsk(recall);
+}
+
+// The shop is not ready — push the run back by the minutes they picked. The
+// warning is cleared with it, so they are asked again before the new time.
+async function delayAutoRecall(recallId, minutes) {
+  const recall = (store.recalls || []).find((r) => r.id === recallId);
+  if (!recall) return;
+  const st = autoState(recall);
+  dismissRecallAsk();
+  if (st.jobIds.length) { toast('Too late — it is already on its way.', 'error'); return; }
+  const from = Math.max(Date.now(), new Date(st.nextDueAt || 0).getTime());
+  st.nextDueAt = new Date(from + minutes * 60000).toISOString();
+  st.warnedFor = null;
+  st.delayedAt = new Date().toISOString();
+  st.delayedTotal = (st.delayedTotal || 0) + minutes;
+  logRecallRun(recall, { auto: true, ok: true, note: `Put off ${minutes} min by the shop`, jobIds: [] });
+  await persist();
+  if (currentView === 'admin' && adminTab === 'recalls' && !recallDraft) renderAdminRecalls();
+  toast(`No problem — ${recall.name} will wait ${minutes} more minute${minutes === 1 ? '' : 's'}.`, 'success');
+}
+
+// "Go ahead now" — skip the rest of the warning.
+async function releaseAutoRecall(recallId) {
+  const recall = (store.recalls || []).find((r) => r.id === recallId);
+  if (!recall) return;
+  const st = autoState(recall);
+  dismissRecallAsk();
+  if (st.jobIds.length) return;
+  st.nextDueAt = new Date(Date.now() - 1000).toISOString();
+  st.warnedFor = st.nextDueAt;      // already warned — do not ask again
+  await persist();
+}
+
 function watchRecallRun(recall, run) {
   const st = autoState(recall);
   st.runId = run.runId;
@@ -1921,8 +2001,29 @@ async function serviceAutoRecall(recall) {
   // 2. A newly delivered order starts (or pushes back) the countdown.
   const armed = armFromDeliveries(recall);
   if (!st.nextDueAt) return armed;                                  // nothing delivered to wait on
+
+  // 3. Half a minute before it goes, tell the shop and offer to push it back —
+  //    the AGV turning up to collect is only welcome if they are done with it.
+  if (cfg.askBefore && !st.jobIds.length
+      && new Date(st.nextDueAt).getTime() - Date.now() <= AUTO_WARN_MS
+      && st.warnedFor !== st.nextDueAt) {
+    warnRecallSoon(recall);
+    return true;
+  }
+
   if (Date.now() < new Date(st.nextDueAt).getTime()) return armed;
   if (st.holdUntil && Date.now() < new Date(st.holdUntil).getTime()) return armed;
+
+  // Never send without the shop having had its warning — and if something held
+  // the run back long after that warning, give it again rather than have an AGV
+  // appear minutes after the countdown they watched ran out.
+  if (cfg.askBefore) {
+    if (st.warnedFor !== st.nextDueAt
+        || Date.now() - new Date(st.nextDueAt).getTime() > AUTO_WARN_STALE_MS) {
+      warnRecallSoon(recall);
+      return true;
+    }
+  }
 
   // Due — but only if the floor is clear.
   if (autoRecallInFlight(recall)) return armed;
@@ -2010,7 +2111,11 @@ function autoStatusText(recall) {
   }
   const by = st.armedBy ? ` — order #${st.armedBy} was delivered ${shortDateTime(st.armedAt)}` : '';
   const left = new Date(st.nextDueAt).getTime() - Date.now();
-  if (left > 0) return `⏱️ Runs in ${fmtCountdown(left)}${by}`;
+  if (left > 0) {
+    const put = st.delayedTotal ? ` (shop has put it off ${st.delayedTotal} min)` : '';
+    if (cfg.askBefore && st.warnedFor === st.nextDueAt) return `🗣️ Asking the shop — ${fmtCountdown(left)} left${put}`;
+    return `⏱️ Runs in ${fmtCountdown(left)}${by}${put}`;
+  }
   if (cfg.onlyWhenIdle && anOrderIsRunning()) return '⏳ Due — holding until the customer order is finished';
   if (autoRecallInFlight(recall)) return '⏳ Due — holding until the other recall is finished';
   if (st.holdUntil && Date.now() < new Date(st.holdUntil).getTime()) return '⏳ Due — letting the AGV settle first';
@@ -3071,6 +3176,55 @@ function dismissRecallBubble(immediate) {
   if (immediate) { el.remove(); return; }
   el.classList.add('leaving');
   setTimeout(() => el.remove(), 400);
+}
+
+// ===========================================================================
+// "Not ready yet?" — the shop's 30-second warning before an automatic recall
+// ===========================================================================
+let recallAskTimer = null;
+
+function showRecallAsk(recall) {
+  dismissRecallAsk();
+  const cfg = autoCfg(recall);
+  const st = autoState(recall);
+  const secondsLeft = () => Math.max(0, Math.round((new Date(st.nextDueAt).getTime() - Date.now()) / 1000));
+
+  const el = document.createElement('div');
+  el.id = 'recallAsk';
+  el.className = 'recall-ask';
+  el.innerHTML = `
+    <div class="ra-card">
+      <div class="ra-head">
+        <span class="ra-emoji">↩️</span>
+        <div>
+          <div class="ra-title">${escapeHtml(recall.name || 'Recall')}</div>
+          <div class="ra-sub">A robot is coming to collect in <b class="ra-count">${secondsLeft()}</b>s — need more time?</div>
+        </div>
+      </div>
+      <div class="ra-btns">
+        ${cfg.delayOptions.map((m) => `<button class="btn btn-secondary" data-ra-delay="${m}">+${m} min</button>`).join('')}
+        <button class="btn btn-primary" data-ra-go="1">I'm done — go now</button>
+      </div>
+    </div>`;
+  document.body.appendChild(el);
+
+  $$('[data-ra-delay]', el).forEach((b) =>
+    b.addEventListener('click', () => delayAutoRecall(recall.id, Number(b.dataset.raDelay))));
+  $('[data-ra-go]', el).addEventListener('click', () => releaseAutoRecall(recall.id));
+
+  // Its own second-by-second countdown; the scheduler only ticks every 5s
+  recallAskTimer = setInterval(() => {
+    const left = secondsLeft();
+    const label = $('.ra-count', el);
+    if (label) label.textContent = String(left);
+    if (left <= 0) dismissRecallAsk();
+  }, 1000);
+}
+
+function dismissRecallAsk() {
+  if (recallAskTimer) { clearInterval(recallAskTimer); recallAskTimer = null; }
+  const el = $('#recallAsk');
+  if (el) el.remove();
 }
 
 let toastHost;

@@ -184,7 +184,9 @@ function loadStore() {
         enabled: false, everyMinutes: 30, onlyWhenIdle: true,
         // Which deliveries wake it: any, only orders containing certain
         // products, or only orders a certain AGV delivered.
-        triggerMode: 'any', triggerProducts: [], triggerRobots: []
+        triggerMode: 'any', triggerProducts: [], triggerRobots: [],
+        // The shop gets 30s notice and can push the run back by one of these
+        askBefore: true, delayOptions: [2, 5, 10, 15]
       }, r.auto || {});
       r.autoState = Object.assign({ jobIds: [] }, r.autoState || {});
     });
