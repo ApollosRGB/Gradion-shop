@@ -1601,6 +1601,8 @@ async function dispatchRecall(recall, opts) {
   // finish, and waiting on one would stall the schedule for good.
   const jobIds = results.filter((r) => r.ok && r.jobId).map((r) => r.jobId);
   logRecallRun(recall, { auto, robot, ok, error, jobIds });
+  // Tell the shop something is being fetched back — by hand or on its own
+  if (jobIds.length) showRecallBubble(recall.name || 'Recall');
   return { ok, runId, jobIds, legs, error };
 }
 
@@ -3021,6 +3023,54 @@ function confirmModal(title, message, onYes) {
     </div>`;
   $('#modalCancel').addEventListener('click', closeModal);
   $('#modalYes').addEventListener('click', () => { closeModal(); onYes(); });
+}
+
+// ===========================================================================
+// Recall bubble
+//
+// A comic thought-bubble that pops up when a recall goes out, so the shop can
+// see the rack is being fetched back rather than wondering why an AGV just
+// turned up. Drawn as one SVG: every lobe is stroked first, then the same
+// lobes are filled on top, which hides the lines where they overlap and leaves
+// a single cloud outline.
+// ===========================================================================
+const RECALL_BUBBLE_MS = 8000;
+const BUBBLE_LOBES = [
+  [80, 80, 54], [150, 62, 54], [214, 84, 50], [118, 112, 44],
+  [186, 118, 40], [252, 112, 30], [52, 104, 34],
+  [58, 180, 15], [26, 202, 8]           // the two trailing thought bubbles
+];
+let recallBubbleTimer = null;
+
+function showRecallBubble(name) {
+  dismissRecallBubble(true);
+  const circles = BUBBLE_LOBES.map(([cx, cy, r]) => `<circle cx="${cx}" cy="${cy}" r="${r}"/>`).join('');
+  const el = document.createElement('div');
+  el.id = 'recallBubble';
+  el.className = 'recall-bubble';
+  el.title = 'Click to dismiss';
+  el.innerHTML = `
+    <svg class="rb-cloud" viewBox="0 0 300 215" aria-hidden="true">
+      <g class="rb-outline">${circles}</g>
+      <g class="rb-fill">${circles}</g>
+    </svg>
+    <div class="rb-text">
+      <span class="rb-emoji">↩️</span>
+      <span class="rb-name">${escapeHtml(name)}</span>
+      <span class="rb-sub">is on its way 🚚</span>
+    </div>`;
+  el.addEventListener('click', () => dismissRecallBubble());
+  document.body.appendChild(el);
+  recallBubbleTimer = setTimeout(() => dismissRecallBubble(), RECALL_BUBBLE_MS);
+}
+
+function dismissRecallBubble(immediate) {
+  if (recallBubbleTimer) { clearTimeout(recallBubbleTimer); recallBubbleTimer = null; }
+  const el = $('#recallBubble');
+  if (!el) return;
+  if (immediate) { el.remove(); return; }
+  el.classList.add('leaving');
+  setTimeout(() => el.remove(), 400);
 }
 
 let toastHost;

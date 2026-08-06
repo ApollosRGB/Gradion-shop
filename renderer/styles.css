@@ -559,6 +559,48 @@ select.inp option:disabled { color: var(--text-muted); }
 .toast.success { background: var(--green); }
 @keyframes fadein { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 
+/* Thought bubble announcing a recall on its way */
+.recall-bubble {
+  position: fixed; left: 22px; bottom: 22px; width: 264px; z-index: 250;
+  cursor: pointer; transform-origin: 20% 90%;
+  animation: rb-pop 0.5s cubic-bezier(0.2, 1.35, 0.4, 1) both, rb-float 3.4s ease-in-out 0.5s infinite;
+}
+.recall-bubble.leaving { animation: rb-away 0.4s ease-in forwards; }
+.rb-cloud { display: block; width: 100%; height: auto; filter: drop-shadow(0 8px 18px rgba(0, 0, 0, 0.18)); }
+/* first pass: outline every lobe — second pass fills over the inner lines */
+.rb-outline circle { fill: var(--surface); stroke: var(--text); stroke-width: 9; }
+.rb-fill circle { fill: var(--surface); }
+.rb-text {
+  position: absolute; inset: 12% 15% 34% 15%;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  text-align: center; gap: 2px; pointer-events: none;
+}
+.rb-emoji { font-size: 24px; line-height: 1; }
+.rb-name {
+  font-weight: 800; font-size: 15px; color: var(--text); line-height: 1.25;
+  max-height: 3.75em; overflow: hidden;
+}
+.rb-sub { font-size: 12px; font-weight: 600; color: var(--text-muted); }
+@keyframes rb-pop {
+  0% { opacity: 0; transform: scale(0.3) translateY(20px) rotate(-8deg); }
+  100% { opacity: 1; transform: scale(1) translateY(0) rotate(0); }
+}
+@keyframes rb-float {
+  0%, 100% { translate: 0 0; }
+  50% { translate: 0 -6px; }
+}
+@keyframes rb-away {
+  to { opacity: 0; transform: scale(0.75) translateY(10px); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .recall-bubble { animation: fadein 0.2s both; }
+  .recall-bubble.leaving { animation: none; opacity: 0; }
+}
+@media (max-width: 900px) {
+  .recall-bubble { width: 200px; left: 12px; bottom: 12px; }
+  .rb-name { font-size: 13px; }
+}
+
 @media (max-width: 900px) {
   .shop-layout { grid-template-columns: 1fr; }
   .cart { position: static; max-height: none; }
