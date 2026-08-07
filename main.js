@@ -246,6 +246,9 @@ function loadStore() {
   }
 }
 
+// Written by the main process only — see the store:set handler.
+const MAIN_OWNED_KEYS = ['pendingRelays', 'mpdvLog', 'mpdvCounter'];
+
 function saveStore(data) {
   fs.mkdirSync(path.dirname(storePath), { recursive: true });
   const tmp = storePath + '.tmp';
@@ -1258,6 +1261,14 @@ async function runRelaySupervisor() {
 function registerIpc() {
   ipcMain.handle('store:get', () => loadStore());
   ipcMain.handle('store:set', (_ev, data) => {
+    // These belong to the main process: hand-over progress, the MPDV log and
+    // its running order number are written here, not in the window. The
+    // renderer saves the whole store from a copy it loaded at start-up, so
+    // taking its version would put back a log that was just cleared, restore
+    // entries recorded since, or rewind the running number onto an order id
+    // MPDV has already been given.
+    const current = loadStore();
+    MAIN_OWNED_KEYS.forEach((key) => { data[key] = current[key]; });
     saveStore(data);
     return true;
   });

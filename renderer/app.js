@@ -3548,6 +3548,14 @@ function renderAdminSettings() {
   };
   const showMpdvState = async () => {
     const [preview, log] = await Promise.all([window.api.mpdvPreview(), window.api.mpdvLog()]);
+    const host = $('#mpdvLog');
+    // Emptying a long log shortens the page under the reader, and the admin
+    // view is what scrolls, so the browser clamps the position and the panel
+    // appears to leap to the bottom. Hold the panel still instead.
+    const anchor = host && host.closest('.panel');
+    const view = $('#view-admin');
+    const before = anchor ? anchor.getBoundingClientRect().top : 0;
+
     $('#mpdvNext').innerHTML = `<span class="dot ok"></span> Next order no. <b>${escapeHtml(preview.orderNumber)}</b>
       — ${preview.usedToday} used today, ${preview.remainingToday} left`;
     $('#mpdvLog').innerHTML = log.length
@@ -3566,6 +3574,11 @@ function renderAdminSettings() {
           ${mpdvCallsHtml(l)}
         </div>`).join('')
       : '<p class="hint">No MPDV orders sent yet.</p>';
+
+    if (anchor && view) {
+      const after = anchor.getBoundingClientRect().top;
+      if (after !== before) view.scrollTop += after - before;
+    }
   };
   $('#saveMpdv').addEventListener('click', async () => {
     store.settings.mpdv = Object.assign({}, store.settings.mpdv, readMpdvForm());
@@ -3573,9 +3586,14 @@ function renderAdminSettings() {
     showMpdvState();
     toast('MPDV settings saved', 'success');
   });
-  $('#clearMpdvLog').addEventListener('click', async () => {
+  $('#clearMpdvLog').addEventListener('click', async (e) => {
+    e.preventDefault();
     await window.api.mpdvClearLog();
-    showMpdvState();
+    // Drop this window's copy as well: it is the one written back on the next
+    // save, and keeping it would bring the whole log straight back.
+    store.mpdvLog = [];
+    await showMpdvState();
+    toast('MPDV log cleared', 'success');
   });
   showMpdvState();
 
