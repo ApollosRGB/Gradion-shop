@@ -11,6 +11,7 @@ let adminTab = 'products';
 let productDraft = null;       // product being edited in admin
 let progressOrderId = null;    // order currently shown on progress screen
 let pollTimer = null;
+let lastLiveJobs = null;       // last job data polled, so the cancel prompt can quote it
 let ratingDraft = {};          // in-progress star selection { productId: 1..5 }
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -804,6 +805,7 @@ async function pollOnce() {
     } catch (e) { /* ignore transient */ }
   }));
   if (noted) await persist();   // which AGV ran it — a recall may be waiting on that
+  lastLiveJobs = liveJobs;
   renderProgress(liveJobs, order);
 
   // Auto-complete when the API reports all jobs finished
@@ -832,6 +834,25 @@ async function pollOnce() {
       await persist();
     }
   }
+}
+
+// When SYNAOS says this order's work will begin. A job it has accepted but not
+// started carries a planned start on its milestones; the soonest one across the
+// order's jobs is what the customer is actually waiting for.
+function plannedStart(liveJobs, order) {
+  if (!liveJobs) return null;
+  let soonest = null;
+  (order.jobs || []).forEach((j) => {
+    const d = liveJobs[j.jobId];
+    if (!d || d.status === 'FINISHED_SUCCESS' || d.status === 'FINISHED_FAILURE') return;
+    (d.milestones || []).forEach((m) => {
+      if (milestonePhase(m) > 0) return;              // this one is already under way
+      const at = new Date(m.startTime || 0).getTime();
+      if (!at) return;
+      if (soonest === null || at < soonest) soonest = at;
+    });
+  });
+  return soonest === null ? null : { at: new Date(soonest).toISOString(), inMs: soonest - Date.now() };
 }
 
 function renderProgress(liveJobs, orderArg) {
@@ -943,12 +964,22 @@ function renderProgress(liveJobs, orderArg) {
     || [...stepLines].reverse().find((s) => s.state === 'done')
     || stepLines[0];
   const nextUp = stepLines.find((s) => s.state === 'pending');
+  // SYNAOS plans when a job will start, and that can be minutes out if the
+  // robot has other work first. Without saying so the screen looks dead and the
+  // order gets cancelled seconds before the AGV would have set off.
+  const queued = !completed && !moving ? plannedStart(liveJobs, order) : null;
   const statusHtml = `
     <div class="status-line ${completed ? 'done' : moving ? 'moving' : 'waiting'}">
-      <span class="status-icon">${completed ? '🎉' : moving ? '🚚' : '⏳'}</span>
+      <span class="status-icon">${completed ? '🎉' : moving ? '🚚' : queued ? '⏱️' : '⏳'}</span>
       <div class="status-body">
-        <div class="status-now">${escapeHtml(completed ? 'Delivered — enjoy your treat' : current.text)}</div>
-        ${!completed && nextUp ? `<div class="status-next">Next: ${escapeHtml(nextUp.text)}</div>` : ''}
+        <div class="status-now">${escapeHtml(completed
+          ? 'Delivered — enjoy your treat'
+          : queued ? `Queued — the robot sets off at ${shortTime(queued.at)}` : current.text)}</div>
+        ${!completed && queued
+          ? `<div class="status-next">${escapeHtml(queued.inMs > 0
+              ? `About ${fmtCountdown(queued.inMs)} to wait — it has other work to finish first`
+              : 'Any moment now')}</div>`
+          : !completed && nextUp ? `<div class="status-next">Next: ${escapeHtml(nextUp.text)}</div>` : ''}
       </div>
       ${!completed && moving ? '<span class="status-pips"><i></i><i></i><i></i></span>' : ''}
     </div>`;
@@ -1070,7 +1101,13 @@ async function confirmOrder(orderId) {
 async function cancelOrder(orderId) {
   const order = store.orders.find((o) => o.id === orderId);
   if (!order) return;
-  confirmModal('Cancel this order?', 'This will ask the robot service to discard the transport jobs.', async () => {
+  // A queued job looks like nothing is happening, so say when the robot is due
+  // rather than let it be cancelled a minute before it sets off.
+  const queued = plannedStart(lastLiveJobs, order);
+  const note = queued && queued.inMs > 0
+    ? ` The robot is queued and due to set off at ${shortTime(queued.at)} — about ${fmtCountdown(queued.inMs)} away.`
+    : '';
+  confirmModal('Cancel this order?', `This will ask the robot service to discard the transport jobs.${note}`, async () => {
     for (const j of order.jobs) {
       if (j.created && j.jobId) {
         try { await window.api.discardJob(j.jobId); } catch (e) { /* ignore */ }
@@ -2990,6 +3027,84 @@ function openDiscoverModal(res) {
   });
 }
 
+// ---- Stuck jobs ----
+//
+// A job nothing ever picked up stays in the queue for good, and everything the
+// same robot is given afterwards waits behind it. They are only listed, never
+// discarded on their own — some of them belong to other systems.
+const STUCK_AFTER_MS = 60 * 60 * 1000;
+
+function stuckReason(job) {
+  const ms = job.milestones || [];
+  const stopped = ms.find((m) => m.executionStoppedReason);
+  if (stopped) return `stopped — ${stopped.executionStoppedReason}`;
+  if (ms.every((m) => !(m.eventHistory || []).length)) return 'never started — no events at all';
+  return null;
+}
+
+async function renderStuckJobs(button) {
+  const host = $('#stuckJobs');
+  const label = button && button.textContent;
+  if (button) { button.disabled = true; button.textContent = 'Looking…'; }
+  let res;
+  try {
+    res = await window.api.listJobs(7 * 24 * 3600);
+  } catch (e) {
+    res = { ok: false, error: e.message };
+  }
+  if (button) { button.disabled = false; button.textContent = label; }
+  if (!host) return;
+  if (!res.ok) { host.innerHTML = `<p class="hint">Could not read the job list — ${escapeHtml(res.error || '')}</p>`; return; }
+
+  const stuck = res.jobs.filter((j) => {
+    if (jobIsFinished(j)) return false;
+    if (Date.now() - new Date(j.createdAt || 0).getTime() < STUCK_AFTER_MS) return false;
+    return !!stuckReason(j);
+  });
+  if (!stuck.length) { host.innerHTML = '<p class="hint">Nothing stuck — every unfinished job is making progress.</p>'; return; }
+
+  host.innerHTML = stuck.map((j) => {
+    const mine = (j.correlations || []).some((c) => c.kind === 'order');
+    const route = (j.milestones || []).map((m) => `${m.action}·${(m.address || {}).id}`).join(' → ');
+    const hours = ((Date.now() - new Date(j.createdAt).getTime()) / 3600000).toFixed(0);
+    return `
+      <div class="mpdv-log-item failed">
+        <div class="mpdv-log-head">
+          <span class="dir out">⚠ stuck</span>
+          <code>${escapeHtml(j.assignedResourceId || 'no robot')}</code>
+          <span class="chip">${escapeHtml(stuckReason(j))}</span>
+          <span class="chip">${hours}h old</span>
+          ${mine ? '<span class="chip on">from this app</span>' : '<span class="chip">another system</span>'}
+          <span class="mpdv-log-time">${escapeHtml(new Date(j.createdAt).toLocaleString())}</span>
+        </div>
+        <div class="mpdv-log-err" style="color:var(--text-muted);font-weight:600;">${escapeHtml(route)}</div>
+        <div class="row-actions" style="margin-top:8px;">
+          <button class="btn btn-secondary" data-stuck="${escapeHtml(j.id)}">Discard this job</button>
+          <span class="hint" style="margin:0;">${escapeHtml(j.id)}</span>
+        </div>
+      </div>`;
+  }).join('');
+
+  $$('[data-stuck]', host).forEach((b) => b.addEventListener('click', () => {
+    const id = b.dataset.stuck;
+    confirmModal('Discard this job?', 'SYNAOS is asked to discard it so the queue behind it can move. Work already under way is not affected.', async () => {
+      b.disabled = true;
+      b.textContent = 'Discarding…';
+      const res2 = await window.api.discardJob(id);
+      if (!res2 || !res2.ok) { toast(`SYNAOS refused: ${(res2 && res2.error) || 'HTTP ' + (res2 && res2.status)}`, 'error'); b.disabled = false; b.textContent = 'Discard this job'; return; }
+      // A discard is a request, and a job no robot ever picked up may never act
+      // on it — say so rather than claim it is gone.
+      const after = await window.api.getJob(id);
+      const cleared = after && after.ok && after.data && jobIsFinished(after.data);
+      toast(cleared
+        ? 'Discarded — the queue behind it can move now.'
+        : 'SYNAOS accepted the request, but the job has not moved. Its robot is probably not online; clear it from the SYNAOS console.',
+        cleared ? 'success' : 'error');
+      renderStuckJobs();
+    });
+  }));
+}
+
 // ---- Setup sync ----
 //
 // One file in a GitHub repository holds everything an install needs, so putting
@@ -3374,6 +3489,14 @@ function renderAdminSettings() {
       </details>
     </div>
     <div class="panel">
+      <h2>Stuck jobs</h2>
+      <p class="hint">A job SYNAOS accepted but nothing ever picked up sits in the queue for good, and later jobs for that robot line up behind it. This lists unfinished jobs that have produced <b>no milestone events at all</b>, or that stopped with a reason, and are more than an hour old.</p>
+      <div class="progress-actions" style="margin-bottom:12px;">
+        <button class="btn btn-secondary" id="findStuck">🔍 Look for stuck jobs</button>
+      </div>
+      <div id="stuckJobs"></div>
+    </div>
+    <div class="panel">
       <h2>This machine</h2>
       <p class="hint">Several machines can run this app against the same fleet. They see each other through SYNAOS — an order or recall out on the floor holds the others back — but only one should be the machine that <b>sends</b> the automatic recalls.</p>
       <label class="fld switch"><input type="checkbox" id="s-runner" ${isRecallRunner() ? 'checked' : ''}> Run automatic recalls from this machine</label>
@@ -3567,6 +3690,7 @@ function renderAdminSettings() {
       () => loadSetupFromGitHub(opts, e.target));
   });
 
+  $('#findStuck').addEventListener('click', (e) => renderStuckJobs(e.target));
   $('#s-runner').addEventListener('change', async (e) => {
     store.settings.recallRunner = e.target.checked;
     await persist();
