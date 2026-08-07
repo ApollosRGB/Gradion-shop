@@ -3122,7 +3122,7 @@ async function loadSetupFromGitHub(opts, button) {
   }
   store.settings.sync = Object.assign({}, store.settings.sync, opts);
   await applySyncedConfig(res.config);
-  toast(`Setup loaded — saved ${shortDateTime(res.savedAt)}`, 'success');
+  toast(`Setup loaded — saved ${shortDateTime(res.savedAt)}${res.branch && res.branch !== (store.settings.sync || {}).branch ? ` (from ${res.branch})` : ''}`, 'success');
 }
 
 // ---- Admin: settings ----
@@ -3292,7 +3292,8 @@ function renderAdminSettings() {
             <input class="inp" id="y-repo" value="${escapeHtml(y.repo || '')}" placeholder="owner/name">
           </label>
           <label class="fld">Branch
-            <input class="inp" id="y-branch" value="${escapeHtml(y.branch || 'main')}">
+            <input class="inp" id="y-branch" value="${escapeHtml(y.branch || 'setups')}">
+            <span class="fld-hint">Setups are data, so they go on their own branch — created on the first publish, with none of the code in it. Loading falls back to the code branch for anything published before.</span>
           </label>
           <label class="fld full">Token — only to publish from this machine
             <input class="inp" id="y-token" type="password" value="${escapeHtml(y.token || '')}" placeholder="ghp_… / github_pat_…">
@@ -3482,7 +3483,9 @@ function renderAdminSettings() {
       store.settings.sync = Object.assign({}, store.settings.sync, opts, { lastPublishedAt: res.at });
       await persist();
       renderAdminSettings();
-      toast(`Setup published — ${(res.bytes / 1024).toFixed(0)} kB${res.secretsIncluded ? ', passwords encrypted' : ', no passwords'}`, 'success');
+      toast(res.branchCreated
+        ? `Setup published — started the ${res.branchCreated} branch for it`
+        : `Setup published — ${(res.bytes / 1024).toFixed(0)} kB${res.secretsIncluded ? ', passwords encrypted' : ', no passwords'}`, 'success');
     });
   });
   $('#syncLoad').addEventListener('click', (e) => {

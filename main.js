@@ -54,7 +54,7 @@ function defaultStore() {
       // and passphrase live here only — they are never part of what is published.
       sync: {
         repo: 'ApollosRGB/Gradion-shop',
-        branch: 'main',
+        branch: 'setups',
         // The name this shop's setup is published under — all another machine
         // needs. The file it maps to (setups/<name>.json) is worked out for you.
         name: 'setup1',
@@ -167,6 +167,14 @@ function loadStore() {
     const arm = Object.assign({}, defaultArm, (data.settings && data.settings.arm) || {});
     const mpdv = Object.assign({}, def.settings.mpdv, (data.settings && data.settings.mpdv) || {});
     const sync = Object.assign({}, def.settings.sync, (data.settings && data.settings.sync) || {});
+    // Setups used to be committed to main alongside the code. Move an existing
+    // install onto the data branch once; reading falls back to the default
+    // branch, so anything already published stays reachable until it is
+    // published again. Done once, so a deliberate choice of main is respected.
+    if (!sync.branchMoved) {
+      if (!sync.branch || sync.branch === 'main' || sync.branch === 'master') sync.branch = SYNC_BRANCH;
+      sync.branchMoved = true;
+    }
     data.settings = Object.assign({}, def.settings, data.settings || {});
     data.settings.arm = arm;
     data.settings.mpdv = mpdv;
@@ -862,6 +870,9 @@ function buildRelayPayloads(legs, stations, orderId, unitId, quantity, extra) {
 
 const SYNC_KIND = 'gradion-shop-setup';
 const SYNC_MAX_BYTES = 8 * 1024 * 1024;   // GitHub's contents API is unhappy well before this
+// Setups are data, not code, so they live on their own branch rather than
+// landing in the middle of the release history on main.
+const SYNC_BRANCH = 'setups';
 
 function githubRequest(method, apiPath, token, body) {
   return new Promise((resolve) => {
@@ -978,6 +989,44 @@ const SYNC_DIR = 'setups';
 function syncSlug(name) {
   const slug = String(name || '').trim().toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
   return slug.slice(0, 40);
+}
+
+// Where the repository keeps its code, so a setup published before the data
+// branch existed can still be found.
+async function githubDefaultBranch(repo, token) {
+  const res = await githubRequest('GET', `/repos/${repo}`, token);
+  return res.ok && res.data ? res.data.default_branch || 'main' : 'main';
+}
+
+async function githubBranchExists(repo, branch, token) {
+  const res = await githubRequest('GET', `/repos/${repo}/git/ref/heads/${encodeURIComponent(branch)}`, token);
+  if (res.ok) return { ok: true, exists: true };
+  if (res.status === 404) return { ok: true, exists: false };
+  return { ok: false, error: res.error || `GitHub answered ${res.status}` };
+}
+
+// Starts the data branch with no parent commit, so it carries the setups and
+// nothing else — no copy of the code, no shared history with main. The file
+// being published is its first commit.
+async function githubCreateOrphanBranch(repo, branch, token, filePath, contentB64, message) {
+  const blob = await githubRequest('POST', `/repos/${repo}/git/blobs`, token, { content: contentB64, encoding: 'base64' });
+  if (!blob.ok) return { ok: false, error: blob.error || `GitHub answered ${blob.status}` };
+
+  const tree = await githubRequest('POST', `/repos/${repo}/git/trees`, token, {
+    tree: [{ path: filePath, mode: '100644', type: 'blob', sha: blob.data.sha }]
+  });
+  if (!tree.ok) return { ok: false, error: tree.error || `GitHub answered ${tree.status}` };
+
+  const commit = await githubRequest('POST', `/repos/${repo}/git/commits`, token, {
+    message, tree: tree.data.sha, parents: []
+  });
+  if (!commit.ok) return { ok: false, error: commit.error || `GitHub answered ${commit.status}` };
+
+  const ref = await githubRequest('POST', `/repos/${repo}/git/refs`, token, {
+    ref: `refs/heads/${branch}`, sha: commit.data.sha
+  });
+  if (!ref.ok) return { ok: false, error: ref.error || `GitHub answered ${ref.status}` };
+  return { ok: true, created: true };
 }
 
 function syncPaths(opts) {
@@ -1531,6 +1580,27 @@ function registerIpc() {
       return { ok: false, error: `The setup is ${(body.length / 1048576).toFixed(1)} MB — too large to publish. Product and station images are usually the cause.` };
     }
 
+    const message = `Gradion Shop setup — ${new Date().toISOString()}`;
+    const at = new Date().toISOString();
+    const remember = () => {
+      store.settings.sync = Object.assign({}, store.settings.sync, cfg, { lastPublishedAt: at, branchMoved: true });
+      saveStore(store);
+    };
+
+    // The data branch may not exist yet — the first publish is what starts it
+    const branch = await githubBranchExists(where.repo, where.branch, cfg.token);
+    if (!branch.ok) return { ok: false, error: branch.error };
+    if (!branch.exists) {
+      const made = await githubCreateOrphanBranch(
+        where.repo, where.branch, cfg.token, where.path, body.toString('base64'), message);
+      if (!made.ok) return { ok: false, error: `Could not start the ${where.branch} branch — ${made.error}` };
+      remember();
+      return {
+        ok: true, at, bytes: body.length, secretsIncluded: !!payload.secrets, branchCreated: where.branch,
+        url: `https://github.com/${where.repo}/blob/${where.branch}/${where.path}`
+      };
+    }
+
     // An update has to name the blob it replaces, so look for one first
     const head = await githubRequest('GET', `${where.contents}?ref=${encodeURIComponent(where.branch)}`, cfg.token);
     const sha = head.ok && head.data ? head.data.sha : undefined;
@@ -1539,16 +1609,14 @@ function registerIpc() {
     }
 
     const res = await githubRequest('PUT', where.contents, cfg.token, {
-      message: `Gradion Shop setup — ${new Date().toISOString()}`,
+      message,
       content: body.toString('base64'),
       branch: where.branch,
       sha
     });
     if (!res.ok) return { ok: false, status: res.status, error: res.error || `GitHub answered ${res.status}` };
 
-    const at = new Date().toISOString();
-    store.settings.sync = Object.assign({}, store.settings.sync, cfg, { lastPublishedAt: at });
-    saveStore(store);
+    remember();
     return {
       ok: true,
       at,
@@ -1565,13 +1633,26 @@ function registerIpc() {
     const cfg = Object.assign({}, store.settings.sync, opts || {});
     const where = syncPaths(Object.assign({}, cfg, { name: cfg.name || 'x' }));
     if (where.error) return { ok: false, error: where.error };
-    const res = await githubRequest('GET', `${where.dir}?ref=${encodeURIComponent(where.branch)}`, cfg.token || null);
-    if (res.status === 404) return { ok: true, setups: [] };      // nothing published yet
+    const read = async (branch) =>
+      githubRequest('GET', `${where.dir}?ref=${encodeURIComponent(branch)}`, cfg.token || null);
+
+    let branch = where.branch;
+    let res = await read(branch);
+    // Setups published before they had their own branch are still on the code
+    // branch, so look there too rather than reporting an empty shop.
+    if (res.status === 404) {
+      const fallback = await githubDefaultBranch(where.repo, cfg.token || null);
+      if (fallback !== branch) {
+        const alt = await read(fallback);
+        if (alt.ok) { res = alt; branch = fallback; }
+      }
+    }
+    if (res.status === 404) return { ok: true, setups: [], branch };   // nothing published yet
     if (!res.ok) return { ok: false, status: res.status, error: res.error || `GitHub answered ${res.status}` };
     const setups = (Array.isArray(res.data) ? res.data : [])
       .filter((f) => f.type === 'file' && /\.json$/i.test(f.name))
       .map((f) => ({ name: f.name.replace(/\.json$/i, ''), size: f.size }));
-    return { ok: true, setups };
+    return { ok: true, setups, branch };
   });
 
   // Reads the published setup. A public repository needs no token; a private
@@ -1582,7 +1663,19 @@ function registerIpc() {
     const where = syncPaths(cfg);
     if (where.error) return { ok: false, error: where.error };
 
-    const res = await githubRequest('GET', `${where.contents}?ref=${encodeURIComponent(where.branch)}`, cfg.token || null);
+    const read = async (branch) =>
+      githubRequest('GET', `${where.contents}?ref=${encodeURIComponent(branch)}`, cfg.token || null);
+
+    let branch = where.branch;
+    let res = await read(branch);
+    // Fall back to the code branch for setups published before the data branch
+    if (res.status === 404) {
+      const fallback = await githubDefaultBranch(where.repo, cfg.token || null);
+      if (fallback !== branch) {
+        const alt = await read(fallback);
+        if (alt.ok) { res = alt; branch = fallback; }
+      }
+    }
     if (res.status === 404) return { ok: false, error: `No setup called "${where.slug || where.path}" has been published to ${where.repo} yet.` };
     if (!res.ok) return { ok: false, status: res.status, error: res.error || `GitHub answered ${res.status}` };
 
@@ -1609,7 +1702,7 @@ function registerIpc() {
     const at = new Date().toISOString();
     store.settings.sync = Object.assign({}, store.settings.sync, cfg, { lastLoadedAt: at });
     saveStore(store);
-    return { ok: true, config, at, savedAt: config.savedAt || null };
+    return { ok: true, config, at, savedAt: config.savedAt || null, branch };
   });
 
   // Opens GitHub's own "new token" page with the right boxes already ticked, so
@@ -1692,6 +1785,7 @@ app.on('window-all-closed', () => {
 module.exports = {
   __setStorePathForTest: (p) => { storePath = p; },
   __loadStoreForTest: () => loadStore(),
+  registerIpcForTest: () => registerIpc(),
   expandScanInput,
   expandScanPattern,
   extractIdsFromText,

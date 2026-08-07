@@ -7,7 +7,7 @@ A Shopee-style desktop ordering app that dispatches orders to either of two syst
 
 Built with Electron for Windows and macOS, with light/dark mode and separate **user** and **admin** interfaces.
 
-![status](https://img.shields.io/badge/version-1.10.9-e0563f)
+![status](https://img.shields.io/badge/version-1.10.10-e0563f)
 
 ## Features
 
@@ -38,6 +38,7 @@ Built with Electron for Windows and macOS, with light/dark mode and separate **u
 - **Hand-overs are placed by hand** — a hand-over is a step you add to a route with **+ Add hand-over (robotic arm)**, with its own `method`; the quantity the arm moves is the quantity the customer ordered. The arm is only ever asked to move something where you put one; a robot change on its own just splits the route into two jobs. The editor previews exactly which jobs will be created and where the arm runs, and warns if a hand-over doesn't sit between a **DROP** and a **PICK at the same station**.
 - **Robotic arm (MQTT)** — the arm is driven over MQTT. Configure the broker URL (`mqtt://`, `mqtts://`, `ws://`, `wss://`), TLS certificate validation, credentials, the command/status topics, and a **payload template** with `{taskId}` `{method}` `{quantity}` `{from}` `{to}` `{orderId}` `{unitId}` placeholders so the JSON matches the arm exactly. At a hand-over the app publishes the command, waits for the configured “finished” value on the status topic — matched back by the echoed task id, so an interim `Started` or another task's status can't release it — and only then creates the receiving AGV's job. A configurable timeout stops a silent arm from wedging an order. **Test connection** and **Send test transfer** verify the setup without placing an order, and a live log shows recent MQTT traffic and hand-overs in progress. The supervisor runs in the main process, so it keeps going even if the customer leaves the progress screen, and resumes hand-overs left in flight after a restart.
 - **Setup sync (GitHub)** — installing on another machine used to mean typing the whole configuration again, so the shop's setup lives in **one JSON file in a GitHub repository**, published under a **name you choose — `setup1`, `line-2`, `showroom`**. That name is the whole interface: the file it maps to (`setups/setup1.json`) is worked out for you, and the other machine picks the setup **from a list of what has been published** rather than typing anything at all. **Publish this setup** writes products, stations, robots, nodes, robot↔station access, recalls (with their automation settings) and the SYNAOS / arm / MPDV connection details; loading is offered on the first-run screen as well as in admin, so a fresh install never needs the admin password just to be configured.
+  Setups are **data, not code**, so they live on their own **`setups` branch** rather than landing in the middle of the release history. The branch is created by the first publish as an **orphan** — no parent commit, so it carries the setup files and none of the code — and later publishes just update the file on it. Reading **falls back to the code branch**, so a setup published before the branch existed is still found and says where it came from.
   **Loading needs no token whatsoever** on a public repository — the machines you hand out never see one. A token is only for *publishing*, entered once on the machine that does it, and tucked away in a collapsed *Repository & token* section with a button that opens GitHub's new-token page with the right box already ticked. (GitHub only issues tokens to a person, so the app cannot mint one itself.) What stays behind is what belongs to the machine: its orders, logs, MPDV counter, in-flight hand-overs, each recall's live countdown, and its theme.
   **Passwords are never published in the clear.** The repository is public, so with no passphrase they are simply left out of the file (the other machine is asked for them once); set a **passphrase** and they are encrypted with AES-256-GCM under a scrypt-derived key, with a fresh salt and IV per publish, readable only by a machine given the same passphrase. The GitHub token — which needs *Contents: write* only for publishing, never for loading a public repo — and the passphrase are stored on the machine and are excluded from the payload.
 - **Settings** — SYNAOS connection (base URL, username, password) with a **Test connection** button, plus a **change admin password** form and dark-mode toggle.
@@ -78,8 +79,8 @@ Authentication is HTTP Basic. All admin configuration (products, stations, price
 ## Download
 
 Grab the latest installers from the [Releases page](../../releases):
-- **Windows** — `GradionShop-Setup-1.10.9.exe`
-- **macOS** — `GradionShop-1.10.9.dmg`
+- **Windows** — `GradionShop-Setup-1.10.10.exe`
+- **macOS** — `GradionShop-1.10.10.dmg`
 
 ## Development
 
