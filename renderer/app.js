@@ -1467,6 +1467,7 @@ function renderAdminRecalls() {
     <div class="panel">
       <h2>Recalls</h2>
       <p class="hint">Routes you run on demand — fetching a rack back from the shop to production, returning an empty carrier, repositioning a load. They never show in the shop, so an order can simply deliver without also hauling everything back.</p>
+      ${isRecallRunner() ? '' : '<div class="handover-warn">👀 This machine does not send automatic recalls — another one does. Turn it on in <b>Settings → This machine</b> if it should. Sending by hand still works.</div>'}
       <p class="hint">A recall can also run itself: the countdown starts when a customer <b>order is delivered</b>, so the rack comes back a set time after it went out. Another delivery while waiting pushes the run back rather than adding a second one, and nothing is ever sent while this recall's own last run is still driving. The app has to stay open for it to run.</p>
       <div class="admin-list">${list || '<p class="hint">No recalls yet. Add one below.</p>'}</div>
       <button class="btn btn-primary" id="addRecall" style="margin-top:16px;">+ New recall</button>
@@ -1616,7 +1617,12 @@ async function dispatchRecall(recall, opts) {
   try {
     results = await window.api.createOrderJobs({
       orderId: runId,
-      units: [{ unitId: uid('u'), productId: recall.id, name: `Recall — ${recall.name}`, quantity: 1, legs }]
+      units: [{
+        unitId: uid('u'), productId: recall.id, name: `Recall — ${recall.name}`, quantity: 1, legs,
+        // Marks the job as this recall's, so every device can tell whose work is
+        // on the floor rather than guessing from the route
+        correlations: [{ kind: RECALL_TAG, id: recall.id }]
+      }]
     });
     await syncRelaysFromMain();
   } catch (e) {
@@ -1633,6 +1639,7 @@ async function dispatchRecall(recall, opts) {
   logRecallRun(recall, { auto, robot, ok, error, jobIds });
   // Tell the shop something is being fetched back — by hand or on its own
   dismissRecallAsk();                 // whatever it was warning about has now gone
+  fleet.at = 0;                       // our own job changes the picture; look again next tick
   if (jobIds.length) showRecallBubble(recall.name || 'Recall');
   return { ok, runId, jobIds, legs, error };
 }
@@ -1738,6 +1745,13 @@ function triggerSummary(recall) {
   return 'the next order to be delivered';
 }
 
+// Which machine actually sends the recalls. Deliberately kept out of the
+// published setup: loading a setup onto five machines must not create five
+// timers all fetching the same rack.
+function isRecallRunner() {
+  return (store.settings || {}).recallRunner !== false;
+}
+
 function autoState(recall) {
   const st = recall.autoState || (recall.autoState = {});
   if (!Array.isArray(st.jobIds)) st.jobIds = [];
@@ -1806,15 +1820,38 @@ function noteAssignedResource(order, jobId, data) {
 // second one: the AGV goes in once the deliveries have settled.
 function armFromDeliveries(recall) {
   const st = autoState(recall);
+  const cfg = autoCfg(recall);
   const last = latestOrderDelivery(recall);
-  if (!last) return false;
-  const at = new Date(last.completedAt).getTime();
+  let at = last ? new Date(last.completedAt).getTime() : 0;
+  let by = last ? (last.shortId || last.id) : null;
+
+  // A delivery made from another machine counts just the same — the rack is at
+  // the shop whoever took the order. Only a recall that follows *any* order can
+  // be armed this way: a product or robot trigger needs the order record, which
+  // lives on the machine that took it.
+  if (cfg.triggerMode === 'any' && fleet.ok && fleet.lastDeliveryAt > at) {
+    at = fleet.lastDeliveryAt;
+    by = 'another device';
+  }
+  if (!at) return false;
   if (st.watermark && at <= new Date(st.watermark).getTime()) return false;   // already accounted for
-  st.watermark = last.completedAt;
-  st.armedAt = last.completedAt;
-  st.armedBy = last.shortId || last.id;
+
+  st.watermark = new Date(at).toISOString();
+  st.armedAt = st.watermark;
+  st.armedBy = by;
   st.nextDueAt = new Date(at + autoIntervalMs(recall)).toISOString();
   return true;
+}
+
+// Has this delivery already been answered — by us, or by another machine that
+// got there first? A run for this recall started after the delivery that armed
+// us means the rack is already being fetched, so stand down rather than send a
+// second AGV after it.
+function deliveryAlreadyAnswered(recall) {
+  const st = autoState(recall);
+  if (!fleet.ok || !st.armedAt) return false;
+  const ran = fleet.recallRunAt[recall.id] || 0;
+  return ran > new Date(st.armedAt).getTime();
 }
 
 // Watches orders that are still running even when nobody is on the progress
@@ -1962,13 +1999,90 @@ async function recallRunVerdict(st) {
   return anyFailed ? 'failed' : 'ok';
 }
 
-// Another recall's run is still out there. Two AGVs sent by two timers into the
-// same aisle is exactly the collision this feature must not create.
+// ---- What the other devices are doing ----
+//
+// Several machines run this app against one fleet, each with its own orders and
+// its own recall timers. None of them can see the others' stores — but SYNAOS
+// can see every job, whoever created it, so the fleet itself is the shared
+// state. Jobs carry correlations saying which order or recall they belong to,
+// and unfinished jobs are always returned, so one query answers "is anyone's
+// order out right now", "is a recall already running" and "when did the last
+// delivery land" for the whole shop.
+const FLEET_WINDOW_S = 7200;          // two hours of history is plenty for a countdown
+const FLEET_REFRESH_MS = 15000;
+const RECALL_TAG = 'gradionRecall';
+
+let fleet = { at: 0, ok: false, orderRunning: false, recallRunning: false, lastDeliveryAt: null, recallRunAt: {} };
+
+function jobCorrelation(job, kind) {
+  const hit = (job.correlations || []).find((c) => c && c.kind === kind);
+  return hit ? hit.id : null;
+}
+
+function jobIsFinished(job) {
+  if (job.status === 'FINISHED_SUCCESS' || job.status === 'FINISHED_FAILURE' || job.finishedExternally) return true;
+  const ms = job.milestones || [];
+  return ms.length > 0 && ms.every((m) => milestonePhase(m) === 4);
+}
+
+// When the work actually ended, for ordering deliveries against a countdown
+function jobFinishedAt(job) {
+  let latest = 0;
+  (job.milestones || []).forEach((m) => {
+    (m.eventHistory || []).forEach((e) => {
+      const t = new Date(e.time || 0).getTime();
+      if (t > latest) latest = t;
+    });
+  });
+  return latest || new Date(job.createdAt || 0).getTime();
+}
+
+async function refreshFleetView(force) {
+  if (isMpdv()) return fleet;
+  if (!force && Date.now() - fleet.at < FLEET_REFRESH_MS) return fleet;
+  let res;
+  try {
+    res = await window.api.listJobs(FLEET_WINDOW_S);
+  } catch (e) {
+    res = { ok: false, error: e.message };
+  }
+  // A failed look at the fleet must not read as "the floor is clear" — keep the
+  // last picture and let the caller see it is stale.
+  if (!res || !res.ok) { fleet = Object.assign({}, fleet, { at: Date.now(), ok: false }); return fleet; }
+
+  const next = { at: Date.now(), ok: true, orderRunning: false, recallRunning: false, lastDeliveryAt: null, recallRunAt: {} };
+  res.jobs.forEach((job) => {
+    const orderId = jobCorrelation(job, 'order');
+    if (!orderId) return;                                  // not ours
+    const recallId = jobCorrelation(job, RECALL_TAG);
+    const done = jobIsFinished(job);
+
+    if (recallId) {
+      if (!done) next.recallRunning = true;
+      const started = new Date(job.createdAt || 0).getTime();
+      if (started > (next.recallRunAt[recallId] || 0)) next.recallRunAt[recallId] = started;
+      return;
+    }
+    // A customer order: running, or a delivery that can arm a recall
+    if (!done) { next.orderRunning = true; return; }
+    if (job.status === 'FINISHED_FAILURE') return;
+    const at = jobFinishedAt(job);
+    if (at > (next.lastDeliveryAt || 0)) next.lastDeliveryAt = at;
+  });
+  fleet = next;
+  return fleet;
+}
+
+// Another recall's run is still out there — on this machine or any other. Two
+// AGVs sent by two timers into the same aisle is exactly the collision this
+// feature must not create.
 function autoRecallInFlight(except) {
+  if (fleet.ok && fleet.recallRunning && !((except.autoState || {}).jobIds || []).length) return true;
   return (store.recalls || []).some((r) => r !== except && ((r.autoState || {}).jobIds || []).length > 0);
 }
 
 function anOrderIsRunning() {
+  if (fleet.ok && fleet.orderRunning) return true;
   return (store.orders || []).some((o) => o.state === 'in_progress' && !o.confirmed
     && Date.now() - new Date(o.createdAt).getTime() < ORDER_STALE_MS);
 }
@@ -2000,9 +2114,22 @@ async function serviceAutoRecall(recall) {
 
   if (!cfg.enabled || isMpdv()) return false;
   if (st.lastResult === 'stalled') return false;
+  // Only the machine nominated to run recalls dispatches them. The others keep
+  // watching, so their panels stay honest, but never send.
+  if (!isRecallRunner()) return false;
 
   // 2. A newly delivered order starts (or pushes back) the countdown.
   const armed = armFromDeliveries(recall);
+
+  // Another machine may have answered that delivery while we were counting down
+  if (deliveryAlreadyAnswered(recall)) {
+    st.nextDueAt = null;
+    st.armedAt = null;
+    st.armedBy = null;
+    st.warnedFor = null;
+    dismissRecallAsk();
+    return true;
+  }
   if (!st.nextDueAt) return armed;                                  // nothing delivered to wait on
 
   // 3. Half a minute before it goes, tell the shop and offer to push it back —
@@ -2036,6 +2163,14 @@ async function serviceAutoRecall(recall) {
     return true;
   }
 
+  // Last look before an AGV moves: the cached picture may be up to 15s old, and
+  // in that time another device could have started this very recall.
+  await refreshFleetView(true);
+  if (deliveryAlreadyAnswered(recall) || autoRecallInFlight(recall)
+      || (cfg.onlyWhenIdle && anOrderIsRunning())) {
+    return true;
+  }
+
   const run = await dispatchRecall(recall, { auto: true });
   watchRecallRun(recall, run);
   return true;
@@ -2060,6 +2195,9 @@ async function autoRecallTick() {
     if (watched.some((r) => r.auto && r.auto.enabled)) {
       orderWatchCounter = (orderWatchCounter + 1) % ORDER_WATCH_TICKS;
       if (orderWatchCounter === 0 && (await refreshLiveOrders())) changed = true;
+      // …and what the other machines are up to, which is the only way this one
+      // can avoid sending an AGV on top of their work.
+      await refreshFleetView();
     }
     for (const recall of watched) {
       changed = (await serviceAutoRecall(recall)) || changed;
@@ -2103,6 +2241,8 @@ function autoStatusText(recall) {
   const st = autoState(recall);
   if (st.jobIds.length) return '🚚 Running now — nothing else goes out until this AGV is finished';
   if (st.lastResult === 'stalled') return '⏸️ Paused — the last run never reported finished; send it by hand to check the AGV';
+  if (cfg.enabled && !isRecallRunner()) return '👀 Watching only — another machine sends the recalls';
+  if (cfg.enabled && fleet.ok && fleet.recallRunning && !st.jobIds.length) return '🚚 Another machine has a recall out — waiting for it';
   if (!cfg.enabled) {
     return st.finishedAt ? `Automatic runs off — last run ${shortDateTime(st.finishedAt)}` : '';
   }
@@ -2884,6 +3024,14 @@ async function applySyncedConfig(config) {
   if (secrets.apiPassword) local.apiPassword = secrets.apiPassword;
   if (secrets.adminPassword) local.adminPassword = secrets.adminPassword;
 
+  // A machine set up from someone else's setup does not start sending recalls
+  // on its own — otherwise every install would fetch the same rack. One machine
+  // is nominated for that in Settings.
+  if (local.recallRunner !== false) {
+    local.recallRunner = false;
+    toast('Automatic recalls are off on this machine — turn them on in Settings if this is the one that should run them.', 'error');
+  }
+
   await persist();
   renderCatalog();
   renderCart();
@@ -3159,6 +3307,14 @@ function renderAdminSettings() {
       </details>
     </div>
     <div class="panel">
+      <h2>This machine</h2>
+      <p class="hint">Several machines can run this app against the same fleet. They see each other through SYNAOS — an order or recall out on the floor holds the others back — but only one should be the machine that <b>sends</b> the automatic recalls.</p>
+      <label class="fld switch"><input type="checkbox" id="s-runner" ${isRecallRunner() ? 'checked' : ''}> Run automatic recalls from this machine</label>
+      <p class="hint" style="margin-top:10px;">${isRecallRunner()
+        ? 'This machine sends them. Turn it off on every other machine.'
+        : 'This machine only watches — recalls are sent by another one. It is switched off automatically when a setup is loaded from GitHub.'}</p>
+    </div>
+    <div class="panel">
       <h2>Appearance</h2>
       <label class="fld switch"><input type="checkbox" id="s-dark" ${s.theme === 'dark' ? 'checked' : ''}> Dark mode</label>
     </div>`;
@@ -3336,6 +3492,14 @@ function renderAdminSettings() {
       () => loadSetupFromGitHub(opts, e.target));
   });
 
+  $('#s-runner').addEventListener('change', async (e) => {
+    store.settings.recallRunner = e.target.checked;
+    await persist();
+    renderAdminSettings();
+    toast(e.target.checked
+      ? 'This machine will send the automatic recalls.'
+      : 'This machine will no longer send recalls — another one should.', 'success');
+  });
   $('#s-dark').addEventListener('change', async (e) => {
     store.settings.theme = e.target.checked ? 'dark' : 'light';
     applyTheme(store.settings.theme);

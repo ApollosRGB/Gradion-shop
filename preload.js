@@ -10,6 +10,7 @@ contextBridge.exposeInMainWorld('api', {
   onScanProgress: (fn) => ipcRenderer.on('scan:progress', (_e, p) => fn(p)),
   createOrderJobs: (payload) => ipcRenderer.invoke('api:createOrderJobs', payload),
   getJob: (jobId) => ipcRenderer.invoke('api:getJob', jobId),
+  listJobs: (sinceSeconds) => ipcRenderer.invoke('api:listJobs', sinceSeconds),
   discardJob: (jobId) => ipcRenderer.invoke('api:discardJob', jobId),
   pickImage: () => ipcRenderer.invoke('dialog:pickImage'),
   syncPublish: (opts) => ipcRenderer.invoke('sync:publish', opts),

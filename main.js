@@ -778,10 +778,13 @@ function usableResourceId(value) {
 // dependency, so a leg cannot start approaching until the previous leg has FINISHED.
 //
 // legs: [{ resourceId, steps: [{ stationRef, action }] }]
-function buildRelayPayloads(legs, stations, orderId, unitId, quantity) {
+// extra: correlations that mark what this job is — a recall carries its own id
+// so any device can tell whose work a job in the fleet is.
+function buildRelayPayloads(legs, stations, orderId, unitId, quantity, extra) {
   const correlations = [
     { kind: 'order', id: orderId },
-    { kind: 'orderUnit', id: unitId }
+    { kind: 'orderUnit', id: unitId },
+    ...(Array.isArray(extra) ? extra.filter((c) => c && c.kind && c.id) : [])
   ];
   // One job now carries a whole cart line, so record how many it is carrying
   if (Number(quantity) > 0) correlations.push({ kind: 'quantity', id: String(Number(quantity)) });
@@ -1236,7 +1239,7 @@ function registerIpc() {
         ? unit.legs
         : [{ resourceId: unit.resourceId, steps: product.steps }];
 
-      const planned = buildRelayPayloads(legs, store.stations, orderId, unit.unitId, unit.quantity);
+      const planned = buildRelayPayloads(legs, store.stations, orderId, unit.unitId, unit.quantity, unit.correlations);
 
       // Hand-overs are only performed where the operator put one in the route.
       // Everything up to the first hand-over goes out now; from that point on
@@ -1486,6 +1489,17 @@ function registerIpc() {
       mode: rm.data ? rm.data.resourceMode : null,
       supportedJobTypes: rm.data ? rm.data.supportedJobTypes : null
     };
+  });
+
+  // Every job the tenant currently has — unfinished ones are always included,
+  // whichever machine created them. This is how devices see each other: SYNAOS
+  // knows what the AGVs are doing, and no app instance has to be told.
+  ipcMain.handle('api:listJobs', async (_ev, sinceSeconds) => {
+    const store = loadStore();
+    const window = Number(sinceSeconds) > 0 ? Math.round(Number(sinceSeconds)) : 7200;
+    const res = await apiRequest(store.settings, 'GET', `/api/v1/jobs?finishedLessThanSecondsAgo=${window}`);
+    if (!res.ok) return { ok: false, status: res.status, error: res.error || `HTTP ${res.status}` };
+    return { ok: true, jobs: Array.isArray(res.data) ? res.data : [] };
   });
 
   ipcMain.handle('api:getJob', async (_ev, jobId) => {
