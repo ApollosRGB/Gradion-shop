@@ -95,7 +95,10 @@ function wireChrome() {
       const fresh = await window.api.storeGet();
       store.pendingRelays = fresh.pendingRelays || [];
       if (currentView === 'progress') pollOnce();
-      if (currentView === 'admin' && adminTab === 'settings') renderAdmin();
+      // Only the hand-over list needs redrawing. Rebuilding the whole admin
+      // panel threw away the scroll position and anything half-typed every
+      // time the supervisor moved a leg on.
+      if (currentView === 'admin' && adminTab === 'settings') refreshArmLog();
     });
   }
   $('#themeToggle').addEventListener('click', toggleTheme);
@@ -1181,7 +1184,13 @@ function onAdminToggle() {
   });
 }
 
+// Admin redraws itself wholesale for almost any change — a toggle, a save, a
+// step edit. That threw the reader back to wherever the shortened page happened
+// to land, which on a long panel means the bottom. Hold the position across the
+// rebuild; only moving to another tab starts at the top.
 function renderAdmin() {
+  const view = $('#view-admin');
+  const keepAt = view ? view.scrollTop : 0;
   const root = $('#adminWrap');
   root.innerHTML = `
     <div class="admin-head">
@@ -1196,12 +1205,18 @@ function renderAdmin() {
     </div>
     <div id="adminBody"></div>`;
   $('#lockAdmin').addEventListener('click', () => { adminUnlocked = false; showView('shop'); });
-  $$('[data-tab]', root).forEach((b) => b.addEventListener('click', () => { adminTab = b.dataset.tab; renderAdmin(); }));
+  $$('[data-tab]', root).forEach((b) => b.addEventListener('click', () => {
+    adminTab = b.dataset.tab;
+    renderAdmin();
+    if (view) view.scrollTop = 0;      // a different tab starts at the top
+  }));
 
   if (adminTab === 'products') renderAdminProducts();
   else if (adminTab === 'recalls') renderAdminRecalls();
   else if (adminTab === 'stations') renderAdminStations();
   else renderAdminSettings();
+
+  if (view) view.scrollTop = keepAt;
 }
 
 // ---- Admin: products / jobs ----
@@ -3027,6 +3042,22 @@ function openDiscoverModal(res) {
   });
 }
 
+// Redraws just the arm's hand-over list and traffic. Kept out of the settings
+// renderer so the relay supervisor can refresh it without rebuilding the panel.
+async function refreshArmLog() {
+  const host = $('#armLog');
+  if (!host) return;
+  const st = await window.api.armStatus();
+  const rows = (st.log || []).map((l) =>
+    `<div class="arm-log-row"><span class="dir ${l.direction}">${l.direction === 'out' ? '▲ sent' : '▼ recv'}</span>
+      <code>${escapeHtml(l.topic)}</code><span class="msg">${escapeHtml(l.message)}</span></div>`).join('');
+  const pend = (st.pending || []).map((p) =>
+    `<div class="arm-log-row"><span class="dir">⏳</span><span class="msg">${escapeHtml(p.productName)} — leg ${p.leg}/${p.totalLegs}, ${escapeHtml(p.state)}${p.lastError ? ' — ' + escapeHtml(p.lastError) : ''}</span></div>`).join('');
+  if (!host.isConnected) return;
+  host.innerHTML = (pend ? `<div class="arm-log-title">Hand-overs in progress</div>${pend}` : '')
+    + (rows ? `<div class="arm-log-title">Recent MQTT traffic</div>${rows}` : '');
+}
+
 // ---- Stuck jobs ----
 //
 // A job nothing ever picked up stays in the queue for good, and everything the
@@ -3548,14 +3579,6 @@ function renderAdminSettings() {
   };
   const showMpdvState = async () => {
     const [preview, log] = await Promise.all([window.api.mpdvPreview(), window.api.mpdvLog()]);
-    const host = $('#mpdvLog');
-    // Emptying a long log shortens the page under the reader, and the admin
-    // view is what scrolls, so the browser clamps the position and the panel
-    // appears to leap to the bottom. Hold the panel still instead.
-    const anchor = host && host.closest('.panel');
-    const view = $('#view-admin');
-    const before = anchor ? anchor.getBoundingClientRect().top : 0;
-
     $('#mpdvNext').innerHTML = `<span class="dot ok"></span> Next order no. <b>${escapeHtml(preview.orderNumber)}</b>
       — ${preview.usedToday} used today, ${preview.remainingToday} left`;
     $('#mpdvLog').innerHTML = log.length
@@ -3574,11 +3597,6 @@ function renderAdminSettings() {
           ${mpdvCallsHtml(l)}
         </div>`).join('')
       : '<p class="hint">No MPDV orders sent yet.</p>';
-
-    if (anchor && view) {
-      const after = anchor.getBoundingClientRect().top;
-      if (after !== before) view.scrollTop += after - before;
-    }
   };
   $('#saveMpdv').addEventListener('click', async () => {
     store.settings.mpdv = Object.assign({}, store.settings.mpdv, readMpdvForm());
@@ -3588,11 +3606,16 @@ function renderAdminSettings() {
   });
   $('#clearMpdvLog').addEventListener('click', async (e) => {
     e.preventDefault();
+    const panel = $('#mpdvLog').closest('.panel');
     await window.api.mpdvClearLog();
     // Drop this window's copy as well: it is the one written back on the next
     // save, and keeping it would bring the whole log straight back.
     store.mpdvLog = [];
     await showMpdvState();
+    // A long log was most of the page; with it gone there is nothing left to
+    // hold the old position, so land on the panel deliberately rather than
+    // wherever the browser clamps to.
+    if (panel) panel.scrollIntoView({ block: 'start' });
     toast('MPDV log cleared', 'success');
   });
   showMpdvState();
@@ -3613,16 +3636,7 @@ function renderAdminSettings() {
     timeoutSeconds: parseInt($('#a-timeout').value, 10) || 120
   });
   const armStatusEl = () => $('#armStatus');
-  const showArmLog = async () => {
-    const st = await window.api.armStatus();
-    const rows = (st.log || []).map((l) =>
-      `<div class="arm-log-row"><span class="dir ${l.direction}">${l.direction === 'out' ? '▲ sent' : '▼ recv'}</span>
-        <code>${escapeHtml(l.topic)}</code><span class="msg">${escapeHtml(l.message)}</span></div>`).join('');
-    const pend = (st.pending || []).map((p) =>
-      `<div class="arm-log-row"><span class="dir">⏳</span><span class="msg">${escapeHtml(p.productName)} — leg ${p.leg}/${p.totalLegs}, ${escapeHtml(p.state)}${p.lastError ? ' — ' + escapeHtml(p.lastError) : ''}</span></div>`).join('');
-    $('#armLog').innerHTML = (pend ? `<div class="arm-log-title">Hand-overs in progress</div>${pend}` : '')
-      + (rows ? `<div class="arm-log-title">Recent MQTT traffic</div>${rows}` : '');
-  };
+  const showArmLog = refreshArmLog;
 
   $('#saveArm').addEventListener('click', async () => {
     store.settings.arm = Object.assign({}, store.settings.arm, readArmForm());
