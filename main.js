@@ -36,18 +36,24 @@ function defaultStore() {
         statusMatchField: 'task_id', // field tying a status back to its command
         timeoutSeconds: 120          // give up waiting and continue anyway
       },
-      // MPDV MES — an alternative to dispatching AGV jobs: an order placed here
-      // becomes a workplan order in MPDV instead.
+      // MPDV MES — an alternative to dispatching AGV jobs. An order placed here
+      // becomes a BOOrder plus one BOOperation per arm; the order goes first,
+      // because the operations reference its id.
       mpdv: {
-        endpoint: 'https://azu-tr-vhxw-10.mpdv.cloud:8080/data/MDWorkplanOrder/generateOrder?X-Access-Id=00099831',
+        baseUrl: 'https://azu-tr-vhxw-10.mpdv.cloud:8080',
+        accessId: '00099831',
         username: '12345',
         password: 'mpdv',
         tlsInsecure: true,           // host does not serve its full certificate chain
-        workplanOrderId: '00003150', // workplanorder.id — same on every order
-        orderType: '0',
         latestEndTs: '2026-08-05T00:00:00.000+08:00',
         language: 'en',
-        timeZoneId: 'Asia/Singapore'
+        timeZoneId: 'Asia/Singapore',
+        // One operation per arm, sent for every order. The identity fields are
+        // editable; the formulas, modes and cycle target are sent as supplied.
+        operations: [
+          { label: 'Openmind arm', operation: '0010', workplace: 'ROBOT01', article: 'BRACES', designation: 'BRACES', unit: 'PCS' },
+          { label: 'Kuka arm', operation: '0010', workplace: 'ROBOT02', article: 'PEN', designation: 'PEN', unit: 'PCS' }
+        ]
       },
       // Where this shop's setup (products, stations, robots, recalls) is kept so
       // a new install can pull it instead of being configured by hand. The token
@@ -166,6 +172,23 @@ function loadStore() {
     const defaultArm = Object.assign({}, def.settings.arm);
     const arm = Object.assign({}, defaultArm, (data.settings && data.settings.arm) || {});
     const mpdv = Object.assign({}, def.settings.mpdv, (data.settings && data.settings.mpdv) || {});
+    // v1.12 replaced the workplan-order call with BOOrder + BOOperation. Carry
+    // the host and access id out of the old single endpoint so the credentials
+    // and address an install already had keep working.
+    if (mpdv.endpoint) {
+      try {
+        const old = new URL(mpdv.endpoint);
+        if (!(data.settings && data.settings.mpdv && data.settings.mpdv.baseUrl)) {
+          mpdv.baseUrl = `${old.protocol}//${old.host}`;
+        }
+        const id = old.searchParams.get('X-Access-Id');
+        if (id && !(data.settings && data.settings.mpdv && data.settings.mpdv.accessId)) mpdv.accessId = id;
+      } catch (e) { /* unparseable old endpoint — the defaults stand */ }
+      delete mpdv.endpoint;
+    }
+    delete mpdv.workplanOrderId;      // workplan orders are no longer created
+    delete mpdv.orderType;            // now per product: which AGV fetches it
+    if (!Array.isArray(mpdv.operations) || !mpdv.operations.length) mpdv.operations = def.settings.mpdv.operations;
     const sync = Object.assign({}, def.settings.sync, (data.settings && data.settings.sync) || {});
     // Setups used to be committed to main alongside the code. Move an existing
     // install onto the data branch once; reading falls back to the default
@@ -473,6 +496,10 @@ function mpdvDateKey(timeZoneId, when) {
 // would be truncated, and every order of the day would collide on one id.
 const MPDV_MAX_ORDERS_PER_DAY = 99;
 
+// A refused operation is tried again before the next one goes out
+const MPDV_ATTEMPTS = 3;
+const MPDV_RETRY_MS = 1000;      // 1s after the first failure, 2s after the second
+
 function formatMpdvOrderNumber(dateKey, seq) {
   return `${dateKey}${String(seq).padStart(2, '0')}`;
 }
@@ -495,14 +522,27 @@ function nextMpdvOrderNumber(timeZoneId, when) {
   return formatMpdvOrderNumber(key, seq);
 }
 
-function buildMpdvPayload(cfg, orderNumber, quantity, requestId) {
+// Where the two calls live. Both hang off the same host and access id, so only
+// those two are configured rather than a URL each.
+function mpdvUrl(cfg, resource) {
+  const base = String(cfg.baseUrl || '').trim().replace(/\/+$/, '');
+  return `${base}/data/${resource}/insert?X-Access-Id=${encodeURIComponent(cfg.accessId || '')}`;
+}
+
+function mpdvQuantity(quantity) {
+  return Number(quantity) > 0 ? Number(quantity) : 1;
+}
+
+// The order itself. Its id is the running number the shop will quote later, and
+// ordertype is which AGV goes for it — 0 kuka, 1 tusk — which each product
+// carries, so a cart line decides its own.
+function buildMpdvOrderPayload(cfg, orderNumber, orderType, quantity, requestId) {
   return {
     params: [
-      { acronym: 'workplanorder.id', operator: 'EQUAL', value: cfg.workplanOrderId },
-      { acronym: 'workplanorder.target.id', operator: 'EQUAL', value: orderNumber },
-      { acronym: 'workplanorder.ordertype', operator: 'EQUAL', value: cfg.orderType },
-      { acronym: 'workplanorder.plan.yield.base', operator: 'EQUAL', value: Number(quantity) > 0 ? Number(quantity) : 1 },
-      { acronym: 'workplanorder.latest_end_ts', operator: 'EQUAL', value: cfg.latestEndTs }
+      { acronym: 'order.id', operator: 'EQUAL', value: orderNumber },
+      { acronym: 'order.ordertype', operator: 'EQUAL', value: String(orderType == null ? '0' : orderType) },
+      { acronym: 'order.plan.yield.base', operator: 'EQUAL', value: mpdvQuantity(quantity) },
+      { acronym: 'order.latest_end_ts', operator: 'EQUAL', value: cfg.latestEndTs }
     ],
     columns: [],
     requestId: Number(requestId) > 0 ? Number(requestId) : 1,
@@ -512,13 +552,39 @@ function buildMpdvPayload(cfg, orderNumber, quantity, requestId) {
   };
 }
 
-function mpdvRequest(cfg, body) {
+// One operation per arm, tied to the order by the same id and carrying the same
+// quantity. Everything below the identity fields is sent exactly as supplied.
+function buildMpdvOperationPayload(cfg, orderNumber, op, quantity, requestId) {
+  return {
+    params: [
+      { acronym: 'order.id', operator: 'EQUAL', value: orderNumber },
+      { acronym: 'operation.operation', operator: 'EQUAL', value: String(op.operation || '0010') },
+      { acronym: 'operation.plan.workplace', operator: 'EQUAL', value: op.workplace },
+      { acronym: 'operation.article', operator: 'EQUAL', value: op.article },
+      { acronym: 'operation.designation', operator: 'EQUAL', value: op.designation },
+      { acronym: 'operation.plan.yield.primary', operator: 'EQUAL', value: mpdvQuantity(quantity) },
+      { acronym: 'operation.plan.unit.primary', operator: 'EQUAL', value: op.unit || 'PCS' },
+      { acronym: 'operation.processing_time.formula', operator: 'EQUAL', value: 'BEA_ZY' },
+      { acronym: 'operation.processing_time.mode', operator: 'EQUAL', value: 'FORMULA' },
+      { acronym: 'operation.remaining_runtime.formula', operator: 'EQUAL', value: 'RLFZ' },
+      { acronym: 'operation.remaining_runtime.mode', operator: 'EQUAL', value: 'FORMULA' },
+      { acronym: 'operation.cycle.target', operator: 'EQUAL', value: 60000 }
+    ],
+    columns: [],
+    requestId: Number(requestId) > 0 ? Number(requestId) : 7,
+    language: cfg.language || 'en',
+    timeZoneId: cfg.timeZoneId || 'Asia/Singapore',
+    returnAsObject: true
+  };
+}
+
+function mpdvRequest(cfg, body, endpoint) {
   return new Promise((resolve) => {
     let url;
     try {
-      url = new URL(cfg.endpoint);
+      url = new URL(endpoint || mpdvUrl(cfg, 'BOOrder'));
     } catch (e) {
-      resolve({ ok: false, status: 0, error: 'Invalid MPDV endpoint URL' });
+      resolve({ ok: false, status: 0, error: 'Invalid MPDV address — check the base URL and access id.' });
       return;
     }
     const transport = url.protocol === 'http:' ? require('http') : require('https');
@@ -605,7 +671,7 @@ function extractMpdvCreatedId(body) {
     if (!row || typeof row !== 'object') continue;
     const obj = row.obj || row.data;
     if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
-      const value = obj['workplanorder.id'] || obj['workplanorder.target.id'];
+      const value = obj['order.id'] || obj['workplanorder.id'] || obj['workplanorder.target.id'];
       if (value !== undefined && value !== null && String(value).trim()) return String(value).trim();
     }
   }
@@ -1370,41 +1436,82 @@ function registerIpc() {
     return results;
   });
 
-  // Creates one MPDV workplan order per cart line. Returns a result per line so
-  // the shop can show exactly which ones reached MPDV and which did not.
+  // Creates one MPDV order per cart line, then an operation per arm against it.
+  // Returns a result per line, each carrying every call it made, so the shop can
+  // show exactly which step failed and in MPDV's own words.
   ipcMain.handle('mpdv:createOrders', async (_ev, { lines }) => {
     const cfg = loadStore().settings.mpdv || {};
     const results = [];
     let requestId = 1;
+
+    // An operation that fails is tried again before the next one is sent — a
+    // refusal is usually MPDV being busy rather than the payload being wrong.
+    const send = async (payload, resource, label) => {
+      let last = null;
+      for (let attempt = 1; attempt <= MPDV_ATTEMPTS; attempt++) {
+        const res = await mpdvRequest(cfg, payload, mpdvUrl(cfg, resource));
+        const verdict = interpretMpdvResponse(res);
+        last = {
+          kind: resource === 'BOOrder' ? 'order' : 'operation',
+          label,
+          ok: verdict.ok,
+          status: res.status,
+          attempt,
+          error: verdict.ok ? null : verdict.error,
+          createdId: verdict.createdId || null,
+          response: verdict.detail || '',
+          request: JSON.stringify(payload)
+        };
+        if (verdict.ok) return last;
+        if (attempt < MPDV_ATTEMPTS) await new Promise((r) => setTimeout(r, MPDV_RETRY_MS * attempt));
+      }
+      return last;
+    };
+
     for (const line of lines || []) {
+      const quantity = mpdvQuantity(line.quantity);
       let orderNumber;
       try {
         orderNumber = nextMpdvOrderNumber(cfg.timeZoneId);
       } catch (err) {
         const entry = {
-          productName: line.name || '', orderNumber: null,
-          quantity: Number(line.quantity) > 0 ? Number(line.quantity) : 1,
-          ok: false, status: 0, error: err.message, response: ''
+          productName: line.name || '', orderNumber: null, quantity,
+          ok: false, status: 0, error: err.message, response: '', calls: []
         };
         recordMpdvLog(entry);
         results.push(entry);
         continue;
       }
-      const payload = buildMpdvPayload(cfg, orderNumber, line.quantity, requestId++);
-      const res = await mpdvRequest(cfg, payload);
-      const verdict = interpretMpdvResponse(res);
+
+      // The order has to exist before an operation can reference its id
+      const orderCall = await send(
+        buildMpdvOrderPayload(cfg, orderNumber, line.orderType, quantity, requestId++),
+        'BOOrder', 'Order');
+      const calls = [orderCall];
+
+      if (orderCall.ok) {
+        for (const op of cfg.operations || []) {
+          calls.push(await send(
+            buildMpdvOperationPayload(cfg, orderNumber, op, quantity, requestId++),
+            'BOOperation', op.label || op.workplace || 'Operation'));
+        }
+      }
+
+      const failed = calls.find((c) => !c.ok);
       const entry = {
         productName: line.name || '',
         orderNumber,
-        quantity: Number(line.quantity) > 0 ? Number(line.quantity) : 1,
-        ok: verdict.ok,
-        status: res.status,
-        error: verdict.ok ? null : verdict.error,
+        quantity,
+        orderType: String(line.orderType == null ? '0' : line.orderType),
+        ok: !failed,
+        status: (failed || orderCall).status,
+        error: failed ? `${failed.label}: ${failed.error}` : null,
         // The id MPDV stored — may differ from ours, since it truncates to 8 chars
-        createdId: verdict.createdId || null,
-        // Exactly what MPDV sent back, kept verbatim whether it succeeded or not
-        response: verdict.detail || '',
-        request: JSON.stringify(payload)
+        createdId: orderCall.createdId || null,
+        // Kept verbatim so nothing MPDV said is hidden, successful or not
+        response: (failed || orderCall).response || '',
+        request: orderCall.request,
+        calls
       };
       recordMpdvLog(entry);
       results.push(entry);
@@ -1425,7 +1532,13 @@ function registerIpc() {
       todayKey: key,
       usedToday: counter.date === key ? counter.seq : 0,
       remainingToday: Math.max(0, MPDV_MAX_ORDERS_PER_DAY - (counter.date === key ? Number(counter.seq) || 0 : 0)),
-      payload: buildMpdvPayload(cfg, orderNumber, 1, 1)
+      orderUrl: mpdvUrl(cfg, 'BOOrder'),
+      operationUrl: mpdvUrl(cfg, 'BOOperation'),
+      payload: buildMpdvOrderPayload(cfg, orderNumber, '0', 1, 1),
+      operationPayloads: (cfg.operations || []).map((op, i) => ({
+        label: op.label || op.workplace,
+        payload: buildMpdvOperationPayload(cfg, orderNumber, op, 1, 7 + i)
+      }))
     };
   });
 
@@ -1792,7 +1905,9 @@ module.exports = {
   guessSimulated,
   mpdvDateKey,
   nextMpdvOrderNumber,
-  buildMpdvPayload,
+  mpdvUrl,
+  buildMpdvOrderPayload,
+  buildMpdvOperationPayload,
   mpdvRequest,
   interpretMpdvResponse,
   renderArmPayload,

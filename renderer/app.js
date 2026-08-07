@@ -121,6 +121,17 @@ function isMpdv() {
   return (store.settings || {}).mode === 'mpdv';
 }
 
+// order.ordertype tells MPDV which AGV goes for the item: 0 kuka, 1 tusk.
+// It belongs to the product, so a cart line decides its own.
+const MPDV_AGVS = [{ value: '0', label: 'kuka' }, { value: '1', label: 'tusk' }];
+function mpdvOrderTypeOf(product) {
+  return String((product || {}).mpdvOrderType) === '1' ? '1' : '0';
+}
+function mpdvAgvName(value) {
+  const hit = MPDV_AGVS.find((a) => a.value === String(value));
+  return hit ? hit.label : String(value);
+}
+
 function applyMode() {
   const mpdv = isMpdv();
   $('#modeBadge').textContent = mpdv ? '🏭 MPDV' : '🤖 SYNAOS';
@@ -374,7 +385,11 @@ async function onFinishMpdv() {
 
   const lines = cart.map((c) => {
     const p = store.products.find((x) => x.id === c.productId);
-    return p ? { productId: p.id, name: p.name, quantity: c.qty, price: p.price, image: p.image } : null;
+    // orderType is which AGV fetches it — 0 kuka, 1 tusk — carried per product
+    return p ? {
+      productId: p.id, name: p.name, quantity: c.qty, price: p.price, image: p.image,
+      orderType: mpdvOrderTypeOf(p)
+    } : null;
   }).filter(Boolean);
 
   let results = [];
@@ -408,6 +423,29 @@ async function onFinishMpdv() {
 
 // MPDV keeps this id in an 8-character field, so what it stored can be a
 // truncated version of what we sent — say so plainly rather than let it pass.
+// An MPDV line is several calls now — the order, then an operation per arm.
+// Each is shown in the order it was made, with what was sent and what came
+// back, so a failure points at the exact step rather than the line as a whole.
+function mpdvCallsHtml(entry) {
+  const calls = entry.calls && entry.calls.length ? entry.calls : [{
+    kind: 'order', label: 'Order', ok: entry.ok, status: entry.status, attempt: 1,
+    error: entry.error, response: entry.response, request: entry.request
+  }];
+  return `<div class="mpdv-calls">${calls.map((c) => `
+    <div class="mpdv-call ${c.ok ? '' : 'failed'}">
+      <div class="mpdv-call-head">
+        <span class="dir ${c.ok ? 'in' : 'out'}">${c.ok ? '✅' : '❌'}</span>
+        <b>${escapeHtml(c.label || c.kind)}</b>
+        <span class="chip">${c.kind === 'order' ? 'BOOrder' : 'BOOperation'}</span>
+        <span class="chip">HTTP ${c.status === 0 ? 'no reply' : c.status}</span>
+        ${c.attempt > 1 ? `<span class="chip">attempt ${c.attempt}</span>` : ''}
+      </div>
+      ${c.ok ? '' : `<div class="mpdv-log-err">${escapeHtml(c.error || 'Rejected')}</div>`}
+      ${c.response ? `<details class="mpdv-log-raw"><summary>MPDV replied</summary><pre>${escapeHtml(prettyJson(c.response))}</pre></details>` : ''}
+      ${c.request ? `<details class="mpdv-log-raw"><summary>What we sent</summary><pre>${escapeHtml(prettyJson(c.request))}</pre></details>` : ''}
+    </div>`).join('')}</div>`;
+}
+
 function mpdvCreatedIdNote(entry) {
   if (!entry.createdId) return '';
   const same = entry.orderNumber && entry.createdId === entry.orderNumber;
@@ -427,9 +465,9 @@ function renderMpdvResult(results, total) {
           ? `Order no. <b>${escapeHtml(r.orderNumber)}</b>`
           : 'No order number was issued'}${mpdvCreatedIdNote(r)}</div>
         ${r.ok ? '' : `<div class="err-text">${escapeHtml(r.error || 'Rejected by MPDV')}</div>`}
-        ${r.response ? `<details class="mpdv-log-raw"><summary>What MPDV replied (HTTP ${r.status === 0 ? 'no reply' : r.status})</summary><pre>${escapeHtml(prettyJson(r.response))}</pre></details>` : ''}
+        ${mpdvCallsHtml(r)}
       </div>
-      <div class="qty-lbl">Qty: ${r.quantity}</div>
+      <div class="qty-lbl">Qty: ${r.quantity}${r.orderType != null ? `<div class="tl-meta">AGV ${escapeHtml(r.orderType)} — ${escapeHtml(mpdvAgvName(r.orderType))}</div>` : ''}</div>
     </div>`).join('');
 
   const allOk = okCount === results.length && results.length > 0;
@@ -1301,6 +1339,12 @@ function renderProductEditor(body) {
           </select>
           ${resourceHint}
         </label>
+        <label class="fld full">MPDV — which AGV fetches it (<code>order.ordertype</code>)
+          <select class="inp" id="f-otype">
+            ${MPDV_AGVS.map((a) => `<option value="${a.value}" ${mpdvOrderTypeOf(p) === a.value ? 'selected' : ''}>${a.value} — ${a.label}</option>`).join('')}
+          </select>
+          <span class="fld-hint">Only used in MPDV mode; sent as this line's <code>order.ordertype</code>.</span>
+        </label>
         <label class="fld switch full">
           <input type="checkbox" id="f-visible" ${p.visible ? 'checked' : ''}> Show this job to users
         </label>
@@ -1333,6 +1377,7 @@ function renderProductEditor(body) {
   $('#f-rating').addEventListener('input', (e) => p.rating = parseFloat(e.target.value) || 0);
   $('#f-sold').addEventListener('input', (e) => p.sold = parseInt(e.target.value) || 0);
   $('#f-visible').addEventListener('change', (e) => p.visible = e.target.checked);
+  $('#f-otype').addEventListener('change', (e) => p.mpdvOrderType = e.target.value);
   $('#f-resource').addEventListener('change', (e) => { p.resourceId = e.target.value || null; renderAdmin(); });
   // Re-render on step edits: changing a station or action changes which robots are
   // allowed there and whether a hand-over boundary is still valid.
@@ -3155,10 +3200,14 @@ function renderAdminSettings() {
     </div>
     <div class="panel">
       <h2>MPDV production orders</h2>
-      <p class="hint">Used when the shop is set to <b>MPDV</b>. Each cart line becomes a workplan order; the ordered quantity becomes <code>plan.yield.base</code>.</p>
+      <p class="hint">Used when the shop is set to <b>MPDV</b>. Each cart line becomes an <b>order</b> (<code>BOOrder/insert</code>) followed by <b>one operation per arm</b> (<code>BOOperation/insert</code>). The order goes first because the operations reference its id; the ordered quantity becomes <code>order.plan.yield.base</code> and each operation's <code>plan.yield.primary</code>. Which AGV fetches an item (<code>order.ordertype</code>) is set per product under Jobs / Products.</p>
       <div class="form-grid">
-        <label class="fld full">Endpoint
-          <input class="inp" id="m-endpoint" value="${escapeHtml(m.endpoint || '')}">
+        <label class="fld">Base URL
+          <input class="inp" id="m-base" value="${escapeHtml(m.baseUrl || '')}" placeholder="https://host:8080">
+        </label>
+        <label class="fld">X-Access-Id
+          <input class="inp" id="m-access" value="${escapeHtml(m.accessId || '')}">
+          <span class="fld-hint">Both calls hang off these two.</span>
         </label>
         <label class="fld">Username
           <input class="inp" id="m-user" value="${escapeHtml(m.username || '')}">
@@ -3169,13 +3218,6 @@ function renderAdminSettings() {
         <label class="fld switch full">
           <input type="checkbox" id="m-tls" ${m.tlsInsecure ? 'checked' : ''}> Don't validate the TLS certificate
           <span class="fld-hint">Needed here: the host serves a valid DigiCert certificate but not its full chain.</span>
-        </label>
-        <label class="fld">workplanorder.id
-          <input class="inp" id="m-woid" value="${escapeHtml(m.workplanOrderId || '')}">
-          <span class="fld-hint">Sent unchanged on every order.</span>
-        </label>
-        <label class="fld">ordertype
-          <input class="inp" id="m-otype" value="${escapeHtml(m.orderType || '')}">
         </label>
         <label class="fld full">latest_end_ts (deadline)
           <input class="inp" id="m-end" value="${escapeHtml(m.latestEndTs || '')}">
@@ -3189,6 +3231,30 @@ function renderAdminSettings() {
           <span class="fld-hint">Also decides which day the order number belongs to.</span>
         </label>
       </div>
+      <h3 style="margin:22px 0 6px;">Operations — one per arm</h3>
+      <p class="hint">Sent against the order after it exists, both of them, every time. The values below are the identity of each operation; the processing-time and remaining-runtime formulas, their modes and the 60000 cycle target are sent exactly as supplied.</p>
+      ${(m.operations || []).map((op, i) => `
+        <div class="op-row">
+          <span class="chip">${escapeHtml(op.label || 'Arm ' + (i + 1))}</span>
+          <label class="inline-fld">operation
+            <input class="inp" data-m-op="${i}" data-f="operation" value="${escapeHtml(op.operation || '')}" style="max-width:80px;">
+          </label>
+          <label class="inline-fld">workplace
+            <input class="inp" data-m-op="${i}" data-f="workplace" value="${escapeHtml(op.workplace || '')}" style="max-width:120px;">
+          </label>
+          <label class="inline-fld">article
+            <input class="inp" data-m-op="${i}" data-f="article" value="${escapeHtml(op.article || '')}" style="max-width:120px;">
+          </label>
+          <label class="inline-fld">designation
+            <input class="inp" data-m-op="${i}" data-f="designation" value="${escapeHtml(op.designation || '')}" style="max-width:120px;">
+          </label>
+          <label class="inline-fld">unit
+            <input class="inp" data-m-op="${i}" data-f="unit" value="${escapeHtml(op.unit || 'PCS')}" style="max-width:80px;">
+          </label>
+        </div>`).join('')}
+      ${(m.operations || []).length === 2 && m.operations[0].operation === m.operations[1].operation
+        ? `<div class="handover-warn">⚠️ Both operations use number <b>${escapeHtml(m.operations[0].operation)}</b>. MPDV may refuse the second as a duplicate on the same order — if it does, give this one its own number (e.g. 0020).</div>`
+        : ''}
       <div class="progress-actions" style="margin-top:16px; align-items:center; flex-wrap:wrap;">
         <button class="btn btn-secondary" id="saveMpdv">Save MPDV settings</button>
         <span class="api-status" id="mpdvNext"></span>
@@ -3339,17 +3405,24 @@ function renderAdminSettings() {
     else status.innerHTML = `<span class="dot bad"></span> Failed (${res.error || 'HTTP ' + res.status})`;
   });
   // ---- MPDV ----
-  const readMpdvForm = () => ({
-    endpoint: $('#m-endpoint').value.trim(),
-    username: $('#m-user').value,
-    password: $('#m-pass').value,
-    tlsInsecure: $('#m-tls').checked,
-    workplanOrderId: $('#m-woid').value.trim(),
-    orderType: $('#m-otype').value.trim(),
-    latestEndTs: $('#m-end').value.trim(),
-    language: $('#m-lang').value.trim() || 'en',
-    timeZoneId: $('#m-tz').value.trim() || 'Asia/Singapore'
-  });
+  const readMpdvForm = () => {
+    const operations = JSON.parse(JSON.stringify(store.settings.mpdv.operations || []));
+    $$('[data-m-op]', body).forEach((el) => {
+      const op = operations[Number(el.dataset.mOp)];
+      if (op) op[el.dataset.f] = el.value.trim();
+    });
+    return {
+      baseUrl: $('#m-base').value.trim().replace(/\/+$/, ''),
+      accessId: $('#m-access').value.trim(),
+      username: $('#m-user').value,
+      password: $('#m-pass').value,
+      tlsInsecure: $('#m-tls').checked,
+      latestEndTs: $('#m-end').value.trim(),
+      language: $('#m-lang').value.trim() || 'en',
+      timeZoneId: $('#m-tz').value.trim() || 'Asia/Singapore',
+      operations
+    };
+  };
   const showMpdvState = async () => {
     const [preview, log] = await Promise.all([window.api.mpdvPreview(), window.api.mpdvLog()]);
     $('#mpdvNext').innerHTML = `<span class="dot ok"></span> Next order no. <b>${escapeHtml(preview.orderNumber)}</b>
@@ -3367,8 +3440,7 @@ function renderAdminSettings() {
           ${l.createdId ? `<div class="mpdv-log-created">${l.createdId === l.orderNumber
             ? `MPDV created <b>${escapeHtml(l.createdId)}</b>`
             : `<span class="mpdv-id-warn">MPDV stored it as <b>${escapeHtml(l.createdId)}</b>, not ${escapeHtml(l.orderNumber || '—')}</span>`}</div>` : ''}
-          ${l.response ? `<details class="mpdv-log-raw"><summary>MPDV response${l.ok ? ' (accepted)' : ''}</summary><pre>${escapeHtml(prettyJson(l.response))}</pre></details>` : ''}
-          ${l.request ? `<details class="mpdv-log-raw"><summary>Request we sent</summary><pre>${escapeHtml(prettyJson(l.request))}</pre></details>` : ''}
+          ${mpdvCallsHtml(l)}
         </div>`).join('')
       : '<p class="hint">No MPDV orders sent yet.</p>';
   };

@@ -3,11 +3,11 @@
 A Shopee-style desktop ordering app that dispatches orders to either of two systems, chosen from a start menu:
 
 - **SYNAOS** — creates AGV transport jobs through the SYNAOS Job Management API and tracks them live.
-- **MPDV** — creates workplan orders in the MPDV MES.
+- **MPDV** — creates production orders (order + one operation per arm) in the MPDV MES.
 
 Built with Electron for Windows and macOS, with light/dark mode and separate **user** and **admin** interfaces.
 
-![status](https://img.shields.io/badge/version-1.10.10-e0563f)
+![status](https://img.shields.io/badge/version-1.12.0-e0563f)
 
 ## Features
 
@@ -49,15 +49,30 @@ Toggle from the top bar; the choice is saved.
 
 ## MPDV production orders
 
-Selected from the start menu (or the badge in the top bar). Each **cart line** becomes one workplan order via `POST .../MDWorkplanOrder/generateOrder`, authenticated with HTTP Basic.
+Selected from the start menu (or the badge in the top bar). Each **cart line** becomes an **order** followed by **one operation per arm**, authenticated with HTTP Basic. No workplan order is involved — that path was removed in v1.12.
+
+**1. `POST /data/BOOrder/insert`** — the order has to exist first, because the operations reference its id.
 
 | Field | Value |
 |---|---|
-| `workplanorder.id` | fixed, from admin (e.g. `00003150`) |
-| `workplanorder.target.id` | **the running order number** |
-| `workplanorder.ordertype` | fixed, from admin |
-| `workplanorder.plan.yield.base` | **the quantity the customer ordered**, as a JSON number |
-| `workplanorder.latest_end_ts` | fixed deadline, from admin |
+| `order.id` | **the running order number**, `ddmmyyxx` |
+| `order.ordertype` | **which AGV fetches it** — `0` kuka, `1` tusk — set per product |
+| `order.plan.yield.base` | **the quantity the customer ordered**, as a JSON number |
+| `order.latest_end_ts` | fixed deadline, from admin |
+
+**2. `POST /data/BOOperation/insert`, once per arm** — both are sent for every order.
+
+| Field | Openmind arm | Kuka arm |
+|---|---|---|
+| `order.id` | the order's id | the order's id |
+| `operation.operation` | `0010` | `0010` |
+| `operation.plan.workplace` | `ROBOT01` | `ROBOT02` |
+| `operation.article` / `.designation` | `BRACES` | `PEN` |
+| `operation.plan.yield.primary` | the ordered quantity | the ordered quantity |
+
+`plan.unit.primary` (`PCS`), the `BEA_ZY` / `RLFZ` formulas, their `FORMULA` modes and the `60000` cycle target are sent exactly as supplied. The identity fields above are editable in **Admin → Settings → MPDV**; both arms ship with operation number `0010`, and the panel warns that MPDV may refuse the second as a duplicate on the same order, in which case give it its own number.
+
+**A refused operation is retried** — three attempts, one then two seconds apart — before the next one is sent. If the **order** insert fails, no operation is sent against an order that does not exist. Every call is kept in the log and on the result screen with what was sent, what came back and which attempt succeeded, so a failure points at the exact step.
 
 The running number is **`DDMMYY` + a two-digit counter** that restarts each day — `03082601`, `03082602`, … `04082601`. It is deliberately 8 characters: MPDV stores this id in an 8-character field, and a longer number is silently truncated, which would make every order of a day collide on one id. That caps the app at **99 MPDV orders per day**; beyond that it refuses to send rather than create a duplicate. The date follows the configured `timeZoneId`, not the PC clock, so the number matches the day MPDV records.
 
@@ -79,8 +94,8 @@ Authentication is HTTP Basic. All admin configuration (products, stations, price
 ## Download
 
 Grab the latest installers from the [Releases page](../../releases):
-- **Windows** — `GradionShop-Setup-1.10.10.exe`
-- **macOS** — `GradionShop-1.10.10.dmg`
+- **Windows** — `GradionShop-Setup-1.12.0.exe`
+- **macOS** — `GradionShop-1.12.0.dmg`
 
 ## Development
 
