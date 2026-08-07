@@ -12,6 +12,8 @@ contextBridge.exposeInMainWorld('api', {
   getJob: (jobId) => ipcRenderer.invoke('api:getJob', jobId),
   discardJob: (jobId) => ipcRenderer.invoke('api:discardJob', jobId),
   pickImage: () => ipcRenderer.invoke('dialog:pickImage'),
+  syncPublish: (opts) => ipcRenderer.invoke('sync:publish', opts),
+  syncFetch: (opts) => ipcRenderer.invoke('sync:fetch', opts),
   mpdvCreateOrders: (payload) => ipcRenderer.invoke('mpdv:createOrders', payload),
   mpdvPreview: (cfg) => ipcRenderer.invoke('mpdv:preview', cfg),
   mpdvLog: () => ipcRenderer.invoke('mpdv:log'),

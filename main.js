@@ -48,6 +48,18 @@ function defaultStore() {
         latestEndTs: '2026-08-05T00:00:00.000+08:00',
         language: 'en',
         timeZoneId: 'Asia/Singapore'
+      },
+      // Where this shop's setup (products, stations, robots, recalls) is kept so
+      // a new install can pull it instead of being configured by hand. The token
+      // and passphrase live here only — they are never part of what is published.
+      sync: {
+        repo: 'ApollosRGB/Gradion-shop',
+        branch: 'main',
+        path: 'gradion-setup.json',
+        token: '',
+        passphrase: '',
+        lastPublishedAt: null,
+        lastLoadedAt: null
       }
     },
     // Running order number: DDMMYY + a 4-digit counter that restarts each day
@@ -151,9 +163,11 @@ function loadStore() {
     const defaultArm = Object.assign({}, def.settings.arm);
     const arm = Object.assign({}, defaultArm, (data.settings && data.settings.arm) || {});
     const mpdv = Object.assign({}, def.settings.mpdv, (data.settings && data.settings.mpdv) || {});
+    const sync = Object.assign({}, def.settings.sync, (data.settings && data.settings.sync) || {});
     data.settings = Object.assign({}, def.settings, data.settings || {});
     data.settings.arm = arm;
     data.settings.mpdv = mpdv;
+    data.settings.sync = sync;
     data.mpdvCounter = data.mpdvCounter || { date: '', seq: 0 };
     data.mpdvLog = data.mpdvLog || [];
 
@@ -827,6 +841,138 @@ function buildRelayPayloads(legs, stations, orderId, unitId, quantity) {
 }
 
 // ---------------------------------------------------------------------------
+// Setup sync
+//
+// The shop's setup — products, stations, robots, nodes, recalls, connection
+// details — is kept in one file in a GitHub repository, so installing the app
+// on another machine is a download rather than an evening of retyping.
+//
+// The repository is public, so passwords are NEVER written in the clear. With
+// no passphrase they are left out of the file entirely; with one they are
+// encrypted (AES-256-GCM, key derived with scrypt) and can only be read back by
+// someone who knows it. The GitHub token and the passphrase itself stay on the
+// machine and are never part of what is published.
+// ---------------------------------------------------------------------------
+
+const SYNC_KIND = 'gradion-shop-setup';
+const SYNC_MAX_BYTES = 8 * 1024 * 1024;   // GitHub's contents API is unhappy well before this
+
+function githubRequest(method, apiPath, token, body) {
+  return new Promise((resolve) => {
+    const https = require('https');
+    const payload = body ? JSON.stringify(body) : null;
+    const options = {
+      hostname: 'api.github.com',
+      port: 443,
+      path: apiPath,
+      method,
+      timeout: 30000,
+      headers: {
+        Accept: 'application/vnd.github+json',
+        // GitHub rejects requests that do not identify themselves
+        'User-Agent': 'GradionShop',
+        'X-GitHub-Api-Version': '2022-11-28'
+      }
+    };
+    if (token) options.headers.Authorization = `Bearer ${token}`;
+    if (payload) {
+      options.headers['Content-Type'] = 'application/json';
+      options.headers['Content-Length'] = Buffer.byteLength(payload);
+    }
+    const req = https.request(options, (res) => {
+      let chunks = '';
+      res.on('data', (d) => (chunks += d));
+      res.on('end', () => {
+        let json = null;
+        try { json = chunks ? JSON.parse(chunks) : null; } catch (e) { /* not JSON */ }
+        resolve({
+          ok: res.statusCode >= 200 && res.statusCode < 300,
+          status: res.statusCode,
+          data: json,
+          error: (json && json.message) || null
+        });
+      });
+    });
+    req.on('timeout', () => { req.destroy(); resolve({ ok: false, status: 0, error: 'GitHub timed out' }); });
+    req.on('error', (err) => resolve({ ok: false, status: 0, error: err.message }));
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+function encryptSecrets(secrets, passphrase) {
+  const salt = crypto.randomBytes(16);
+  const iv = crypto.randomBytes(12);
+  const key = crypto.scryptSync(passphrase, salt, 32);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const enc = Buffer.concat([cipher.update(JSON.stringify(secrets), 'utf8'), cipher.final()]);
+  return {
+    alg: 'aes-256-gcm',
+    salt: salt.toString('base64'),
+    iv: iv.toString('base64'),
+    tag: cipher.getAuthTag().toString('base64'),
+    data: enc.toString('base64')
+  };
+}
+
+// Throws when the passphrase is wrong — GCM's tag check is what tells us.
+function decryptSecrets(blob, passphrase) {
+  const salt = Buffer.from(blob.salt, 'base64');
+  const key = crypto.scryptSync(passphrase, salt, 32);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(blob.iv, 'base64'));
+  decipher.setAuthTag(Buffer.from(blob.tag, 'base64'));
+  const dec = Buffer.concat([decipher.update(Buffer.from(blob.data, 'base64')), decipher.final()]);
+  return JSON.parse(dec.toString('utf8'));
+}
+
+// Everything worth carrying to another machine, and nothing that belongs to
+// this one: no orders, no logs, no counters, no in-flight recall bookkeeping,
+// and above all no tokens or passwords unless they can be encrypted.
+function buildSyncPayload(store, passphrase) {
+  const s = store.settings || {};
+  const arm = Object.assign({}, s.arm); delete arm.password;
+  const mpdv = Object.assign({}, s.mpdv); delete mpdv.password;
+  return {
+    kind: SYNC_KIND,
+    formatVersion: 1,
+    appVersion: app.getVersion(),
+    savedAt: new Date().toISOString(),
+    settings: {
+      apiBaseUrl: s.apiBaseUrl,
+      apiUsername: s.apiUsername,
+      arm,
+      mpdv
+    },
+    stations: store.stations || [],
+    robots: store.robots || [],
+    nodes: store.nodes || [],
+    capability: store.capability || {},
+    products: store.products || [],
+    // The route and its automation travel; the countdown and the run it is
+    // watching belong to the machine that was running it.
+    recalls: (store.recalls || []).map((r) => {
+      const copy = Object.assign({}, r);
+      delete copy.autoState;
+      return copy;
+    }),
+    secrets: passphrase ? encryptSecrets({
+      apiPassword: s.apiPassword || '',
+      armPassword: (s.arm || {}).password || '',
+      mpdvPassword: (s.mpdv || {}).password || '',
+      adminPassword: s.adminPassword || ''
+    }, passphrase) : null
+  };
+}
+
+function syncPaths(opts) {
+  const repo = String((opts && opts.repo) || '').trim().replace(/^https?:\/\/github\.com\//i, '').replace(/\.git$/, '').replace(/\/$/, '');
+  const path = String((opts && opts.path) || 'gradion-setup.json').trim().replace(/^\//, '');
+  const branch = String((opts && opts.branch) || 'main').trim() || 'main';
+  if (!/^[^/\s]+\/[^/\s]+$/.test(repo)) return { error: 'Repository should look like owner/name.' };
+  return { repo, path, branch, contents: `/repos/${repo}/contents/${path.split('/').map(encodeURIComponent).join('/')}` };
+}
+
+// ---------------------------------------------------------------------------
 // Relay supervisor
 //
 // Watches each pending hand-over: as soon as the outgoing AGV's DROP is
@@ -1332,6 +1478,87 @@ function registerIpc() {
     });
   });
 
+  // Publishes this machine's setup to the repository. Needs a token with write
+  // access to it; the token never leaves this machine other than as the
+  // Authorization header on this request.
+  ipcMain.handle('sync:publish', async (_ev, opts) => {
+    const store = loadStore();
+    const cfg = Object.assign({}, store.settings.sync, opts || {});
+    const where = syncPaths(cfg);
+    if (where.error) return { ok: false, error: where.error };
+    if (!cfg.token) return { ok: false, error: 'A GitHub token with write access to the repository is needed to publish.' };
+
+    const payload = buildSyncPayload(store, cfg.passphrase || '');
+    const body = Buffer.from(JSON.stringify(payload, null, 2), 'utf8');
+    if (body.length > SYNC_MAX_BYTES) {
+      return { ok: false, error: `The setup is ${(body.length / 1048576).toFixed(1)} MB — too large to publish. Product and station images are usually the cause.` };
+    }
+
+    // An update has to name the blob it replaces, so look for one first
+    const head = await githubRequest('GET', `${where.contents}?ref=${encodeURIComponent(where.branch)}`, cfg.token);
+    const sha = head.ok && head.data ? head.data.sha : undefined;
+    if (!head.ok && head.status !== 404) {
+      return { ok: false, error: head.error || `GitHub answered ${head.status}` };
+    }
+
+    const res = await githubRequest('PUT', where.contents, cfg.token, {
+      message: `Gradion Shop setup — ${new Date().toISOString()}`,
+      content: body.toString('base64'),
+      branch: where.branch,
+      sha
+    });
+    if (!res.ok) return { ok: false, status: res.status, error: res.error || `GitHub answered ${res.status}` };
+
+    const at = new Date().toISOString();
+    store.settings.sync = Object.assign({}, store.settings.sync, cfg, { lastPublishedAt: at });
+    saveStore(store);
+    return {
+      ok: true,
+      at,
+      bytes: body.length,
+      secretsIncluded: !!payload.secrets,
+      url: (res.data && res.data.content && res.data.content.html_url) || null
+    };
+  });
+
+  // Reads the published setup. A public repository needs no token; a private
+  // one uses the same token as publishing.
+  ipcMain.handle('sync:fetch', async (_ev, opts) => {
+    const store = loadStore();
+    const cfg = Object.assign({}, store.settings.sync, opts || {});
+    const where = syncPaths(cfg);
+    if (where.error) return { ok: false, error: where.error };
+
+    const res = await githubRequest('GET', `${where.contents}?ref=${encodeURIComponent(where.branch)}`, cfg.token || null);
+    if (res.status === 404) return { ok: false, error: `No setup published at ${where.repo}/${where.path} yet.` };
+    if (!res.ok) return { ok: false, status: res.status, error: res.error || `GitHub answered ${res.status}` };
+
+    let config;
+    try {
+      config = JSON.parse(Buffer.from((res.data.content || '').replace(/\n/g, ''), 'base64').toString('utf8'));
+    } catch (e) {
+      return { ok: false, error: 'That file is not readable as a saved setup.' };
+    }
+    if (!config || config.kind !== SYNC_KIND) {
+      return { ok: false, error: 'That file is not a Gradion Shop setup.' };
+    }
+
+    if (config.secrets) {
+      if (!cfg.passphrase) return { ok: false, needsPassphrase: true, error: 'This setup carries encrypted passwords — enter the passphrase to read it.' };
+      try {
+        config.decryptedSecrets = decryptSecrets(config.secrets, cfg.passphrase);
+      } catch (e) {
+        return { ok: false, badPassphrase: true, error: 'That passphrase does not open this setup.' };
+      }
+    }
+    delete config.secrets;
+
+    const at = new Date().toISOString();
+    store.settings.sync = Object.assign({}, store.settings.sync, cfg, { lastLoadedAt: at });
+    saveStore(store);
+    return { ok: true, config, at, savedAt: config.savedAt || null };
+  });
+
   ipcMain.handle('dialog:pickImage', async (ev) => {
     const win = BrowserWindow.fromWebContents(ev.sender);
     const res = await dialog.showOpenDialog(win, {
@@ -1418,5 +1645,9 @@ module.exports = {
   runArmTransfer,
   buildRelayPayloads,
   usableResourceId,
+  buildSyncPayload,
+  encryptSecrets,
+  decryptSecrets,
+  syncPaths,
   armState
 };

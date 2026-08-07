@@ -559,6 +559,13 @@ select.inp option:disabled { color: var(--text-muted); }
 .toast.success { background: var(--green); }
 @keyframes fadein { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 
+/* Setup sync — the note about what does and does not get published */
+.sync-warn {
+  margin: 0 0 16px; padding: 12px 14px; border-radius: 12px; font-size: 13px; line-height: 1.55;
+  background: rgba(47, 158, 68, 0.1); color: #1e6f30; border: 1px solid rgba(47, 158, 68, 0.3);
+}
+:root[data-theme="dark"] .sync-warn { color: #7ee08f; background: rgba(81, 207, 102, 0.1); }
+
 /* The shop's 30-second warning before an automatic recall */
 .recall-ask {
   position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);

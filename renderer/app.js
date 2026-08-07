@@ -109,6 +109,17 @@ function wireChrome() {
   $$('.nav-btn').forEach((b) =>
     b.addEventListener('click', () => showView(b.dataset.view)));
   $('#finishBtn').addEventListener('click', onFinish);
+  // Pulling the setup is the first thing a fresh install wants, so it is offered
+  // here rather than only behind the admin password.
+  $('#startSync').addEventListener('click', (e) => {
+    const y = store.settings.sync || {};
+    if (!y.repo) { toast('No repository is set — add one in Admin → Settings.', 'error'); return; }
+    confirmModal('Load this shop\'s setup?',
+      `Products, stations, robots, nodes and recalls will be taken from ${escapeHtml(y.repo)}, replacing whatever is on this machine.`,
+      () => loadSetupFromGitHub({
+        repo: y.repo, branch: y.branch, path: y.path, token: y.token, passphrase: y.passphrase
+      }, e.target));
+  });
 }
 
 // ===========================================================================
@@ -2802,10 +2813,99 @@ function openDiscoverModal(res) {
   });
 }
 
+// ---- Setup sync ----
+//
+// One file in a GitHub repository holds everything an install needs, so putting
+// the app on another machine is a download rather than an evening of retyping.
+
+function syncStatusText(y) {
+  if (y.lastPublishedAt) return `Published ${shortDateTime(y.lastPublishedAt)}`;
+  if (y.lastLoadedAt) return `Loaded ${shortDateTime(y.lastLoadedAt)}`;
+  return 'Never published';
+}
+
+function syncOptionsFromForm() {
+  return {
+    repo: $('#y-repo').value.trim(),
+    branch: $('#y-branch').value.trim() || 'main',
+    path: $('#y-path').value.trim() || 'gradion-setup.json',
+    token: $('#y-token').value.trim(),
+    passphrase: $('#y-pass').value
+  };
+}
+
+// Replaces what belongs to the shop and leaves what belongs to this machine:
+// its own orders, logs, counters, theme, chosen system and any password the
+// published file did not carry.
+async function applySyncedConfig(config) {
+  const local = store.settings;
+  const incoming = config.settings || {};
+  const secrets = config.decryptedSecrets || {};
+
+  store.stations = config.stations || store.stations;
+  store.robots = config.robots || store.robots;
+  store.nodes = config.nodes || store.nodes;
+  store.capability = config.capability || store.capability;
+  store.products = config.products || store.products;
+  // Keep each recall's own countdown and in-flight run — that is this machine's
+  store.recalls = (config.recalls || store.recalls || []).map((r) => {
+    const here = (store.recalls || []).find((x) => x.id === r.id);
+    return Object.assign({}, r, { autoState: (here && here.autoState) || { jobIds: [] } });
+  });
+
+  local.apiBaseUrl = incoming.apiBaseUrl || local.apiBaseUrl;
+  local.apiUsername = incoming.apiUsername || local.apiUsername;
+  local.arm = Object.assign({}, local.arm, incoming.arm || {}, { password: secrets.armPassword || (local.arm || {}).password });
+  local.mpdv = Object.assign({}, local.mpdv, incoming.mpdv || {}, { password: secrets.mpdvPassword || (local.mpdv || {}).password });
+  if (secrets.apiPassword) local.apiPassword = secrets.apiPassword;
+  if (secrets.adminPassword) local.adminPassword = secrets.adminPassword;
+
+  await persist();
+  renderCatalog();
+  renderCart();
+  applyMode();
+  if (currentView === 'admin') renderAdmin();
+}
+
+async function loadSetupFromGitHub(opts, button) {
+  const label = button && button.textContent;
+  if (button) { button.disabled = true; button.textContent = 'Loading…'; }
+  let res;
+  try {
+    res = await window.api.syncFetch(opts);
+  } catch (e) {
+    res = { ok: false, error: e.message };
+  }
+  if (button) { button.disabled = false; button.textContent = label; }
+
+  if (!res.ok) {
+    // A file with encrypted passwords is useless without the passphrase, so ask
+    // for it rather than quietly loading half a setup.
+    if (res.needsPassphrase || res.badPassphrase) {
+      promptModal('Passphrase needed', 'This setup carries encrypted passwords', 'password', '', async (val, close, setErr) => {
+        if (!val) { setErr('Enter the passphrase used when it was published.'); return; }
+        const retry = await window.api.syncFetch(Object.assign({}, opts, { passphrase: val }));
+        if (!retry.ok) { setErr(retry.error || 'Could not read it.'); return; }
+        close();
+        store.settings.sync = Object.assign({}, store.settings.sync, opts, { passphrase: val });
+        await applySyncedConfig(retry.config);
+        toast(`Setup loaded — saved ${shortDateTime(retry.savedAt)}`, 'success');
+      });
+      return;
+    }
+    toast(res.error || 'Could not load the setup.', 'error');
+    return;
+  }
+  store.settings.sync = Object.assign({}, store.settings.sync, opts);
+  await applySyncedConfig(res.config);
+  toast(`Setup loaded — saved ${shortDateTime(res.savedAt)}`, 'success');
+}
+
 // ---- Admin: settings ----
 function renderAdminSettings() {
   const body = $('#adminBody');
   const s = store.settings;
+  const y = s.sync || {};
   const a = s.arm || {};
   const m = s.mpdv || {};
   body.innerHTML = `
@@ -2942,6 +3042,35 @@ function renderAdminSettings() {
       <button class="btn btn-primary" id="changePass" style="margin-top:16px;">Update password</button>
     </div>
     <div class="panel">
+      <h2>Setup sync (GitHub)</h2>
+      <p class="hint">Keeps this shop's setup — products, stations, robots, nodes, recalls and connection details — in one file in a GitHub repository, so a new machine can pull it instead of being configured by hand.</p>
+      <div class="sync-warn">🔒 <b>The repository is public.</b> Passwords are never published in the clear: without a passphrase they are left out of the file altogether, and with one they are encrypted and can only be read back by someone who knows it. The token and passphrase below stay on this machine.</div>
+      <div class="form-grid">
+        <label class="fld">Repository
+          <input class="inp" id="y-repo" value="${escapeHtml(y.repo || '')}" placeholder="owner/name">
+        </label>
+        <label class="fld">Branch
+          <input class="inp" id="y-branch" value="${escapeHtml(y.branch || 'main')}">
+        </label>
+        <label class="fld">File
+          <input class="inp" id="y-path" value="${escapeHtml(y.path || 'gradion-setup.json')}">
+        </label>
+        <label class="fld">Token (publishing only)
+          <input class="inp" id="y-token" type="password" value="${escapeHtml(y.token || '')}" placeholder="ghp_… / github_pat_…">
+          <span class="fld-hint">Needs <b>Contents: write</b> on that repository. Loading a public repo needs no token.</span>
+        </label>
+        <label class="fld full">Passphrase for passwords (optional)
+          <input class="inp" id="y-pass" type="password" value="${escapeHtml(y.passphrase || '')}" placeholder="Leave empty to publish without any passwords">
+          <span class="fld-hint">Set the same passphrase on the other machine to bring the SYNAOS, arm, MPDV and admin passwords across.</span>
+        </label>
+      </div>
+      <div class="progress-actions" style="margin-top:16px; align-items:center;">
+        <button class="btn btn-primary" id="syncPublish">⬆️ Publish this setup</button>
+        <button class="btn btn-secondary" id="syncLoad">⬇️ Load setup from GitHub</button>
+        <span class="api-status" id="syncStatus"><span class="dot"></span> ${escapeHtml(syncStatusText(y))}</span>
+      </div>
+    </div>
+    <div class="panel">
       <h2>Appearance</h2>
       <label class="fld switch"><input type="checkbox" id="s-dark" ${s.theme === 'dark' ? 'checked' : ''}> Dark mode</label>
     </div>`;
@@ -3071,6 +3200,36 @@ function renderAdminSettings() {
     $('#s-newpass').value = ''; $('#s-newpass2').value = '';
     toast('Admin password updated', 'success');
   });
+  $('#syncPublish').addEventListener('click', async (e) => {
+    const opts = syncOptionsFromForm();
+    const what = opts.passphrase
+      ? 'Products, stations, robots, nodes and recalls go up, with the passwords encrypted under your passphrase.'
+      : 'Products, stations, robots, nodes and recalls go up. No passwords are included — the other machine will need them typed in once.';
+    confirmModal('Publish this setup?', `${what} It replaces whatever is in ${escapeHtml(opts.repo)} at ${escapeHtml(opts.path)}.`, async () => {
+      const btn = e.target;
+      btn.disabled = true;
+      btn.textContent = 'Publishing…';
+      let res;
+      try {
+        res = await window.api.syncPublish(opts);
+      } catch (err) {
+        res = { ok: false, error: err.message };
+      }
+      btn.disabled = false;
+      btn.textContent = '⬆️ Publish this setup';
+      if (!res.ok) { toast(res.error || 'Could not publish.', 'error'); return; }
+      store.settings.sync = Object.assign({}, store.settings.sync, opts, { lastPublishedAt: res.at });
+      await persist();
+      renderAdminSettings();
+      toast(`Setup published — ${(res.bytes / 1024).toFixed(0)} kB${res.secretsIncluded ? ', passwords encrypted' : ', no passwords'}`, 'success');
+    });
+  });
+  $('#syncLoad').addEventListener('click', (e) => {
+    confirmModal('Load setup from GitHub?',
+      'This replaces the products, stations, robots, nodes and recalls on this machine with the published ones. Orders and logs are left alone.',
+      () => loadSetupFromGitHub(syncOptionsFromForm(), e.target));
+  });
+
   $('#s-dark').addEventListener('change', async (e) => {
     store.settings.theme = e.target.checked ? 'dark' : 'light';
     applyTheme(store.settings.theme);
