@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -55,7 +55,10 @@ function defaultStore() {
       sync: {
         repo: 'ApollosRGB/Gradion-shop',
         branch: 'main',
-        path: 'gradion-setup.json',
+        // The name this shop's setup is published under — all another machine
+        // needs. The file it maps to (setups/<name>.json) is worked out for you.
+        name: 'setup1',
+        path: '',
         token: '',
         passphrase: '',
         lastPublishedAt: null,
@@ -964,12 +967,32 @@ function buildSyncPayload(store, passphrase) {
   };
 }
 
+// Setups are addressed by a name the operator picks — "setup1", "line-2",
+// "showroom" — and that name is all the other machine needs to type. The file it
+// maps to is an implementation detail nobody has to think about.
+const SYNC_DIR = 'setups';
+
+function syncSlug(name) {
+  const slug = String(name || '').trim().toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+  return slug.slice(0, 40);
+}
+
 function syncPaths(opts) {
   const repo = String((opts && opts.repo) || '').trim().replace(/^https?:\/\/github\.com\//i, '').replace(/\.git$/, '').replace(/\/$/, '');
-  const path = String((opts && opts.path) || 'gradion-setup.json').trim().replace(/^\//, '');
   const branch = String((opts && opts.branch) || 'main').trim() || 'main';
   if (!/^[^/\s]+\/[^/\s]+$/.test(repo)) return { error: 'Repository should look like owner/name.' };
-  return { repo, path, branch, contents: `/repos/${repo}/contents/${path.split('/').map(encodeURIComponent).join('/')}` };
+
+  // An explicit path still wins, so a file published by an older version stays reachable
+  const explicit = String((opts && opts.path) || '').trim().replace(/^\//, '');
+  const slug = syncSlug((opts && opts.name) || '');
+  if (!explicit && !slug) return { error: 'Give the setup a name, for example setup1.' };
+  const path = explicit || `${SYNC_DIR}/${slug}.json`;
+
+  return {
+    repo, path, branch, slug,
+    contents: `/repos/${repo}/contents/${path.split('/').map(encodeURIComponent).join('/')}`,
+    dir: `/repos/${repo}/contents/${SYNC_DIR}`
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1486,7 +1509,7 @@ function registerIpc() {
     const cfg = Object.assign({}, store.settings.sync, opts || {});
     const where = syncPaths(cfg);
     if (where.error) return { ok: false, error: where.error };
-    if (!cfg.token) return { ok: false, error: 'A GitHub token with write access to the repository is needed to publish.' };
+    if (!cfg.token) return { ok: false, needsToken: true, error: 'Publishing needs a GitHub token with write access — loading on the other machine does not.' };
 
     const payload = buildSyncPayload(store, cfg.passphrase || '');
     const body = Buffer.from(JSON.stringify(payload, null, 2), 'utf8');
@@ -1521,6 +1544,22 @@ function registerIpc() {
     };
   });
 
+  // What has been published, so the other machine can pick a setup from a list
+  // rather than having to spell its name exactly. Needs no token on a public repo.
+  ipcMain.handle('sync:list', async (_ev, opts) => {
+    const store = loadStore();
+    const cfg = Object.assign({}, store.settings.sync, opts || {});
+    const where = syncPaths(Object.assign({}, cfg, { name: cfg.name || 'x' }));
+    if (where.error) return { ok: false, error: where.error };
+    const res = await githubRequest('GET', `${where.dir}?ref=${encodeURIComponent(where.branch)}`, cfg.token || null);
+    if (res.status === 404) return { ok: true, setups: [] };      // nothing published yet
+    if (!res.ok) return { ok: false, status: res.status, error: res.error || `GitHub answered ${res.status}` };
+    const setups = (Array.isArray(res.data) ? res.data : [])
+      .filter((f) => f.type === 'file' && /\.json$/i.test(f.name))
+      .map((f) => ({ name: f.name.replace(/\.json$/i, ''), size: f.size }));
+    return { ok: true, setups };
+  });
+
   // Reads the published setup. A public repository needs no token; a private
   // one uses the same token as publishing.
   ipcMain.handle('sync:fetch', async (_ev, opts) => {
@@ -1530,7 +1569,7 @@ function registerIpc() {
     if (where.error) return { ok: false, error: where.error };
 
     const res = await githubRequest('GET', `${where.contents}?ref=${encodeURIComponent(where.branch)}`, cfg.token || null);
-    if (res.status === 404) return { ok: false, error: `No setup published at ${where.repo}/${where.path} yet.` };
+    if (res.status === 404) return { ok: false, error: `No setup called "${where.slug || where.path}" has been published to ${where.repo} yet.` };
     if (!res.ok) return { ok: false, status: res.status, error: res.error || `GitHub answered ${res.status}` };
 
     let config;
@@ -1557,6 +1596,15 @@ function registerIpc() {
     store.settings.sync = Object.assign({}, store.settings.sync, cfg, { lastLoadedAt: at });
     saveStore(store);
     return { ok: true, config, at, savedAt: config.savedAt || null };
+  });
+
+  // Opens GitHub's own "new token" page with the right boxes already ticked, so
+  // making one is a click and a copy rather than a hunt through settings. Only
+  // github.com is ever opened.
+  ipcMain.handle('sync:openTokenPage', async () => {
+    const url = 'https://github.com/settings/tokens/new?scopes=repo&description=Gradion%20Shop%20setup%20sync';
+    await shell.openExternal(url);
+    return { ok: true, url };
   });
 
   ipcMain.handle('dialog:pickImage', async (ev) => {

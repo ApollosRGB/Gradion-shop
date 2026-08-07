@@ -565,6 +565,17 @@ select.inp option:disabled { color: var(--text-muted); }
   background: rgba(47, 158, 68, 0.1); color: #1e6f30; border: 1px solid rgba(47, 158, 68, 0.3);
 }
 :root[data-theme="dark"] .sync-warn { color: #7ee08f; background: rgba(81, 207, 102, 0.1); }
+.sync-list { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 14px; font-size: 13px; }
+.sync-list .hint { margin: 0; }
+.chip-btn {
+  font: inherit; font-size: 13px; font-weight: 700; cursor: pointer;
+  padding: 6px 14px; border-radius: 999px;
+  background: var(--surface-2); color: var(--text); border: 1px solid var(--border);
+}
+.chip-btn:hover { border-color: var(--accent); color: var(--accent); }
+.sync-adv { margin-top: 18px; border-top: 1px solid var(--border); padding-top: 12px; }
+.sync-adv > summary { cursor: pointer; font-size: 13px; font-weight: 700; color: var(--text-muted); }
+.sync-adv > summary:hover { color: var(--text); }
 
 /* The shop's 30-second warning before an automatic recall */
 .recall-ask {

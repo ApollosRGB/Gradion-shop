@@ -14,6 +14,8 @@ contextBridge.exposeInMainWorld('api', {
   pickImage: () => ipcRenderer.invoke('dialog:pickImage'),
   syncPublish: (opts) => ipcRenderer.invoke('sync:publish', opts),
   syncFetch: (opts) => ipcRenderer.invoke('sync:fetch', opts),
+  syncList: (opts) => ipcRenderer.invoke('sync:list', opts),
+  syncOpenTokenPage: () => ipcRenderer.invoke('sync:openTokenPage'),
   mpdvCreateOrders: (payload) => ipcRenderer.invoke('mpdv:createOrders', payload),
   mpdvPreview: (cfg) => ipcRenderer.invoke('mpdv:preview', cfg),
   mpdvLog: () => ipcRenderer.invoke('mpdv:log'),

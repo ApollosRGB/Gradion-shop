@@ -111,15 +111,7 @@ function wireChrome() {
   $('#finishBtn').addEventListener('click', onFinish);
   // Pulling the setup is the first thing a fresh install wants, so it is offered
   // here rather than only behind the admin password.
-  $('#startSync').addEventListener('click', (e) => {
-    const y = store.settings.sync || {};
-    if (!y.repo) { toast('No repository is set — add one in Admin → Settings.', 'error'); return; }
-    confirmModal('Load this shop\'s setup?',
-      `Products, stations, robots, nodes and recalls will be taken from ${escapeHtml(y.repo)}, replacing whatever is on this machine.`,
-      () => loadSetupFromGitHub({
-        repo: y.repo, branch: y.branch, path: y.path, token: y.token, passphrase: y.passphrase
-      }, e.target));
-  });
+  $('#startSync').addEventListener('click', (e) => pickSetupToLoad(e.target));
 }
 
 // ===========================================================================
@@ -2824,14 +2816,46 @@ function syncStatusText(y) {
   return 'Never published';
 }
 
+// Same rule as the main process, so the panel can show the file a name maps to
+function syncSlug(name) {
+  return String(name || '').trim().toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+}
+
 function syncOptionsFromForm() {
   return {
     repo: $('#y-repo').value.trim(),
     branch: $('#y-branch').value.trim() || 'main',
-    path: $('#y-path').value.trim() || 'gradion-setup.json',
+    name: $('#y-name').value.trim(),
+    path: $('#y-path').value.trim(),
     token: $('#y-token').value.trim(),
     passphrase: $('#y-pass').value
   };
+}
+
+// Shows what has already been published, so loading is a click rather than
+// remembering exactly what a setup was called.
+async function renderSyncSetups(opts) {
+  const host = $('#syncSetups');
+  if (!host) return;
+  host.innerHTML = '<span class="hint">Looking for published setups…</span>';
+  let res;
+  try {
+    res = await window.api.syncList(opts);
+  } catch (e) {
+    res = { ok: false, error: e.message };
+  }
+  if (!host.isConnected) return;
+  if (!res.ok) { host.innerHTML = `<span class="hint">Could not list setups — ${escapeHtml(res.error || '')}</span>`; return; }
+  if (!res.setups.length) { host.innerHTML = '<span class="hint">Nothing published yet. Publish this one to get started.</span>'; return; }
+  host.innerHTML = `<span class="hint">Published setups:</span> ${res.setups.map((s) =>
+    `<button class="chip-btn" data-setup="${escapeHtml(s.name)}">${escapeHtml(s.name)}</button>`).join('')}`;
+  $$('[data-setup]', host).forEach((b) => b.addEventListener('click', () => {
+    $('#y-name').value = b.dataset.setup;
+    confirmModal(`Load "${escapeHtml(b.dataset.setup)}"?`,
+      'This replaces the products, stations, robots, nodes and recalls on this machine with the published ones. Orders and logs are left alone.',
+      () => loadSetupFromGitHub(syncOptionsFromForm(), b));
+  }));
 }
 
 // Replaces what belongs to the shop and leaves what belongs to this machine:
@@ -2865,6 +2889,58 @@ async function applySyncedConfig(config) {
   renderCart();
   applyMode();
   if (currentView === 'admin') renderAdmin();
+}
+
+// The first-run route: show what has been published and let them pick one, so
+// setting up a new machine is choosing "setup1" from a list.
+async function pickSetupToLoad(button) {
+  const y = store.settings.sync || {};
+  const base = { repo: y.repo, branch: y.branch, token: y.token, passphrase: y.passphrase };
+  if (!y.repo) { toast('No repository is set — add one in Admin → Settings.', 'error'); return; }
+
+  const label = button && button.textContent;
+  if (button) { button.disabled = true; button.textContent = 'Looking…'; }
+  let res;
+  try {
+    res = await window.api.syncList(base);
+  } catch (e) {
+    res = { ok: false, error: e.message };
+  }
+  if (button) { button.disabled = false; button.textContent = label; }
+  if (!res.ok) { toast(res.error || 'Could not reach GitHub.', 'error'); return; }
+
+  const load = (name) => loadSetupFromGitHub(Object.assign({}, base, { name, path: '' }), button);
+  if (!res.setups.length) {
+    // Nothing listed — maybe an older single-file setup, or the name is known
+    promptModal('Load a setup', 'Name of the setup to load', 'text', y.name || 'setup1', (val, close) => {
+      close();
+      load(val.trim());
+    });
+    return;
+  }
+  if (res.setups.length === 1) {
+    confirmModal(`Load "${escapeHtml(res.setups[0].name)}"?`,
+      `Products, stations, robots, nodes and recalls will be taken from ${escapeHtml(y.repo)}, replacing whatever is on this machine.`,
+      () => load(res.setups[0].name));
+    return;
+  }
+  const host = modalHost();
+  host.innerHTML = `
+    <div class="modal-backdrop">
+      <div class="modal">
+        <h3>Which setup?</h3>
+        <p class="hint">Published to ${escapeHtml(y.repo)}. Loading replaces the products, stations, robots, nodes and recalls on this machine.</p>
+        <div class="sync-list" style="margin:12px 0;">
+          ${res.setups.map((s) => `<button class="chip-btn" data-pick="${escapeHtml(s.name)}">${escapeHtml(s.name)}</button>`).join('')}
+        </div>
+        <div class="modal-actions"><button class="btn btn-secondary" id="modalCancel">Cancel</button></div>
+      </div>
+    </div>`;
+  $('#modalCancel').addEventListener('click', closeModal);
+  $$('[data-pick]', host).forEach((b) => b.addEventListener('click', () => {
+    closeModal();
+    load(b.dataset.pick);
+  }));
 }
 
 async function loadSetupFromGitHub(opts, button) {
@@ -3046,29 +3122,41 @@ function renderAdminSettings() {
       <p class="hint">Keeps this shop's setup — products, stations, robots, nodes, recalls and connection details — in one file in a GitHub repository, so a new machine can pull it instead of being configured by hand.</p>
       <div class="sync-warn">🔒 <b>The repository is public.</b> Passwords are never published in the clear: without a passphrase they are left out of the file altogether, and with one they are encrypted and can only be read back by someone who knows it. The token and passphrase below stay on this machine.</div>
       <div class="form-grid">
-        <label class="fld">Repository
-          <input class="inp" id="y-repo" value="${escapeHtml(y.repo || '')}" placeholder="owner/name">
+        <label class="fld">Setup name
+          <input class="inp" id="y-name" value="${escapeHtml(y.name || 'setup1')}" placeholder="setup1">
+          <span class="fld-hint">All the other machine needs to type. Saved as <code>setups/${escapeHtml(syncSlug(y.name || 'setup1') || '…')}.json</code>.</span>
         </label>
-        <label class="fld">Branch
-          <input class="inp" id="y-branch" value="${escapeHtml(y.branch || 'main')}">
-        </label>
-        <label class="fld">File
-          <input class="inp" id="y-path" value="${escapeHtml(y.path || 'gradion-setup.json')}">
-        </label>
-        <label class="fld">Token (publishing only)
-          <input class="inp" id="y-token" type="password" value="${escapeHtml(y.token || '')}" placeholder="ghp_… / github_pat_…">
-          <span class="fld-hint">Needs <b>Contents: write</b> on that repository. Loading a public repo needs no token.</span>
-        </label>
-        <label class="fld full">Passphrase for passwords (optional)
+        <label class="fld">Passphrase for passwords (optional)
           <input class="inp" id="y-pass" type="password" value="${escapeHtml(y.passphrase || '')}" placeholder="Leave empty to publish without any passwords">
           <span class="fld-hint">Set the same passphrase on the other machine to bring the SYNAOS, arm, MPDV and admin passwords across.</span>
         </label>
       </div>
       <div class="progress-actions" style="margin-top:16px; align-items:center;">
         <button class="btn btn-primary" id="syncPublish">⬆️ Publish this setup</button>
-        <button class="btn btn-secondary" id="syncLoad">⬇️ Load setup from GitHub</button>
+        <button class="btn btn-secondary" id="syncLoad">⬇️ Load a setup</button>
         <span class="api-status" id="syncStatus"><span class="dot"></span> ${escapeHtml(syncStatusText(y))}</span>
       </div>
+      <div id="syncSetups" class="sync-list"></div>
+      <details class="sync-adv"${y.token ? '' : ' open'}>
+        <summary>Repository &amp; token${y.token ? ' — token saved' : ' — needed once, to publish'}</summary>
+        <div class="form-grid" style="margin-top:12px;">
+          <label class="fld">Repository
+            <input class="inp" id="y-repo" value="${escapeHtml(y.repo || '')}" placeholder="owner/name">
+          </label>
+          <label class="fld">Branch
+            <input class="inp" id="y-branch" value="${escapeHtml(y.branch || 'main')}">
+          </label>
+          <label class="fld full">Token — only to publish from this machine
+            <input class="inp" id="y-token" type="password" value="${escapeHtml(y.token || '')}" placeholder="ghp_… / github_pat_…">
+            <span class="fld-hint">Loading needs none at all on a public repository. Paste it once here and it is remembered.</span>
+          </label>
+          <label class="fld full">File name override (advanced)
+            <input class="inp" id="y-path" value="${escapeHtml(y.path || '')}" placeholder="left empty — worked out from the setup name">
+          </label>
+        </div>
+        <button class="btn btn-secondary" id="syncToken" style="margin-top:12px;">🔑 Create a token on GitHub ↗</button>
+        <p class="hint" style="margin-top:10px;">Opens GitHub with the right box already ticked. Copy what it gives you into the field above — GitHub only shows it once.</p>
+      </details>
     </div>
     <div class="panel">
       <h2>Appearance</h2>
@@ -3200,12 +3288,29 @@ function renderAdminSettings() {
     $('#s-newpass').value = ''; $('#s-newpass2').value = '';
     toast('Admin password updated', 'success');
   });
+  renderSyncSetups({ repo: y.repo, branch: y.branch, token: y.token });
+  $('#syncToken').addEventListener('click', () => {
+    window.api.syncOpenTokenPage();
+    toast('GitHub opened in your browser — copy the token back into the field.', 'success');
+  });
+  $('#y-name').addEventListener('change', async () => {
+    store.settings.sync = Object.assign({}, store.settings.sync, syncOptionsFromForm());
+    await persist();
+    renderAdminSettings();
+  });
   $('#syncPublish').addEventListener('click', async (e) => {
     const opts = syncOptionsFromForm();
+    if (!syncSlug(opts.name) && !opts.path) { toast('Give the setup a name, for example setup1.', 'error'); return; }
+    if (!opts.token) {
+      toast('A token is needed to publish — open “Repository & token” below.', 'error');
+      $('.sync-adv').open = true;
+      return;
+    }
     const what = opts.passphrase
       ? 'Products, stations, robots, nodes and recalls go up, with the passwords encrypted under your passphrase.'
       : 'Products, stations, robots, nodes and recalls go up. No passwords are included — the other machine will need them typed in once.';
-    confirmModal('Publish this setup?', `${what} It replaces whatever is in ${escapeHtml(opts.repo)} at ${escapeHtml(opts.path)}.`, async () => {
+    const target = opts.path || `setups/${syncSlug(opts.name)}.json`;
+    confirmModal('Publish this setup?', `${what} It replaces whatever is in ${escapeHtml(opts.repo)} at ${escapeHtml(target)}.`, async () => {
       const btn = e.target;
       btn.disabled = true;
       btn.textContent = 'Publishing…';
@@ -3225,9 +3330,10 @@ function renderAdminSettings() {
     });
   });
   $('#syncLoad').addEventListener('click', (e) => {
-    confirmModal('Load setup from GitHub?',
+    const opts = syncOptionsFromForm();
+    confirmModal(`Load "${escapeHtml(opts.name || opts.path)}"?`,
       'This replaces the products, stations, robots, nodes and recalls on this machine with the published ones. Orders and logs are left alone.',
-      () => loadSetupFromGitHub(syncOptionsFromForm(), e.target));
+      () => loadSetupFromGitHub(opts, e.target));
   });
 
   $('#s-dark').addEventListener('change', async (e) => {
