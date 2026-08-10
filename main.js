@@ -50,9 +50,11 @@ function defaultStore() {
         timeZoneId: 'Asia/Singapore',
         // One operation per arm, sent for every order. The identity fields are
         // editable; the formulas, modes and cycle target are sent as supplied.
+        // The two must not share an operation number: MPDV rejects the second
+        // as a duplicate on the same order ("Data are already available", 1669).
         operations: [
           { label: 'Openmind arm', operation: '0010', workplace: 'ROBOT01', article: 'BRACES', designation: 'BRACES', unit: 'PCS' },
-          { label: 'Kuka arm', operation: '0010', workplace: 'ROBOT02', article: 'PEN', designation: 'PEN', unit: 'PCS' }
+          { label: 'Kuka arm', operation: '0020', workplace: 'ROBOT02', article: 'PEN', designation: 'PEN', unit: 'PCS' }
         ]
       },
       // Where this shop's setup (products, stations, robots, recalls) is kept so
@@ -189,6 +191,16 @@ function loadStore() {
     delete mpdv.workplanOrderId;      // workplan orders are no longer created
     delete mpdv.orderType;            // now per product: which AGV fetches it
     if (!Array.isArray(mpdv.operations) || !mpdv.operations.length) mpdv.operations = def.settings.mpdv.operations;
+    // Both arms shipped with 0010, and MPDV refuses the second operation on an
+    // order when the number is already taken — return code 1669, "Data are
+    // already available". Give the second one its own number, once, so a
+    // deliberate choice made afterwards is left alone.
+    if (!mpdv.operationNumbersSeparated) {
+      if (mpdv.operations.length > 1 && mpdv.operations[1].operation === mpdv.operations[0].operation) {
+        mpdv.operations[1].operation = '0020';
+      }
+      mpdv.operationNumbersSeparated = true;
+    }
     const sync = Object.assign({}, def.settings.sync, (data.settings && data.settings.sync) || {});
     // Setups used to be committed to main alongside the code. Move an existing
     // install onto the data branch once; reading falls back to the default

@@ -7,7 +7,7 @@ A Shopee-style desktop ordering app that dispatches orders to either of two syst
 
 Built with Electron for Windows and macOS, with light/dark mode and separate **user** and **admin** interfaces.
 
-![status](https://img.shields.io/badge/version-1.12.3-e0563f)
+![status](https://img.shields.io/badge/version-1.12.4-e0563f)
 
 ## Features
 
@@ -70,7 +70,7 @@ Selected from the start menu (or the badge in the top bar). Each **cart line** b
 | `operation.article` / `.designation` | `BRACES` | `PEN` |
 | `operation.plan.yield.primary` | the ordered quantity | the ordered quantity |
 
-`plan.unit.primary` (`PCS`), the `BEA_ZY` / `RLFZ` formulas, their `FORMULA` modes and the `60000` cycle target are sent exactly as supplied. The identity fields above are editable in **Admin → Settings → MPDV**; both arms ship with operation number `0010`, and the panel warns that MPDV may refuse the second as a duplicate on the same order, in which case give it its own number.
+`plan.unit.primary` (`PCS`), the `BEA_ZY` / `RLFZ` formulas, their `FORMULA` modes and the `60000` cycle target are sent exactly as supplied. The identity fields above are editable in **Admin → Settings → MPDV**; the two arms ship with **different** operation numbers (`0010` and `0020`): MPDV refuses a second operation that reuses a number already on the order, answering return code **1669, "Data are already available"**. An install that still had both on `0010` is moved once on upgrade, and a number set deliberately afterwards is left alone.
 
 **A refused operation is retried** — three attempts, one then two seconds apart — before the next one is sent. If the **order** insert fails, no operation is sent against an order that does not exist. Every call is kept in the log and on the result screen with what was sent, what came back and which attempt succeeded, so a failure points at the exact step.
 
@@ -96,8 +96,8 @@ Authentication is HTTP Basic. All admin configuration (products, stations, price
 ## Download
 
 Grab the latest installers from the [Releases page](../../releases):
-- **Windows** — `GradionShop-Setup-1.12.3.exe`
-- **macOS** — `GradionShop-1.12.3.dmg`
+- **Windows** — `GradionShop-Setup-1.12.4.exe`
+- **macOS** — `GradionShop-1.12.4.dmg`
 
 ## Development
 
