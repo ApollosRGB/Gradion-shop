@@ -33,6 +33,19 @@ function cleanMpdvFields(rows) {
     .filter((row) => row.acronym);
 }
 
+// The envelope around the params: which columns MPDV should return, the id it
+// echoes back, and whether the answer comes as an object. Typed in the admin
+// form, so nothing is taken on trust.
+function cleanMpdvColumns(value) {
+  const list = Array.isArray(value) ? value : String(value == null ? '' : value).split(',');
+  return list.map((c) => String(c).trim()).filter(Boolean);
+}
+
+function cleanMpdvRequestId(value, fallback) {
+  const n = Math.round(Number(value));
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
 // `saved` is what was on disk, not the defaults-merged copy: the defaults
 // always carry an orderFields array, so asking the merged object whether it has
 // one would answer yes for an install that predates the field entirely.
@@ -45,8 +58,14 @@ function normalizeMpdvFields(mpdv, saved) {
   }
   delete mpdv.latestEndTs;          // an ordinary row now
   mpdv.orderFields = cleanMpdvFields(mpdv.orderFields);
+  mpdv.orderColumns = cleanMpdvColumns(mpdv.orderColumns);
+  mpdv.orderRequestId = cleanMpdvRequestId(mpdv.orderRequestId, 1);
+  mpdv.orderReturnAsObject = mpdv.orderReturnAsObject !== false;
   (mpdv.operations || []).forEach((op) => {
     op.fields = cleanMpdvFields(Array.isArray(op.fields) ? op.fields : defaultMpdvOperationFields());
+    op.columns = cleanMpdvColumns(op.columns);
+    op.requestId = cleanMpdvRequestId(op.requestId, 7);
+    op.returnAsObject = op.returnAsObject !== false;
   });
 }
 
@@ -94,14 +113,19 @@ function defaultStore() {
         orderFields: [
           { acronym: 'order.latest_end_ts', value: '2026-08-05T00:00:00.000+08:00' }
         ],
+        // The envelope around those params: which columns to ask back, the id
+        // MPDV echoes, and whether the answer comes as an object.
+        orderColumns: [],
+        orderRequestId: 1,
+        orderReturnAsObject: true,
         // One operation per arm, sent for every order. The identity fields are
         // editable, and `fields` carries everything else the operation needs —
         // the formulas, their modes and the cycle target — as editable rows.
         // The two must not share an operation number: MPDV rejects the second
         // as a duplicate on the same order ("Data are already available", 1669).
         operations: [
-          { label: 'Openmind arm', operation: '0010', workplace: 'ROBOT01', article: 'BRACES', designation: 'BRACES', unit: 'PCS', fields: defaultMpdvOperationFields() },
-          { label: 'Kuka arm', operation: '0020', workplace: 'ROBOT02', article: 'PEN', designation: 'PEN', unit: 'PCS', fields: defaultMpdvOperationFields() }
+          { label: 'Openmind arm', operation: '0010', workplace: 'ROBOT01', article: 'BRACES', designation: 'BRACES', unit: 'PCS', fields: defaultMpdvOperationFields(), columns: [], requestId: 7, returnAsObject: true },
+          { label: 'Kuka arm', operation: '0020', workplace: 'ROBOT02', article: 'PEN', designation: 'PEN', unit: 'PCS', fields: defaultMpdvOperationFields(), columns: [], requestId: 7, returnAsObject: true }
         ]
       },
       // Where this shop's setup (products, stations, robots, recalls) is kept so
@@ -635,11 +659,13 @@ function buildMpdvOrderPayload(cfg, orderNumber, orderType, quantity, requestId)
       { acronym: 'order.plan.yield.base', operator: 'EQUAL', value: mpdvQuantity(quantity) },
       ...mpdvExtraParams(cfg.orderFields, MPDV_ORDER_AUTO_ACRONYMS)
     ],
-    columns: [],
-    requestId: Number(requestId) > 0 ? Number(requestId) : 1,
+    columns: cleanMpdvColumns(cfg.orderColumns),
+    // A request id set in admin wins; left unset, each call in a send keeps
+    // counting up as it always has.
+    requestId: cleanMpdvRequestId(cfg.orderRequestId, Number(requestId) > 0 ? Number(requestId) : 1),
     language: cfg.language || 'en',
     timeZoneId: cfg.timeZoneId || 'Asia/Singapore',
-    returnAsObject: true
+    returnAsObject: cfg.orderReturnAsObject !== false
   };
 }
 
@@ -658,11 +684,11 @@ function buildMpdvOperationPayload(cfg, orderNumber, op, quantity, requestId) {
       { acronym: 'operation.plan.unit.primary', operator: 'EQUAL', value: op.unit || 'PCS' },
       ...mpdvExtraParams(op.fields, MPDV_OPERATION_AUTO_ACRONYMS)
     ],
-    columns: [],
-    requestId: Number(requestId) > 0 ? Number(requestId) : 7,
+    columns: cleanMpdvColumns(op.columns),
+    requestId: cleanMpdvRequestId(op.requestId, Number(requestId) > 0 ? Number(requestId) : 7),
     language: cfg.language || 'en',
     timeZoneId: cfg.timeZoneId || 'Asia/Singapore',
-    returnAsObject: true
+    returnAsObject: op.returnAsObject !== false
   };
 }
 

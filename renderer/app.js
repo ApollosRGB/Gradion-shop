@@ -158,6 +158,27 @@ function mpdvAutoRowsHtml(fields) {
 
 // One editable acronym/value row per field. `scope` is 'order' or 'op:<index>',
 // which is how the form is read back and how a row knows which list to leave.
+// The envelope MPDV wraps every request in: which columns to ask back, the id
+// it echoes, and whether the answer is an object. Fixed until now, so a site
+// wanting columns returned or returnAsObject false needed a new build.
+function mpdvEnvelopeHtml(scope, columns, requestId, returnAsObject, defaultId) {
+  return `
+    <div class="env-row">
+      <label class="inline-fld">columns
+        <input class="inp" data-me="${scope}" data-f="columns" style="min-width:260px;"
+          value="${escapeHtml((columns || []).join(', '))}" placeholder="none — comma-separated, e.g. operation.id, operation.ordertype">
+      </label>
+      <label class="inline-fld">requestId
+        <input class="inp" type="number" min="1" step="1" data-me="${scope}" data-f="requestId"
+          value="${escapeHtml(String(requestId || defaultId))}" style="max-width:80px;">
+      </label>
+      <label class="switch">
+        <input type="checkbox" data-me="${scope}" data-f="returnAsObject" ${returnAsObject !== false ? 'checked' : ''}>
+        returnAsObject
+      </label>
+    </div>`;
+}
+
 function mpdvFieldRowsHtml(rows, scope, placeholder) {
   return rows.map((row, i) => `
     <div class="field-row">
@@ -3430,6 +3451,7 @@ function renderAdminSettings() {
       ${mpdvAutoRowsHtml(MPDV_ORDER_AUTO)}
       ${mpdvFieldRowsHtml(m.orderFields || [], 'order', 'order.article')}
       <button class="chip-btn" data-mf-add="order">+ Add field</button>
+      ${mpdvEnvelopeHtml('order', m.orderColumns, m.orderRequestId, m.orderReturnAsObject, 1)}
       <h3 style="margin:22px 0 6px;">Operations — one per arm</h3>
       <p class="hint">Sent against the order after it exists, both of them, every time. The boxes in each row are the identity of the operation; the rows underneath are the rest of what it carries — the formulas, their modes and the cycle target — sent exactly as supplied.</p>
       ${(m.operations || []).map((op, i) => `
@@ -3453,6 +3475,7 @@ function renderAdminSettings() {
           <div class="op-fields">
             ${mpdvFieldRowsHtml(op.fields || [], 'op:' + i, 'operation.cycle.target')}
             <button class="chip-btn" data-mf-add="op:${i}">+ Add field</button>
+            ${mpdvEnvelopeHtml('op:' + i, op.columns, op.requestId, op.returnAsObject, 7)}
           </div>
         </div>`).join('')}
       ${(m.operations || []).length === 2 && m.operations[0].operation === m.operations[1].operation
@@ -3628,13 +3651,28 @@ function renderAdminSettings() {
     });
     return rows.filter(Boolean);
   };
+  const readMpdvEnvelope = (scope, defaultId) => {
+    const env = { columns: [], requestId: defaultId, returnAsObject: true };
+    $$(`[data-me="${scope}"]`, body).forEach((el) => {
+      if (el.dataset.f === 'columns') env.columns = el.value.split(',').map((c) => c.trim()).filter(Boolean);
+      else if (el.dataset.f === 'requestId') {
+        const n = Math.round(Number(el.value));
+        env.requestId = Number.isFinite(n) && n > 0 ? n : defaultId;
+      } else env.returnAsObject = el.checked;
+    });
+    return env;
+  };
   const readMpdvForm = () => {
     const operations = JSON.parse(JSON.stringify(store.settings.mpdv.operations || []));
     $$('[data-m-op]', body).forEach((el) => {
       const op = operations[Number(el.dataset.mOp)];
       if (op) op[el.dataset.f] = el.value.trim();
     });
-    operations.forEach((op, i) => { op.fields = readMpdvFieldRows('op:' + i); });
+    operations.forEach((op, i) => {
+      op.fields = readMpdvFieldRows('op:' + i);
+      Object.assign(op, readMpdvEnvelope('op:' + i, 7));
+    });
+    const orderEnvelope = readMpdvEnvelope('order', 1);
     return {
       baseUrl: $('#m-base').value.trim().replace(/\/+$/, ''),
       accessId: $('#m-access').value.trim(),
@@ -3644,6 +3682,9 @@ function renderAdminSettings() {
       language: $('#m-lang').value.trim() || 'en',
       timeZoneId: $('#m-tz').value.trim() || 'Asia/Singapore',
       orderFields: readMpdvFieldRows('order'),
+      orderColumns: orderEnvelope.columns,
+      orderRequestId: orderEnvelope.requestId,
+      orderReturnAsObject: orderEnvelope.returnAsObject,
       operations
     };
   };
