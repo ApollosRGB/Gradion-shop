@@ -7,7 +7,7 @@ A Shopee-style desktop ordering app that dispatches orders to either of two syst
 
 Built with Electron for Windows and macOS, with light/dark mode and separate **user** and **admin** interfaces.
 
-![status](https://img.shields.io/badge/version-1.12.5-e0563f)
+![status](https://img.shields.io/badge/version-1.13.0-e0563f)
 
 ## Features
 
@@ -58,19 +58,23 @@ Selected from the start menu (or the badge in the top bar). Each **cart line** b
 | `order.id` | **the running order number**, `ddmmyyxx` |
 | `order.ordertype` | **which AGV fetches it** — `0` kuka, `1` tusk — set per product |
 | `order.plan.yield.base` | **the quantity the customer ordered**, as a JSON number |
-| `order.latest_end_ts` | fixed deadline, from admin |
+| *your own rows* | anything else the order should carry — ships with `order.latest_end_ts` |
 
 **2. `POST /data/BOOperation/insert`, once per arm** — both are sent for every order.
 
 | Field | Openmind arm | Kuka arm |
 |---|---|---|
 | `order.id` | the order's id | the order's id |
-| `operation.operation` | `0010` | `0010` |
+| `operation.operation` | `0010` | `0020` |
 | `operation.plan.workplace` | `ROBOT01` | `ROBOT02` |
 | `operation.article` / `.designation` | `BRACES` | `PEN` |
 | `operation.plan.yield.primary` | the ordered quantity | the ordered quantity |
+| `operation.plan.unit.primary` | `PCS` | `PCS` |
+| *that arm's own rows* | `BEA_ZY` / `RLFZ` formulas, their `FORMULA` modes, `60000` cycle target | same |
 
-`plan.unit.primary` (`PCS`), the `BEA_ZY` / `RLFZ` formulas, their `FORMULA` modes and the `60000` cycle target are sent exactly as supplied. The identity fields above are editable in **Admin → Settings → MPDV**; the two arms ship with **different** operation numbers (`0010` and `0020`): MPDV refuses a second operation that reuses a number already on the order, answering return code **1669, "Data are already available"**. An install that still had both on `0010` is moved once on upgrade, and a number set deliberately afterwards is left alone.
+**Everything the app does not fill in itself is editable** in **Admin → Settings → MPDV** (v1.13). The order and each operation carry a list of **acronym/value rows** you can add to, change and remove, so a field this MPDV wants — `order.article`, a different cycle target, another formula — needs no new build. The three order fields in bold above and each operation's identity boxes are filled in per order and shown locked; a row naming one of them is ignored rather than allowed to overwrite the running number or the ordered quantity. A value is sent as a **JSON number when it is one and nothing else** — `60000` goes as `60000`, while `0010` stays the string it was typed as instead of being flattened to `10`.
+
+The two arms ship with **different** operation numbers (`0010` and `0020`): MPDV refuses a second operation that reuses a number already on the order, answering return code **1669, "Data are already available"**. An install that still had both on `0010` is moved once on upgrade, and a number set deliberately afterwards is left alone. The deadline used to be a setting of its own; on upgrade it becomes the order's first row, so what an install already had keeps being sent — including a setup published by an older version.
 
 **A refused operation is retried** — three attempts, one then two seconds apart — before the next one is sent. If the **order** insert fails, no operation is sent against an order that does not exist. Every call is kept in the log and on the result screen with what was sent, what came back and which attempt succeeded, so a failure points at the exact step.
 
@@ -96,8 +100,8 @@ Authentication is HTTP Basic. All admin configuration (products, stations, price
 ## Download
 
 Grab the latest installers from the [Releases page](../../releases):
-- **Windows** — `GradionShop-Setup-1.12.5.exe`
-- **macOS** — `GradionShop-1.12.5.dmg`
+- **Windows** — `GradionShop-Setup-1.13.0.exe`
+- **macOS** — `GradionShop-1.13.0.dmg`
 
 ## Development
 

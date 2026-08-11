@@ -139,6 +139,36 @@ function mpdvAgvName(value) {
   return hit ? hit.label : String(value);
 }
 
+// The order fields the app fills in per order. Shown so the payload reads as a
+// whole, but not editable: a row naming one of these is dropped when the order
+// is built, rather than being allowed to overwrite the running number.
+const MPDV_ORDER_AUTO = [
+  { acronym: 'order.id', note: 'the running order number, ddmmyyxx' },
+  { acronym: 'order.ordertype', note: 'which AGV fetches it — set per product' },
+  { acronym: 'order.plan.yield.base', note: 'the quantity ordered' }
+];
+
+function mpdvAutoRowsHtml(fields) {
+  return fields.map((f) => `
+    <div class="field-row auto">
+      <code class="field-acr">${escapeHtml(f.acronym)}</code>
+      <span class="field-auto">🔒 ${escapeHtml(f.note)}</span>
+    </div>`).join('');
+}
+
+// One editable acronym/value row per field. `scope` is 'order' or 'op:<index>',
+// which is how the form is read back and how a row knows which list to leave.
+function mpdvFieldRowsHtml(rows, scope, placeholder) {
+  return rows.map((row, i) => `
+    <div class="field-row">
+      <input class="inp field-acr" data-mf="${scope}" data-i="${i}" data-f="acronym"
+             value="${escapeHtml(row.acronym || '')}" placeholder="${escapeHtml(placeholder)}">
+      <input class="inp" data-mf="${scope}" data-i="${i}" data-f="value"
+             value="${escapeHtml(row.value == null ? '' : String(row.value))}" placeholder="value">
+      <button class="row-del" data-mf-del="${scope}" data-i="${i}" title="Remove this field">✕</button>
+    </div>`).join('');
+}
+
 function applyMode() {
   const mpdv = isMpdv();
   $('#modeBadge').textContent = mpdv ? '🏭 MPDV' : '🤖 SYNAOS';
@@ -3198,6 +3228,19 @@ async function renderSyncSetups(opts) {
   }));
 }
 
+// A setup published before v1.13 has the deadline as its own setting and no
+// order fields at all. Turn it into a row on the way in, so loading an older
+// setup does not silently drop the one order field it had.
+function mpdvFromSetup(incoming) {
+  const mpdv = Object.assign({}, incoming || {});
+  if (!Array.isArray(mpdv.orderFields) && typeof mpdv.latestEndTs === 'string') {
+    const deadline = mpdv.latestEndTs.trim();
+    if (deadline) mpdv.orderFields = [{ acronym: 'order.latest_end_ts', value: deadline }];
+  }
+  delete mpdv.latestEndTs;
+  return mpdv;
+}
+
 // Replaces what belongs to the shop and leaves what belongs to this machine:
 // its own orders, logs, counters, theme, chosen system and any password the
 // published file did not carry.
@@ -3220,7 +3263,7 @@ async function applySyncedConfig(config) {
   local.apiBaseUrl = incoming.apiBaseUrl || local.apiBaseUrl;
   local.apiUsername = incoming.apiUsername || local.apiUsername;
   local.arm = Object.assign({}, local.arm, incoming.arm || {}, { password: secrets.armPassword || (local.arm || {}).password });
-  local.mpdv = Object.assign({}, local.mpdv, incoming.mpdv || {}, { password: secrets.mpdvPassword || (local.mpdv || {}).password });
+  local.mpdv = Object.assign({}, local.mpdv, mpdvFromSetup(incoming.mpdv), { password: secrets.mpdvPassword || (local.mpdv || {}).password });
   if (secrets.apiPassword) local.apiPassword = secrets.apiPassword;
   if (secrets.adminPassword) local.adminPassword = secrets.adminPassword;
 
@@ -3374,10 +3417,6 @@ function renderAdminSettings() {
           <input type="checkbox" id="m-tls" ${m.tlsInsecure ? 'checked' : ''}> Don't validate the TLS certificate
           <span class="fld-hint">Needed here: the host serves a valid DigiCert certificate but not its full chain.</span>
         </label>
-        <label class="fld full">latest_end_ts (deadline)
-          <input class="inp" id="m-end" value="${escapeHtml(m.latestEndTs || '')}">
-          <span class="fld-hint">Sent as-is, e.g. <code>2026-08-05T00:00:00.000+08:00</code>.</span>
-        </label>
         <label class="fld">language
           <input class="inp" id="m-lang" value="${escapeHtml(m.language || 'en')}">
         </label>
@@ -3386,8 +3425,13 @@ function renderAdminSettings() {
           <span class="fld-hint">Also decides which day the order number belongs to.</span>
         </label>
       </div>
+      <h3 style="margin:22px 0 6px;">Order — sent first</h3>
+      <p class="hint">Three fields are filled in per order and cannot be edited; everything else the order carries is yours to set. Add a row for any <code>order.*</code> field your MPDV accepts.</p>
+      ${mpdvAutoRowsHtml(MPDV_ORDER_AUTO)}
+      ${mpdvFieldRowsHtml(m.orderFields || [], 'order', 'order.article')}
+      <button class="chip-btn" data-mf-add="order">+ Add field</button>
       <h3 style="margin:22px 0 6px;">Operations — one per arm</h3>
-      <p class="hint">Sent against the order after it exists, both of them, every time. The values below are the identity of each operation; the processing-time and remaining-runtime formulas, their modes and the 60000 cycle target are sent exactly as supplied.</p>
+      <p class="hint">Sent against the order after it exists, both of them, every time. The boxes in each row are the identity of the operation; the rows underneath are the rest of what it carries — the formulas, their modes and the cycle target — sent exactly as supplied.</p>
       ${(m.operations || []).map((op, i) => `
         <div class="op-row">
           <span class="chip">${escapeHtml(op.label || 'Arm ' + (i + 1))}</span>
@@ -3406,6 +3450,10 @@ function renderAdminSettings() {
           <label class="inline-fld">unit
             <input class="inp" data-m-op="${i}" data-f="unit" value="${escapeHtml(op.unit || 'PCS')}" style="max-width:80px;">
           </label>
+          <div class="op-fields">
+            ${mpdvFieldRowsHtml(op.fields || [], 'op:' + i, 'operation.cycle.target')}
+            <button class="chip-btn" data-mf-add="op:${i}">+ Add field</button>
+          </div>
         </div>`).join('')}
       ${(m.operations || []).length === 2 && m.operations[0].operation === m.operations[1].operation
         ? `<div class="handover-warn">⚠️ Both operations use number <b>${escapeHtml(m.operations[0].operation)}</b>. MPDV may refuse the second as a duplicate on the same order — if it does, give this one its own number (e.g. 0020).</div>`
@@ -3568,24 +3616,52 @@ function renderAdminSettings() {
     else status.innerHTML = `<span class="dot bad"></span> Failed (${res.error || 'HTTP ' + res.status})`;
   });
   // ---- MPDV ----
+  // Rows are read back by their scope: 'order' for the order's own fields,
+  // 'op:<index>' for one arm's. A blank row is kept here so adding two in a row
+  // does not throw the first one away; it is dropped when the payload is built.
+  const readMpdvFieldRows = (scope) => {
+    const rows = [];
+    $$(`[data-mf="${scope}"]`, body).forEach((el) => {
+      const i = Number(el.dataset.i);
+      if (!rows[i]) rows[i] = { acronym: '', value: '' };
+      rows[i][el.dataset.f] = el.dataset.f === 'acronym' ? el.value.trim() : el.value;
+    });
+    return rows.filter(Boolean);
+  };
   const readMpdvForm = () => {
     const operations = JSON.parse(JSON.stringify(store.settings.mpdv.operations || []));
     $$('[data-m-op]', body).forEach((el) => {
       const op = operations[Number(el.dataset.mOp)];
       if (op) op[el.dataset.f] = el.value.trim();
     });
+    operations.forEach((op, i) => { op.fields = readMpdvFieldRows('op:' + i); });
     return {
       baseUrl: $('#m-base').value.trim().replace(/\/+$/, ''),
       accessId: $('#m-access').value.trim(),
       username: $('#m-user').value,
       password: $('#m-pass').value,
       tlsInsecure: $('#m-tls').checked,
-      latestEndTs: $('#m-end').value.trim(),
       language: $('#m-lang').value.trim() || 'en',
       timeZoneId: $('#m-tz').value.trim() || 'Asia/Singapore',
+      orderFields: readMpdvFieldRows('order'),
       operations
     };
   };
+  // Adding or removing a row redraws the panel, so keep what is typed but not
+  // yet saved — otherwise a half-filled form would be lost to a "+ Add field".
+  const editMpdvFields = (scope, change) => {
+    const cfg = Object.assign({}, store.settings.mpdv, readMpdvForm());
+    const opIndex = scope.startsWith('op:') ? Number(scope.slice(3)) : -1;
+    const list = opIndex >= 0 ? (cfg.operations[opIndex] || {}).fields : cfg.orderFields;
+    if (!list) return;
+    change(list);
+    store.settings.mpdv = cfg;
+    renderAdmin();
+  };
+  $$('[data-mf-add]', body).forEach((el) => el.addEventListener('click', () =>
+    editMpdvFields(el.dataset.mfAdd, (list) => list.push({ acronym: '', value: '' }))));
+  $$('[data-mf-del]', body).forEach((el) => el.addEventListener('click', () =>
+    editMpdvFields(el.dataset.mfDel, (list) => list.splice(Number(el.dataset.i), 1))));
   const showMpdvState = async () => {
     const [preview, log] = await Promise.all([window.api.mpdvPreview(), window.api.mpdvLog()]);
     $('#mpdvNext').innerHTML = `<span class="dot ok"></span> Next order no. <b>${escapeHtml(preview.orderNumber)}</b>

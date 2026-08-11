@@ -9,6 +9,47 @@ const crypto = require('crypto');
 
 let storePath;
 
+// What an operation carries beyond its identity fields. These used to be built
+// into the payload; they are rows now so a site whose MPDV uses other formulas
+// or a different cycle target can change them without a new build.
+function defaultMpdvOperationFields() {
+  return [
+    { acronym: 'operation.processing_time.formula', value: 'BEA_ZY' },
+    { acronym: 'operation.processing_time.mode', value: 'FORMULA' },
+    { acronym: 'operation.remaining_runtime.formula', value: 'RLFZ' },
+    { acronym: 'operation.remaining_runtime.mode', value: 'FORMULA' },
+    { acronym: 'operation.cycle.target', value: '60000' }
+  ];
+}
+
+// Rows arrive from the admin form, so take nothing on trust: a row is an
+// acronym and a value, both strings, and an unnamed row is not a field.
+function cleanMpdvFields(rows) {
+  return (Array.isArray(rows) ? rows : [])
+    .map((row) => ({
+      acronym: String((row && row.acronym) || '').trim(),
+      value: row && row.value != null ? String(row.value) : ''
+    }))
+    .filter((row) => row.acronym);
+}
+
+// `saved` is what was on disk, not the defaults-merged copy: the defaults
+// always carry an orderFields array, so asking the merged object whether it has
+// one would answer yes for an install that predates the field entirely.
+function normalizeMpdvFields(mpdv, saved) {
+  if (!Array.isArray((saved || {}).orderFields)) {
+    // Before v1.13 the deadline was the only order field, and it had its own
+    // setting. Carry it across as the first row so it keeps being sent.
+    const deadline = typeof mpdv.latestEndTs === 'string' ? mpdv.latestEndTs.trim() : '';
+    mpdv.orderFields = deadline ? [{ acronym: 'order.latest_end_ts', value: deadline }] : [];
+  }
+  delete mpdv.latestEndTs;          // an ordinary row now
+  mpdv.orderFields = cleanMpdvFields(mpdv.orderFields);
+  (mpdv.operations || []).forEach((op) => {
+    op.fields = cleanMpdvFields(Array.isArray(op.fields) ? op.fields : defaultMpdvOperationFields());
+  });
+}
+
 function defaultStore() {
   return {
     settings: {
@@ -45,16 +86,22 @@ function defaultStore() {
         username: '12345',
         password: 'mpdv',
         tlsInsecure: true,           // host does not serve its full certificate chain
-        latestEndTs: '2026-08-05T00:00:00.000+08:00',
         language: 'en',
         timeZoneId: 'Asia/Singapore',
+        // What goes on the order besides the three the app fills in itself
+        // (id, ordertype, planned yield). Free acronym/value rows, so a field
+        // MPDV accepts can be added without a new release.
+        orderFields: [
+          { acronym: 'order.latest_end_ts', value: '2026-08-05T00:00:00.000+08:00' }
+        ],
         // One operation per arm, sent for every order. The identity fields are
-        // editable; the formulas, modes and cycle target are sent as supplied.
+        // editable, and `fields` carries everything else the operation needs —
+        // the formulas, their modes and the cycle target — as editable rows.
         // The two must not share an operation number: MPDV rejects the second
         // as a duplicate on the same order ("Data are already available", 1669).
         operations: [
-          { label: 'Openmind arm', operation: '0010', workplace: 'ROBOT01', article: 'BRACES', designation: 'BRACES', unit: 'PCS' },
-          { label: 'Kuka arm', operation: '0020', workplace: 'ROBOT02', article: 'PEN', designation: 'PEN', unit: 'PCS' }
+          { label: 'Openmind arm', operation: '0010', workplace: 'ROBOT01', article: 'BRACES', designation: 'BRACES', unit: 'PCS', fields: defaultMpdvOperationFields() },
+          { label: 'Kuka arm', operation: '0020', workplace: 'ROBOT02', article: 'PEN', designation: 'PEN', unit: 'PCS', fields: defaultMpdvOperationFields() }
         ]
       },
       // Where this shop's setup (products, stations, robots, recalls) is kept so
@@ -201,6 +248,10 @@ function loadStore() {
       }
       mpdv.operationNumbersSeparated = true;
     }
+    // v1.13 turned everything that is not filled in by the app itself into
+    // editable rows. The one order field an install already had was the
+    // deadline, so it becomes the first row rather than being lost.
+    normalizeMpdvFields(mpdv, (data.settings && data.settings.mpdv) || {});
     const sync = Object.assign({}, def.settings.sync, (data.settings && data.settings.sync) || {});
     // Setups used to be committed to main alongside the code. Move an existing
     // install onto the data branch once; reading falls back to the default
@@ -548,16 +599,41 @@ function mpdvQuantity(quantity) {
   return Number(quantity) > 0 ? Number(quantity) : 1;
 }
 
+// Filled in per order by the app, so a row naming one of these is ignored
+// rather than allowed to overwrite the running number or the ordered quantity.
+const MPDV_ORDER_AUTO_ACRONYMS = ['order.id', 'order.ordertype', 'order.plan.yield.base'];
+const MPDV_OPERATION_AUTO_ACRONYMS = [
+  'order.id', 'operation.operation', 'operation.plan.workplace', 'operation.article',
+  'operation.designation', 'operation.plan.yield.primary', 'operation.plan.unit.primary'
+];
+
+// Rows are typed as text, but MPDV wants a number for the likes of
+// `operation.cycle.target`. Send one when the text *is* a plain number and
+// nothing else: "60000" becomes 60000, while "0010" stays the string it was
+// typed as rather than being flattened to 10.
+function mpdvFieldValue(raw) {
+  const text = String(raw == null ? '' : raw).trim();
+  return text && String(Number(text)) === text ? Number(text) : String(raw == null ? '' : raw);
+}
+
+// The configured rows, as params. Anything the app fills in itself is dropped.
+function mpdvExtraParams(rows, autoAcronyms) {
+  return cleanMpdvFields(rows)
+    .filter((row) => !autoAcronyms.includes(row.acronym))
+    .map((row) => ({ acronym: row.acronym, operator: 'EQUAL', value: mpdvFieldValue(row.value) }));
+}
+
 // The order itself. Its id is the running number the shop will quote later, and
 // ordertype is which AGV goes for it — 0 kuka, 1 tusk — which each product
-// carries, so a cart line decides its own.
+// carries, so a cart line decides its own. Everything past those three is the
+// admin's own list of order fields, sent in the order it was entered.
 function buildMpdvOrderPayload(cfg, orderNumber, orderType, quantity, requestId) {
   return {
     params: [
       { acronym: 'order.id', operator: 'EQUAL', value: orderNumber },
       { acronym: 'order.ordertype', operator: 'EQUAL', value: String(orderType == null ? '0' : orderType) },
       { acronym: 'order.plan.yield.base', operator: 'EQUAL', value: mpdvQuantity(quantity) },
-      { acronym: 'order.latest_end_ts', operator: 'EQUAL', value: cfg.latestEndTs }
+      ...mpdvExtraParams(cfg.orderFields, MPDV_ORDER_AUTO_ACRONYMS)
     ],
     columns: [],
     requestId: Number(requestId) > 0 ? Number(requestId) : 1,
@@ -568,7 +644,8 @@ function buildMpdvOrderPayload(cfg, orderNumber, orderType, quantity, requestId)
 }
 
 // One operation per arm, tied to the order by the same id and carrying the same
-// quantity. Everything below the identity fields is sent exactly as supplied.
+// quantity. Below the identity fields sit that arm's own rows — the formulas,
+// their modes and the cycle target — sent exactly as supplied.
 function buildMpdvOperationPayload(cfg, orderNumber, op, quantity, requestId) {
   return {
     params: [
@@ -579,11 +656,7 @@ function buildMpdvOperationPayload(cfg, orderNumber, op, quantity, requestId) {
       { acronym: 'operation.designation', operator: 'EQUAL', value: op.designation },
       { acronym: 'operation.plan.yield.primary', operator: 'EQUAL', value: mpdvQuantity(quantity) },
       { acronym: 'operation.plan.unit.primary', operator: 'EQUAL', value: op.unit || 'PCS' },
-      { acronym: 'operation.processing_time.formula', operator: 'EQUAL', value: 'BEA_ZY' },
-      { acronym: 'operation.processing_time.mode', operator: 'EQUAL', value: 'FORMULA' },
-      { acronym: 'operation.remaining_runtime.formula', operator: 'EQUAL', value: 'RLFZ' },
-      { acronym: 'operation.remaining_runtime.mode', operator: 'EQUAL', value: 'FORMULA' },
-      { acronym: 'operation.cycle.target', operator: 'EQUAL', value: 60000 }
+      ...mpdvExtraParams(op.fields, MPDV_OPERATION_AUTO_ACRONYMS)
     ],
     columns: [],
     requestId: Number(requestId) > 0 ? Number(requestId) : 7,
@@ -1931,6 +2004,9 @@ module.exports = {
   mpdvUrl,
   buildMpdvOrderPayload,
   buildMpdvOperationPayload,
+  defaultMpdvOperationFields,
+  mpdvFieldValue,
+  mpdvExtraParams,
   mpdvRequest,
   interpretMpdvResponse,
   renderArmPayload,
