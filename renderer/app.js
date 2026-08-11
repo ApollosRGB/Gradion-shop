@@ -108,6 +108,9 @@ function wireChrome() {
     store.settings.mode = b.dataset.mode;
     await persist();
     applyMode();
+    // Choosing a system starts a fresh session: whatever was half-added to the
+    // cart belongs to the one before it.
+    cart = [];
     showView('shop');
   }));
   $$('.nav-btn').forEach((b) =>
@@ -175,6 +178,11 @@ function showView(view) {
   $$('.nav-btn').forEach((b) => b.classList.toggle('active', b.dataset.view === view));
 
   if (view !== 'progress') stopPolling();
+  // The cards carry their own counter, taken from the cart when they were last
+  // drawn. Anything that empties the cart elsewhere — finishing an order,
+  // starting a new session — would otherwise leave last time's numbers sitting
+  // on them until something happened to redraw.
+  if (view === 'shop') { renderCatalog(); renderCart(); }
   if (view === 'orders') renderOrders();
   if (view === 'admin') renderAdmin();
 }
@@ -418,6 +426,7 @@ async function onFinishMpdv() {
   }
 
   cart = [];
+  renderCatalog();          // the cards read their counter off the cart, so redraw them after emptying it
   renderCart();
   btn.disabled = false;
   applyMode();

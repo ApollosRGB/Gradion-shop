@@ -7,7 +7,7 @@ A Shopee-style desktop ordering app that dispatches orders to either of two syst
 
 Built with Electron for Windows and macOS, with light/dark mode and separate **user** and **admin** interfaces.
 
-![status](https://img.shields.io/badge/version-1.12.4-e0563f)
+![status](https://img.shields.io/badge/version-1.12.5-e0563f)
 
 ## Features
 
@@ -96,8 +96,8 @@ Authentication is HTTP Basic. All admin configuration (products, stations, price
 ## Download
 
 Grab the latest installers from the [Releases page](../../releases):
-- **Windows** — `GradionShop-Setup-1.12.4.exe`
-- **macOS** — `GradionShop-1.12.4.dmg`
+- **Windows** — `GradionShop-Setup-1.12.5.exe`
+- **macOS** — `GradionShop-1.12.5.dmg`
 
 ## Development
 
