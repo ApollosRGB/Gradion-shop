@@ -205,11 +205,13 @@ function mpdvRawHtml(scope, raw, sample) {
       </label>
       <div class="raw-body ${on ? '' : 'hidden'}" data-raw-body="${scope}">
         <div class="handover-warn">⚠️ While this is on, everything set above for this request is ignored — including the order id, ordertype and quantity the app normally fills in. Use the placeholders below to put them back.</div>
+        <p class="hint" style="margin:0 0 6px;">Paste your JSON here, then <b>Save this JSON</b>. Nothing is kept until you do.</p>
         <textarea class="inp mono" data-mraw="${scope}" data-f="body" rows="14" spellcheck="false"
           placeholder='{ "params": [ … ], "columns": [ … ], "requestId": 1, "language": "de", "timeZoneId": "Asia/Singapore", "returnAsObject": false }'>${escapeHtml((raw && raw.body) || '')}</textarea>
         <div class="raw-actions">
-          <button class="chip-btn" data-raw-fill="${scope}">Start from the fields above</button>
+          <button class="btn btn-primary" data-raw-save="${scope}">💾 Save this JSON</button>
           <button class="chip-btn" data-raw-check="${scope}">Check it</button>
+          <button class="link-btn danger" data-raw-fill="${scope}">Discard this and use the fields above</button>
           <span class="fld-hint">Placeholders: <code>{orderNumber}</code> <code>{quantity}</code> <code>{orderType}</code> <code>{productName}</code> <code>{requestId}</code> <code>{language}</code> <code>{timeZoneId}</code> — each works as a JSON string (<code>"{orderNumber}"</code>) or as a bare number (<code>{quantity}</code>). <code>//</code> and <code>/* */</code> comments and trailing commas are allowed here; they are stripped before sending.</span>
         </div>
         <div class="raw-verdict" data-raw-verdict="${scope}"></div>
@@ -4317,6 +4319,38 @@ function renderAdminSettings() {
     const host = $(`[data-raw-verdict="${scope}"]`);
     if (host) host.innerHTML = html;
   };
+  // Saving is offered where the JSON is typed, not only at the foot of a long
+  // panel: the button nearest what you are editing must be the one that keeps
+  // it. Everything in the panel is written at once, exactly as the button at
+  // the bottom does.
+  const saveMpdvSettings = async () => {
+    store.settings.mpdv = Object.assign({}, store.settings.mpdv, readMpdvForm());
+    await persist();
+    showMpdvState();
+  };
+  $$('[data-raw-save]', body).forEach((el) => el.addEventListener('click', async () => {
+    const scope = el.dataset.rawSave;
+    const box = rawBox(scope);
+    if (!box) return;
+    const res = await window.api.mpdvCheckRaw(box.value);
+    await saveMpdvSettings();
+    const warnings = (res.warnings || []).map((w) => `<div class="handover-warn">⚠️ ${escapeHtml(w)}</div>`).join('');
+    // A draft that does not parse is still worth keeping — but it is saved as a
+    // draft, and saying so is the difference between "kept" and "will be sent".
+    rawVerdict(scope, res.ok
+      ? `<div class="raw-ok">💾 Saved. This is what would be sent:</div>${warnings}<pre>${escapeHtml(res.preview)}</pre>`
+      : `<div class="mpdv-log-err">💾 Saved, but it is not valid yet, so it cannot be sent: ${escapeHtml(res.error)}</div>`);
+    toast(res.ok ? 'This JSON will be sent for that request' : 'Saved — but the JSON is not valid yet', res.ok ? 'success' : 'error');
+  }));
+  // Typing after a save is not saved, so say so rather than let it look kept.
+  $$('[data-mraw][data-f="body"]', body).forEach((el) => {
+    const saved = el.value;
+    el.addEventListener('input', () => {
+      if (el.value === saved) return;
+      rawVerdict(el.dataset.mraw, '<span class="fld-hint">Not saved yet — click <b>Save this JSON</b>.</span>');
+    });
+  });
+
   $$('[data-mraw][data-f="enabled"]', body).forEach((el) => el.addEventListener('change', () => {
     // Showing the editor rather than redrawing the panel: a redraw would throw
     // away whatever else is half-typed in this form.
@@ -4340,8 +4374,8 @@ function renderAdminSettings() {
     const scope = el.dataset.rawFill;
     const box = rawBox(scope);
     if (box && box.value.trim()) {
-      confirmModal('Replace what is in the editor?',
-        'The body the fields above produce will overwrite what is typed here.',
+      confirmModal('Discard the JSON you typed?',
+        'It will be replaced by the body the fields above produce. This cannot be undone.',
         () => fillRawFromFields(scope));
     } else {
       fillRawFromFields(scope);
