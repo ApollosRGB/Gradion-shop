@@ -107,6 +107,12 @@ function wireChrome() {
     window.api.onMpdvRunsChanged(() => {
       if (currentView === 'mpdv-result') refreshMpdvRuns();
       if (currentView === 'admin' && adminTab === 'settings') refreshArmLog();
+      // The tracking screen polls as well, but a stage can turn over between
+      // two polls and the customer is watching that line, not the clock.
+      if (currentView === 'progress') {
+        const order = store.orders.find((o) => o.id === progressOrderId);
+        if (isMpdvOrder(order)) pollMpdvOnce(order);
+      }
     });
   }
   $('#themeToggle').addEventListener('click', toggleTheme);
@@ -246,10 +252,6 @@ function applyMode() {
   $('#modeBadge').textContent = mpdv ? '🏭 MPDV' : '🤖 SYNAOS';
   $('#brandTitle').textContent = mpdv ? 'Gradion Shop — Production' : 'Gradion Shop';
   $('#finishBtn').textContent = mpdv ? 'Finish & Send to Production' : 'Finish & Send to Robot';
-  // Order history and live tracking are SYNAOS concepts
-  $$('.nav-btn').forEach((b) => {
-    if (b.dataset.view === 'orders') b.classList.toggle('hidden', mpdv);
-  });
 }
 
 // ===========================================================================
@@ -517,23 +519,92 @@ async function onFinishMpdv() {
   }
 
   const total = lines.reduce((s, l) => s + l.price * l.quantity, 0);
+  // Results come back one per line, in the order they were sent, so a line is
+  // matched by position rather than by a name two products could share.
   if (results.some((r) => r.ok)) {
-    results.forEach((r) => {
+    results.forEach((r, i) => {
       if (!r.ok) return;
-      const p = store.products.find((x) => x.id === (lines.find((l) => l.name === r.productName) || {}).productId);
+      const p = store.products.find((x) => x.id === (lines[i] || {}).productId);
       if (p) p.sold = (p.sold || 0) + r.quantity;
     });
-    await persist();
-    renderCatalog();
   }
+
+  // A production order is an order like any other: it goes in the history and
+  // is tracked on the same screen, through the cell's stages rather than jobs.
+  const order = buildMpdvOrderRecord(lines, results, total);
+  store.orders.unshift(order);
+  await persist();
 
   cart = [];
   renderCatalog();          // the cards read their counter off the cart, so redraw them after emptying it
   renderCart();
+  renderOrdersBadge();
   btn.disabled = false;
   applyMode();
-  renderMpdvResult(results, total);
+  renderMpdvResult(results, total, order.id);
   showView('mpdv-result');
+}
+
+// The order record behind an MPDV send. `lines` carries what the MES was told
+// and, for each line that has hand-overs, the run the cell is working through —
+// kept on the order itself so the history survives the runs being cleared.
+function buildMpdvOrderRecord(lines, results, total) {
+  const id = uid('ord');
+  const items = [];
+  const orderLines = results.map((r, i) => {
+    const line = lines[i] || {};
+    const product = store.products.find((p) => p.id === line.productId);
+    if (line.productId) {
+      items.push({
+        productId: line.productId, name: line.name, price: line.price,
+        qty: line.quantity, image: line.image, steps: (product && product.steps) || []
+      });
+    }
+    const run = r.run || null;
+    return {
+      productId: line.productId || null,
+      productName: r.productName || line.name || '',
+      orderNumber: r.orderNumber || null,
+      createdId: r.createdId || null,
+      quantity: r.quantity != null ? r.quantity : line.quantity,
+      ok: !!r.ok,
+      error: r.error || null,
+      armNote: r.armNote || null,
+      runId: run ? run.id : null,
+      // 'no-arm' = the order is in the MES and there is nothing for the cell to
+      // do, so there is nothing to wait for either.
+      runState: !r.ok ? 'failed' : run ? 'waiting-for-agv' : 'no-arm',
+      runIndex: 0,
+      lastError: null,
+      stages: run ? (run.stages || []).map((s) => ({
+        armLabel: s.armLabel, stationName: s.stationName, state: 'pending', note: null
+      })) : []
+    };
+  });
+
+  const anyOk = results.some((r) => r.ok);
+  const numbers = orderLines.filter((l) => l.ok && l.orderNumber).map((l) => l.orderNumber);
+  return {
+    id,
+    shortId: id.slice(-6),
+    system: 'mpdv',
+    // Shown beside the order id, because the MES number is what the shop floor
+    // will quote back at you — the app's own id means nothing to MPDV.
+    headExtra: numbers.length ? `MPDV ${numbers.join(', ')}` : '',
+    createdAt: new Date().toISOString(),
+    items,
+    lines: orderLines,
+    jobs: [],                 // no SYNAOS job belongs to this order
+    total,
+    state: anyOk ? 'in_progress' : 'failed',
+    confirmed: false,
+    rated: false,
+    ratings: {}
+  };
+}
+
+function isMpdvOrder(order) {
+  return !!order && order.system === 'mpdv';
 }
 
 // MPDV keeps this id in an 8-character field, so what it stored can be a
@@ -569,7 +640,7 @@ function mpdvCreatedIdNote(entry) {
     : ` — <span class="mpdv-id-warn">MPDV stored it as <b>${escapeHtml(entry.createdId)}</b></span>`;
 }
 
-function renderMpdvResult(results, total) {
+function renderMpdvResult(results, total, orderId) {
   const okCount = results.filter((r) => r.ok).length;
   const rows = results.map((r) => `
     <div class="oi-row">
@@ -608,9 +679,12 @@ function renderMpdvResult(results, total) {
       </div>
     </div>
     <div class="progress-actions" style="margin-top:16px;">
-      <button class="btn btn-primary" id="mpdvBackToShop">← Back to Shop</button>
+      ${orderId ? '<button class="btn btn-primary" id="mpdvTrack">Track this order →</button>' : ''}
+      <button class="btn btn-secondary" id="mpdvBackToShop">← Back to Shop</button>
     </div>`;
   $('#mpdvBackToShop').addEventListener('click', () => showView('shop'));
+  const track = $('#mpdvTrack');
+  if (track) track.addEventListener('click', () => openProgress(orderId));
   refreshMpdvRuns();
 }
 
@@ -980,7 +1054,8 @@ function openProgress(orderId) {
   const ord = store.orders.find((o) => o.id === orderId);
   ratingDraft = ord && ord.ratings ? { ...ord.ratings } : {};
   showView('progress');
-  renderProgress(null);
+  if (isMpdvOrder(ord)) renderMpdvProgress(ord);
+  else renderProgress(null);
   startPolling();
 }
 
@@ -1034,6 +1109,9 @@ async function pollOnce() {
   const order = store.orders.find((o) => o.id === progressOrderId);
   if (!order) { stopPolling(); return; }
   if (order.confirmed || order.state === 'completed') { stopPolling(); }
+  // An MPDV order has no jobs of its own to read; the cell's stages are its
+  // progress, and the main process is what watches them.
+  if (isMpdvOrder(order)) { await pollMpdvOnce(order); return; }
 
   const liveJobs = {};
   let noted = false;
@@ -1179,27 +1257,8 @@ function renderProgress(liveJobs, orderArg) {
     state: completed ? 'done' : 'pending'
   });
 
-  // Past a certain number of stops the station line is dropped so the labels
-  // stay readable while everything still fits across the card.
-  const dense = stepLines.length > 8;
-  const railHtml = stepLines.map((s) => `
-    <div class="rail-node ${s.state}">
-      <div class="rail-dot">${s.iconImage
-        ? `<img src="${escapeHtml(s.iconImage)}" alt="">`
-        : s.icon}</div>
-      <div class="rail-label">${escapeHtml(s.label)}</div>
-      ${s.place ? `<div class="rail-place">${escapeHtml(s.place)}</div>` : ''}
-      <div class="rail-time">${s.at ? escapeHtml(dense ? shortTime(s.at) : shortDateTime(s.at)) : ''}</div>
-    </div>`).join('');
-
-  // The parcel sits on the last finished stop, or halfway to the one under way,
-  // so it advances between stops rather than jumping from icon to icon.
-  const lastDone = stepLines.reduce((acc, s, i) => (s.state === 'done' ? i : acc), -1);
-  const activeIdx = stepLines.findIndex((s) => s.state === 'active');
-  const span = Math.max(1, stepLines.length - 1);
-  const position = activeIdx >= 0 ? activeIdx - 0.5 : Math.max(lastDone, 0);
-  const progress = Math.max(0, Math.min(1, position / span));
-  const moving = activeIdx >= 0;
+  const view = railGeometry(stepLines, completed);
+  const moving = view.moving;
 
   // One line that changes as the order moves on
   const current = stepLines.find((s) => s.state === 'active')
@@ -1226,14 +1285,6 @@ function renderProgress(liveJobs, orderArg) {
       ${!completed && moving ? '<span class="status-pips"><i></i><i></i><i></i></span>' : ''}
     </div>`;
 
-  const itemsHtml = order.items.map((i) => `
-    <div class="oi-row">
-      <div class="thumb">${i.image ? `<img src="${i.image}">` : '🎁'}</div>
-      <div class="nm">${escapeHtml(i.name)}</div>
-      <div class="qty-lbl">Qty: ${i.qty}</div>
-      <div class="pr">${money(i.price * i.qty)}</div>
-    </div>`).join('');
-
   const failNote = failed
     ? `<div class="err-text" style="text-align:center;margin-bottom:10px;">⚠️ Some units were rejected by the robot service. ${escapeHtml((order.jobs.find((j) => j.error) || {}).error || '')}</div>`
     : '';
@@ -1247,52 +1298,263 @@ function renderProgress(liveJobs, orderArg) {
       </div>
     </div>`;
 
-  // Rating card — shown once the order is completed
-  const starsRow = (pid, value, interactive) =>
-    [1, 2, 3, 4, 5].map((n) =>
-      `<span class="star-pick ${n <= value ? 'on' : ''}" ${interactive ? `data-rate="${pid}" data-val="${n}"` : ''}>★</span>`).join('');
-
-  let ratingBlock = '';
-  if (completed) {
-    if (order.rated) {
-      const avg = order.items.reduce((s, i) => s + (order.ratings[i.productId] || 0), 0) / (order.items.length || 1);
-      ratingBlock = `
-        <div class="order-card">
-          <h2 style="text-align:center;">Thanks for rating! ⭐</h2>
-          <p class="hint" style="text-align:center;">You rated this order ${avg.toFixed(1)} on average.</p>
-          ${order.items.map((i) => `
-            <div class="rate-row">
-              <div class="rate-name">${escapeHtml(i.name)}</div>
-              <div class="stars-lg readonly">${starsRow(i.productId, order.ratings[i.productId] || 0, false)}</div>
-            </div>`).join('')}
-        </div>`;
-    } else {
-      const allRated = order.items.every((i) => ratingDraft[i.productId] > 0);
-      ratingBlock = `
-        <div class="order-card">
-          <h2 style="text-align:center;">Rate your order</h2>
-          <p class="hint" style="text-align:center;">Tap the stars to rate each item.</p>
-          ${order.items.map((i) => `
-            <div class="rate-row">
-              <div class="rate-name">${escapeHtml(i.name)}</div>
-              <div class="stars-lg">${starsRow(i.productId, ratingDraft[i.productId] || 0, true)}</div>
-            </div>`).join('')}
-          <div class="progress-actions" style="margin-top:14px;">
-            <button class="btn btn-primary" id="submitRating" ${allRated ? '' : 'disabled'}>Submit rating</button>
-          </div>
-        </div>`;
-    }
-  }
+  const ratingBlock = ratingBlockHtml(order, completed);
 
   $('#progressWrap').innerHTML = `
+    ${railCardHtml(order, stepLines, statusHtml, failNote, view)}
+    ${confirmBlock}
+    ${ratingBlock}
+    ${orderItemsCardHtml(order)}
+    <div class="progress-actions" style="margin-top:16px;">
+      <button class="btn btn-secondary" id="backToShop">← Back to Shop</button>
+    </div>`;
+
+  wireProgressActions(order);
+  const cancel = $('#cancelOrder');
+  if (cancel) cancel.addEventListener('click', () => cancelOrder(order.id));
+}
+
+// ===========================================================================
+// MPDV order tracking
+//
+// The MES has the order; what the customer wants to see is the cell working
+// through it. Each hand-over in the route is a stage — the AGV getting to the
+// station, then that arm doing its work — and the main process reports where it
+// has got to. What it reports is copied onto the order as it goes, so the
+// history still reads correctly long after the run itself has been cleared.
+// ===========================================================================
+
+async function pollMpdvOnce(order) {
+  let runs = [];
+  try { runs = await window.api.mpdvRuns(); } catch (e) { renderMpdvProgress(order); return; }
+
+  const signature = (l) => JSON.stringify([l.runState, l.runIndex, l.lastError, l.stages]);
+  let changed = false;
+
+  (order.lines || []).forEach((line) => {
+    if (!line.runId) return;
+    const run = runs.find((r) => r.id === line.runId);
+    if (!run) {
+      // Cleared, stopped by hand or pruned. The stages already recorded stand,
+      // but a line still shown as waiting would wait for something nobody is
+      // watching any more — so say that instead.
+      if (line.runState === 'waiting-for-agv' || line.runState === 'arm-running') {
+        line.runState = 'stopped';
+        line.lastError = 'The app is no longer watching this order in the cell.';
+        changed = true;
+      }
+      return;
+    }
+    const before = signature(line);
+    line.runState = run.state;
+    line.runIndex = run.index;
+    line.lastError = run.lastError || null;
+    line.stages = run.stages || [];
+    if (signature(line) !== before) changed = true;
+  });
+
+  // Delivered once every line the MES accepted has been worked through. A line
+  // with no hand-over has nothing to wait for, so it never holds the order open.
+  const tracked = (order.lines || []).filter((l) => l.ok);
+  const allDone = tracked.length > 0 && tracked.every((l) => l.runState === 'done' || l.runState === 'no-arm');
+  if (allDone && !order.confirmed && order.state !== 'completed') {
+    markOrderDelivered(order);
+    changed = true;
+  }
+  if (changed) {
+    await persist();
+    renderOrdersBadge();
+  }
+  renderMpdvProgress(order);
+}
+
+// One stop for the AGV getting there and one for the arm, per stage, so the
+// screen shows which of the two the order is actually waiting on.
+function mpdvStepLines(order) {
+  const lines = order.lines || [];
+  const many = lines.filter((l) => l.ok).length > 1;
+  const steps = [{
+    icon: '🧾',
+    label: 'Order placed',
+    place: order.items.map((i) => `${i.qty}× ${i.name}`).join(', '),
+    text: 'Order placed',
+    state: 'done',
+    at: order.createdAt
+  }];
+
+  lines.forEach((line) => {
+    if (!line.ok) return;
+    const tag = many ? `${line.productName} · ` : '';
+    if (!line.stages || !line.stages.length) {
+      steps.push({
+        icon: '🏭',
+        label: 'In production',
+        place: `${tag}MPDV ${line.orderNumber || ''}`.trim(),
+        text: `${line.productName} is with MPDV`,
+        state: 'done',
+        at: order.createdAt
+      });
+      return;
+    }
+    line.stages.forEach((stage, i) => {
+      // Nothing is "in progress" once the run has finished, been given up on or
+      // stopped being watched — those stops go back to being plain pending ones.
+      const watching = line.runState !== 'done' && line.runState !== 'failed' && line.runState !== 'stopped';
+      const current = watching && i === line.runIndex;
+      const past = i < line.runIndex;
+      const armDone = past || stage.state === 'done' || stage.state === 'continued';
+      const arrived = armDone || !!stage.arrivedAt || (current && line.runState === 'arm-running');
+      steps.push({
+        icon: '🚚',
+        label: arrived ? 'AGV arrived' : 'AGV on its way',
+        place: `${tag}${stage.stationName || stage.stationId || ''}`,
+        text: arrived
+          ? `The AGV reached ${stage.stationName || 'the station'}`
+          : `Waiting for an AGV to reach ${stage.stationName || 'the station'}`,
+        state: arrived ? 'done' : current ? 'active' : 'pending',
+        at: stage.arrivedAt || null
+      });
+      steps.push({
+        icon: stage.state === 'continued' ? '⚠️' : '🤖',
+        label: stage.armLabel || 'Arm',
+        place: `${tag}${stage.stationName || ''}`,
+        text: armDone
+          ? `${stage.armLabel || 'The arm'} finished at ${stage.stationName || 'the station'}`
+          : current && line.runState === 'arm-running'
+            ? `${stage.armLabel || 'The arm'} is working`
+            : `${stage.armLabel || 'The arm'} waits its turn`,
+        state: armDone ? 'done' : current && line.runState === 'arm-running' ? 'active' : 'pending',
+        at: stage.finishedAt || null
+      });
+    });
+  });
+
+  const completed = order.confirmed || order.state === 'completed';
+  steps.push({
+    icon: completed ? '🎉' : '🏁',
+    label: 'Completed',
+    place: completed ? 'Ready for you' : '',
+    text: completed ? 'The cell has finished this order' : 'Order complete',
+    state: completed ? 'done' : 'pending'
+  });
+  return steps;
+}
+
+function renderMpdvProgress(orderArg) {
+  const order = orderArg || store.orders.find((o) => o.id === progressOrderId);
+  if (!order) return;
+  const completed = order.confirmed || order.state === 'completed';
+  const stepLines = mpdvStepLines(order);
+  const view = railGeometry(stepLines, completed);
+
+  const failedLine = (order.lines || []).find((l) => !l.ok);
+  const givenUp = (order.lines || []).find((l) => l.runState === 'failed' || l.runState === 'stopped');
+  const headNote = failedLine
+    ? `<div class="err-text" style="text-align:center;margin-bottom:10px;">⚠️ MPDV did not accept ${escapeHtml(failedLine.productName || 'a line')}. ${escapeHtml(failedLine.error || '')}</div>`
+    : givenUp
+      ? `<div class="err-text" style="text-align:center;margin-bottom:10px;">⚠️ ${escapeHtml(givenUp.lastError || 'The cell gave up on this order.')}</div>`
+      : '';
+
+  const current = stepLines.find((s) => s.state === 'active')
+    || [...stepLines].reverse().find((s) => s.state === 'done')
+    || stepLines[0];
+  // Nothing is coming next once the cell has given up or stopped being watched,
+  // so the line that would promise one is left off.
+  const nextUp = givenUp ? null : stepLines.find((s) => s.state === 'pending');
+  const statusHtml = `
+    <div class="status-line ${completed ? 'done' : view.moving ? 'moving' : 'waiting'}">
+      <span class="status-icon">${completed ? '🎉' : view.moving ? '🏭' : givenUp ? '⚠️' : '⏳'}</span>
+      <div class="status-body">
+        <div class="status-now">${escapeHtml(completed
+          ? 'The cell has finished this order'
+          : givenUp ? (givenUp.lastError || 'The cell is no longer working on this order')
+            : current.text)}</div>
+        ${!completed && nextUp ? `<div class="status-next">Next: ${escapeHtml(nextUp.text)}</div>` : ''}
+      </div>
+      ${!completed && view.moving ? '<span class="status-pips"><i></i><i></i><i></i></span>' : ''}
+    </div>`;
+
+  // The same two ways out the result screen offers: something is true on the
+  // floor but silent on the wire, or the cell should stop being watched.
+  const busy = (order.lines || []).filter((l) => l.runId
+    && (l.runState === 'waiting-for-agv' || l.runState === 'arm-running'));
+  const controls = busy.length ? `
     <div class="order-card">
-      <h2>Order #${escapeHtml(order.shortId)}</h2>
-      ${failNote}
+      <h3 style="margin-top:0;">Nothing moving?</h3>
+      <p class="hint">Use these if the floor is ahead of what the app can see.</p>
+      ${busy.map((l) => `
+        <div class="progress-actions" style="flex-wrap:wrap;margin-bottom:6px;">
+          <span class="chip">${escapeHtml(l.productName)}</span>
+          <button class="btn btn-secondary" data-run-skip="${escapeHtml(l.runId)}">${l.runState === 'arm-running' ? 'The arm is done — carry on' : 'The AGV is there — carry on'}</button>
+          <button class="link-btn danger" data-run-cancel="${escapeHtml(l.runId)}">Stop watching</button>
+        </div>`).join('')}
+    </div>` : '';
+
+  // An MES order cannot be recalled through this API, so the screen never
+  // offers to cancel one — only to confirm it has been collected.
+  const confirmBlock = completed ? '' : `
+    <div class="order-card" style="text-align:center;">
+      <h2 style="color:var(--text);margin-bottom:14px;">Got your order?</h2>
+      <div class="progress-actions">
+        <button class="btn btn-primary" id="confirmGotIt">👍 Got it!</button>
+      </div>
+      <p class="hint" style="margin-top:10px;">The production order stays in MPDV either way — this only closes it here.</p>
+    </div>`;
+
+  $('#progressWrap').innerHTML = `
+    ${railCardHtml(order, stepLines, statusHtml, headNote, view)}
+    ${controls}
+    ${confirmBlock}
+    ${ratingBlockHtml(order, completed)}
+    ${orderItemsCardHtml(order)}
+    <div class="progress-actions" style="margin-top:16px;">
+      <button class="btn btn-secondary" id="backToShop">← Back to Shop</button>
+    </div>`;
+
+  wireProgressActions(order);
+  $$('[data-run-skip]').forEach((b) => b.addEventListener('click', async () => {
+    b.disabled = true;
+    const res = await window.api.mpdvSkipWait(b.dataset.runSkip);
+    if (!res.ok) toast(res.error || 'That run is no longer listed.', 'error');
+    pollMpdvOnce(order);
+  }));
+  $$('[data-run-cancel]').forEach((b) => b.addEventListener('click', async () => {
+    b.disabled = true;
+    await window.api.mpdvCancelRun(b.dataset.runCancel);
+    toast('Stopped watching — the MPDV order itself is untouched.');
+    pollMpdvOnce(order);
+  }));
+}
+
+// ---------------------------------------------------------------------------
+// The tracking screen's parts, shared by both systems
+//
+// A SYNAOS order is tracked through its job milestones and an MPDV one through
+// the cell's stages, but a customer is looking at the same thing either way —
+// the same rail, the same items, the same rating card. Only the stops differ,
+// so only the stops are worked out separately.
+// ---------------------------------------------------------------------------
+
+function railCardHtml(order, stepLines, statusHtml, headNote, view) {
+  const railHtml = stepLines.map((s) => `
+    <div class="rail-node ${s.state}">
+      <div class="rail-dot">${s.iconImage
+        ? `<img src="${escapeHtml(s.iconImage)}" alt="">`
+        : s.icon}</div>
+      <div class="rail-label">${escapeHtml(s.label)}</div>
+      ${s.place ? `<div class="rail-place">${escapeHtml(s.place)}</div>` : ''}
+      <div class="rail-time">${s.at ? escapeHtml(view.dense ? shortTime(s.at) : shortDateTime(s.at)) : ''}</div>
+    </div>`).join('');
+  const pct = (view.progress * 100).toFixed(1);
+  return `
+    <div class="order-card">
+      <h2>Order #${escapeHtml(order.shortId)}${order.headExtra ? ` <span class="chip">${escapeHtml(order.headExtra)}</span>` : ''}</h2>
+      ${headNote || ''}
       <div class="rail-scroll">
-        <div class="rail ${dense ? 'dense' : ''}" style="--stops:${stepLines.length}">
+        <div class="rail ${view.dense ? 'dense' : ''}" style="--stops:${stepLines.length}">
           <div class="rail-line">
-            <div class="rail-line-fill" style="width:${(progress * 100).toFixed(1)}%"></div>
-            <div class="rail-traveller ${moving ? 'moving' : ''} ${completed ? 'arrived' : ''}" style="left:${(progress * 100).toFixed(1)}%">
+            <div class="rail-line-fill" style="width:${pct}%"></div>
+            <div class="rail-traveller ${view.moving ? 'moving' : ''} ${view.completed ? 'arrived' : ''}" style="left:${pct}%">
               <span class="rail-parcel">📦</span>
             </div>
           </div>
@@ -1300,9 +1562,35 @@ function renderProgress(liveJobs, orderArg) {
         </div>
       </div>
       ${statusHtml}
-    </div>
-    ${confirmBlock}
-    ${ratingBlock}
+    </div>`;
+}
+
+// The parcel sits on the last finished stop, or halfway to the one under way,
+// so it advances between stops rather than jumping from icon to icon.
+function railGeometry(stepLines, completed) {
+  const lastDone = stepLines.reduce((acc, s, i) => (s.state === 'done' ? i : acc), -1);
+  const activeIdx = stepLines.findIndex((s) => s.state === 'active');
+  const span = Math.max(1, stepLines.length - 1);
+  const position = activeIdx >= 0 ? activeIdx - 0.5 : Math.max(lastDone, 0);
+  return {
+    // Past a certain number of stops the station line is dropped so the labels
+    // stay readable while everything still fits across the card.
+    dense: stepLines.length > 8,
+    progress: Math.max(0, Math.min(1, position / span)),
+    moving: activeIdx >= 0,
+    completed
+  };
+}
+
+function orderItemsCardHtml(order) {
+  const itemsHtml = order.items.map((i) => `
+    <div class="oi-row">
+      <div class="thumb">${i.image ? `<img src="${i.image}">` : '🎁'}</div>
+      <div class="nm">${escapeHtml(i.name)}</div>
+      <div class="qty-lbl">Qty: ${i.qty}</div>
+      <div class="pr">${money(i.price * i.qty)}</div>
+    </div>`).join('');
+  return `
     <div class="order-items-card">
       <h3>Order items</h3>
       ${itemsHtml}
@@ -1310,22 +1598,57 @@ function renderProgress(liveJobs, orderArg) {
         <div class="nm">Total</div>
         <div class="pr">${money(order.total)}</div>
       </div>
-    </div>
-    <div class="progress-actions" style="margin-top:16px;">
-      <button class="btn btn-secondary" id="backToShop">← Back to Shop</button>
     </div>`;
+}
 
+function ratingBlockHtml(order, completed) {
+  if (!completed) return '';
+  const starsRow = (pid, value, interactive) =>
+    [1, 2, 3, 4, 5].map((n) =>
+      `<span class="star-pick ${n <= value ? 'on' : ''}" ${interactive ? `data-rate="${pid}" data-val="${n}"` : ''}>★</span>`).join('');
+
+  if (order.rated) {
+    const avg = order.items.reduce((s, i) => s + (order.ratings[i.productId] || 0), 0) / (order.items.length || 1);
+    return `
+      <div class="order-card">
+        <h2 style="text-align:center;">Thanks for rating! ⭐</h2>
+        <p class="hint" style="text-align:center;">You rated this order ${avg.toFixed(1)} on average.</p>
+        ${order.items.map((i) => `
+          <div class="rate-row">
+            <div class="rate-name">${escapeHtml(i.name)}</div>
+            <div class="stars-lg readonly">${starsRow(i.productId, order.ratings[i.productId] || 0, false)}</div>
+          </div>`).join('')}
+      </div>`;
+  }
+  const allRated = order.items.every((i) => ratingDraft[i.productId] > 0);
+  return `
+    <div class="order-card">
+      <h2 style="text-align:center;">Rate your order</h2>
+      <p class="hint" style="text-align:center;">Tap the stars to rate each item.</p>
+      ${order.items.map((i) => `
+        <div class="rate-row">
+          <div class="rate-name">${escapeHtml(i.name)}</div>
+          <div class="stars-lg">${starsRow(i.productId, ratingDraft[i.productId] || 0, true)}</div>
+        </div>`).join('')}
+      <div class="progress-actions" style="margin-top:14px;">
+        <button class="btn btn-primary" id="submitRating" ${allRated ? '' : 'disabled'}>Submit rating</button>
+      </div>
+    </div>`;
+}
+
+// Back, rate and "got it" behave the same on both screens; redrawing goes
+// through the one that owns this order so the stars work in either.
+function wireProgressActions(order) {
+  const redraw = () => (isMpdvOrder(order) ? renderMpdvProgress(order) : renderProgress(null));
   $('#backToShop').addEventListener('click', () => showView('shop'));
   $$('[data-rate]').forEach((el) => el.addEventListener('click', () => {
     ratingDraft[el.dataset.rate] = parseInt(el.dataset.val, 10);
-    renderProgress(null);
+    redraw();
   }));
   const submitBtn = $('#submitRating');
   if (submitBtn) submitBtn.addEventListener('click', () => submitOrderRating(order.id));
   const gotIt = $('#confirmGotIt');
   if (gotIt) gotIt.addEventListener('click', () => confirmOrder(order.id));
-  const cancel = $('#cancelOrder');
-  if (cancel) cancel.addEventListener('click', () => cancelOrder(order.id));
 }
 
 async function confirmOrder(orderId) {
@@ -1388,11 +1711,17 @@ function renderOrders() {
       : o.state === 'failed'
       ? '<span class="status-pill failed">Failed</span>'
       : '<span class="status-pill progress">In progress</span>';
+    // Both systems' orders sit in one history, so each says which one it went
+    // to — and an MPDV one quotes the MES number the shop floor will use.
+    const mpdvOrder = isMpdvOrder(o);
+    const numbers = mpdvOrder
+      ? (o.lines || []).filter((l) => l.ok && l.orderNumber).map((l) => l.orderNumber).join(', ')
+      : '';
     return `
       <div class="order-list-item" data-open="${o.id}">
-        <div class="thumb">📦</div>
+        <div class="thumb">${mpdvOrder ? '🏭' : '📦'}</div>
         <div class="oli-main">
-          <div class="oli-id">Order #${escapeHtml(o.shortId)}</div>
+          <div class="oli-id">Order #${escapeHtml(o.shortId)}${numbers ? ` <span class="chip">MPDV ${escapeHtml(numbers)}</span>` : ''}</div>
           <div class="oli-sub">${escapeHtml(summary)}</div>
           <div class="oli-date">${escapeHtml(date)}</div>
         </div>

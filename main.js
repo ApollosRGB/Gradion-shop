@@ -395,7 +395,14 @@ function loadStore() {
       try { saveStore(data); } catch (e) { /* read-only run; migration still applies in memory */ }
     }
     data.pendingRelays = data.pendingRelays || [];
-    data.pendingMpdvRuns = data.pendingMpdvRuns || [];
+    // Finished runs are kept for a day so the tracking screen can still show one
+    // that has just completed; the order itself keeps its own copy of the
+    // stages, so pruning here loses nothing from the history.
+    data.pendingMpdvRuns = (data.pendingMpdvRuns || []).filter((r) => {
+      if (!r || (r.state !== 'done' && r.state !== 'failed')) return true;
+      const at = Date.parse(r.finishedAt || r.createdAt || '') || 0;
+      return Date.now() - at < 24 * 60 * 60 * 1000;
+    });
     data.stations = data.stations || def.stations;
     data.stations.forEach((s) => {
       if (!s.system) s.system = 'STATION';
@@ -1724,6 +1731,10 @@ async function runMpdvSupervisor() {
 
     const arm = store.settings.arm || {};
     const wait = arm.mpdvWait || {};
+    // Switching the arms off has to stop work that was already queued too —
+    // otherwise a run created earlier would still command an arm the operator
+    // has just disabled.
+    if (!arm.enabled || wait.enabled === false) return;
     const sinceMs = Date.parse(run.since) || Date.parse(run.createdAt) || Date.now();
 
     // A run marked as commanding an arm while nothing is waiting for one has

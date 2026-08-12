@@ -7,7 +7,7 @@ A Shopee-style desktop ordering app that dispatches orders to either of two syst
 
 Built with Electron for Windows and macOS, with light/dark mode and separate **user** and **admin** interfaces.
 
-![status](https://img.shields.io/badge/version-1.14.0-e0563f)
+![status](https://img.shields.io/badge/version-1.15.0-e0563f)
 
 ## Features
 
@@ -17,7 +17,7 @@ Built with Electron for Windows and macOS, with light/dark mode and separate **u
 - **Finish** dispatches the order to whichever system is selected. In SYNAOS mode each **cart line** travels as one job chain — the whole line rides together rather than one trip per item — and the screen switches to live order progress. Ordering an item adds its quantity to the product's **sold** count.
 - **Rate your order** — once an order is delivered, the customer rates each item 1–5 stars; the product's displayed rating becomes the **running average** of all ratings received.
 - The progress screen polls the Job API and shows the journey as a **tracking bar**: every step is a stop on the rail with its own icon, short label, station and the time it happened, and a **parcel travels between them** — sitting on the last finished stop, or halfway along while a step is under way. The track fills in behind it, the current stop pulses, and the parcel lands with a bounce on arrival. A long route **compresses to fit** the card rather than scrolling — the icons, labels and dates scale with the number of stops, and past eight stops the station line is dropped to keep the labels readable. Underneath, a **single status line** says what is happening right now ("Delivering to ShopT (shop)") with the next step below it, changing as the order advances rather than growing into a list. Animations respect *prefers-reduced-motion*.
-- **My Orders** keeps a history; reopen any order to see its live status. Confirm receipt ("👍 Got it!") or cancel (discards the SYNAOS jobs).
+- **My Orders** keeps a history of orders from **both systems** (v1.15) — an MPDV one is marked 🏭 and quotes the MES order number it was given. Reopen any order to see its live status: a SYNAOS order is tracked through its job milestones, an MPDV one through the cell's stages (see below). Confirm receipt ("👍 Got it!") or, for a SYNAOS order, cancel it (discards the SYNAOS jobs).
 
 ### ⚙️ Admin interface (password-protected)
 - **Jobs / Products** — define each product as a sequence of job milestones (station + action + **the robot that performs it**, e.g. *Production · PICK → Shop · DROP*), set its price, attach an image file, and choose whether users can see it.
@@ -90,6 +90,8 @@ The order and its operations are created **exactly as before**; this is what hap
 2. **publishes the command** to that hand-over's arm, on its own command topic, carrying the ordered quantity and the route's `method`;
 3. **waits for `Finished` on that arm's state topic** before the order moves on to its next stage.
 
+**A production order is tracked like any other (v1.15).** MPDV orders go into **My Orders** — the tab is no longer hidden in MPDV mode — and open on the same tracking screen the SYNAOS orders use, with the same rail, parcel, items and rating card. The stops are the cell's work rather than job milestones: *Order placed → AGV arrived at K2 → Openmind arm → AGV arrived at K1 → Kuka arm → Completed*, each turning from pending to active to done as the run advances, with the times they happened. A stage the arm never confirmed is marked ⚠️ and keeps the reason. The order is **completed** once every line the MES accepted has been worked through, which is what opens the rating card; a line whose route has no hand-over has nothing to wait for and never holds the order open. The screen carries the same two ways out as the result panel (*the AGV is there / the arm is done — carry on*, and *stop watching*), but **never offers to cancel** — an MES order cannot be recalled through this API, so "Got it!" only closes it in the shop. Each order keeps its own copy of the stages, so the history still reads correctly after the runs are cleared; finished runs are pruned after a day.
+
 Runs are advanced **one at a time** — there is one cell, and two orders must not command an arm at once. The result screen shows a live **“In the cell”** panel per order: which stage it is on, which arm is working, which AGV brought the load, and two ways out — **“the AGV is there / the arm is done — carry on”** when something is true on the floor but silent on the wire, and **“stop watching”**, which leaves the MES order completely untouched. Both timeouts are configurable: if **no AGV arrives** the run is given up and the arm is *not* commanded, while if **the arm stays silent** the order moves on and the stage is marked as continued, with the reason recorded. State is persisted, so closing the app mid-order does not lose it — a stage interrupted while the arm was working is re-commanded on restart, and says so.
 
 The log, its running order number, hand-over and MPDV run progress are written by the **main process**, so a save from the window never carries an older copy of them back — clearing the log makes it stay cleared, a send recorded while the panel is open is not wiped, and the running number can never be rewound onto an id MPDV has already been given.
@@ -112,8 +114,8 @@ Authentication is HTTP Basic. All admin configuration (products, stations, price
 ## Download
 
 Grab the latest installers from the [Releases page](../../releases):
-- **Windows** — `GradionShop-Setup-1.14.0.exe`
-- **macOS** — `GradionShop-1.14.0.dmg`
+- **Windows** — `GradionShop-Setup-1.15.0.exe`
+- **macOS** — `GradionShop-1.15.0.dmg`
 
 ## Development
 
