@@ -7,7 +7,7 @@ A Shopee-style desktop ordering app that dispatches orders to either of two syst
 
 Built with Electron for Windows and macOS, with light/dark mode and separate **user** and **admin** interfaces.
 
-![status](https://img.shields.io/badge/version-1.15.0-e0563f)
+![status](https://img.shields.io/badge/version-1.16.0-e0563f)
 
 ## Features
 
@@ -74,6 +74,8 @@ Selected from the start menu (or the badge in the top bar). Each **cart line** b
 
 **Everything the app does not fill in itself is editable** in **Admin → Settings → MPDV** (v1.13). The order and each operation carry a list of **acronym/value rows** you can add to, change and remove, so a field this MPDV wants — `order.article`, a different cycle target, another formula — needs no new build. The three order fields in bold above and each operation's identity boxes are filled in per order and shown locked; a row naming one of them is ignored rather than allowed to overwrite the running number or the ordered quantity. A value is sent as a **JSON number when it is one and nothing else** — `60000` goes as `60000`, while `0010` stays the string it was typed as instead of being flattened to `10`.
 
+**Or send your own JSON (v1.16).** The fields build the order the shop normally sends; a vendor test often needs one it will not build — a different `ordertype`, other `columns` back, or params the app fills in itself. Each request — the order and each operation — has a **Send my own JSON for this request** switch and an editor holding the whole body, sent exactly as typed. Anything set above it is then ignored for that request, including the order id, ordertype and quantity, and the panel says so. **Placeholders** put the per-order values back where they are wanted: `{orderNumber}` `{quantity}` `{orderType}` `{productName}` `{requestId}` `{language}` `{timeZoneId}` — each works as a JSON string (`"{orderNumber}"`) or as a bare number (`{quantity}`), and a value containing a quote is escaped rather than allowed to break the body. **Start from the fields above** drops in the body the structured form would have produced, and **Check it** parses it with the placeholders filled in and shows exactly what would go on the wire. A body that does not parse is reported as a failed call for that request and **never sent** — with the text that failed, so the mistake is visible.
+
 The **envelope** around those params is editable too (v1.13.1): **`columns`** (comma-separated, e.g. `operation.id, operation.ordertype`), the **`requestId`** MPDV echoes back, and **`returnAsObject`** — set per request, so the order and each arm can differ. `language` and `timeZoneId` were already editable. A requestId left unusable falls back to the counter that numbers the calls within a send, and blank entries in `columns` are dropped, so nothing typed into those boxes can produce a malformed body.
 
 The two arms ship with **different** operation numbers (`0010` and `0020`): MPDV refuses a second operation that reuses a number already on the order, answering return code **1669, "Data are already available"**. An install that still had both on `0010` is moved once on upgrade, and a number set deliberately afterwards is left alone. The deadline used to be a setting of its own; on upgrade it becomes the order's first row, so what an install already had keeps being sent — including a setup published by an older version.
@@ -114,8 +116,8 @@ Authentication is HTTP Basic. All admin configuration (products, stations, price
 ## Download
 
 Grab the latest installers from the [Releases page](../../releases):
-- **Windows** — `GradionShop-Setup-1.15.0.exe`
-- **macOS** — `GradionShop-1.15.0.dmg`
+- **Windows** — `GradionShop-Setup-1.16.0.exe`
+- **macOS** — `GradionShop-1.16.0.dmg`
 
 ## Development
 

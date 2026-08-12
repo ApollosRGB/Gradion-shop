@@ -175,6 +175,49 @@ function mpdvAutoRowsHtml(fields) {
 // The envelope MPDV wraps every request in: which columns to ask back, the id
 // it echoes, and whether the answer is an object. Fixed until now, so a site
 // wanting columns returned or returnAsObject false needed a new build.
+// A body of the shape MPDV answers with the fields it created, offered as a
+// starting point because getting an id and an ordertype back is the usual
+// reason for reaching for this at all.
+const MPDV_RAW_EXAMPLE = `{
+  "params" : [ {
+    "acronym" : "operation.ordertype",
+    "value" : "GR",
+    "operator" : "EQUAL"
+  } ],
+  "columns" : [ "operation.id", "operation.ordertype", "operation.plan.yield.primary" ],
+  "requestId" : 1,
+  "language" : "de",
+  "timeZoneId" : "Asia/Singapore",
+  "returnAsObject" : false
+}`;
+
+// The whole request body, typed by hand. The fields above build the order the
+// shop normally sends; this is for the one it will not build — a vendor test
+// wanting another `ordertype`, other columns back, or params the app fills in
+// itself. What is typed here is what goes on the wire.
+function mpdvRawHtml(scope, raw, sample) {
+  const on = !!(raw && raw.enabled);
+  return `
+    <div class="raw-block">
+      <label class="switch">
+        <input type="checkbox" data-mraw="${scope}" data-f="enabled" ${on ? 'checked' : ''}>
+        <b>Send my own JSON for this request</b>
+      </label>
+      <div class="raw-body ${on ? '' : 'hidden'}" data-raw-body="${scope}">
+        <div class="handover-warn">⚠️ While this is on, everything set above for this request is ignored — including the order id, ordertype and quantity the app normally fills in. Use the placeholders below to put them back.</div>
+        <textarea class="inp mono" data-mraw="${scope}" data-f="body" rows="14" spellcheck="false"
+          placeholder='{ "params": [ … ], "columns": [ … ], "requestId": 1, "language": "de", "timeZoneId": "Asia/Singapore", "returnAsObject": false }'>${escapeHtml((raw && raw.body) || '')}</textarea>
+        <div class="raw-actions">
+          <button class="chip-btn" data-raw-fill="${scope}">Start from the fields above</button>
+          <button class="chip-btn" data-raw-check="${scope}">Check it</button>
+          <span class="fld-hint">Placeholders: <code>{orderNumber}</code> <code>{quantity}</code> <code>{orderType}</code> <code>{productName}</code> <code>{requestId}</code> <code>{language}</code> <code>{timeZoneId}</code> — each works as a JSON string (<code>"{orderNumber}"</code>) or as a bare number (<code>{quantity}</code>).</span>
+        </div>
+        <div class="raw-verdict" data-raw-verdict="${scope}"></div>
+        ${sample ? `<details class="mpdv-log-raw"><summary>An example body</summary><pre>${escapeHtml(sample)}</pre></details>` : ''}
+      </div>
+    </div>`;
+}
+
 function mpdvEnvelopeHtml(scope, columns, requestId, returnAsObject, defaultId) {
   return `
     <div class="env-row">
@@ -4011,6 +4054,7 @@ function renderAdminSettings() {
       ${mpdvFieldRowsHtml(m.orderFields || [], 'order', 'order.article')}
       <button class="chip-btn" data-mf-add="order">+ Add field</button>
       ${mpdvEnvelopeHtml('order', m.orderColumns, m.orderRequestId, m.orderReturnAsObject, 1)}
+      ${mpdvRawHtml('order', m.orderRaw, MPDV_RAW_EXAMPLE)}
       <h3 style="margin:22px 0 6px;">Operations — one per arm</h3>
       <p class="hint">Sent against the order after it exists, both of them, every time. The boxes in each row are the identity of the operation; the rows underneath are the rest of what it carries — the formulas, their modes and the cycle target — sent exactly as supplied.</p>
       ${(m.operations || []).map((op, i) => `
@@ -4035,6 +4079,7 @@ function renderAdminSettings() {
             ${mpdvFieldRowsHtml(op.fields || [], 'op:' + i, 'operation.cycle.target')}
             <button class="chip-btn" data-mf-add="op:${i}">+ Add field</button>
             ${mpdvEnvelopeHtml('op:' + i, op.columns, op.requestId, op.returnAsObject, 7)}
+            ${mpdvRawHtml('op:' + i, op.raw, MPDV_RAW_EXAMPLE)}
           </div>
         </div>`).join('')}
       ${(m.operations || []).length === 2 && m.operations[0].operation === m.operations[1].operation
@@ -4225,6 +4270,7 @@ function renderAdminSettings() {
     operations.forEach((op, i) => {
       op.fields = readMpdvFieldRows('op:' + i);
       Object.assign(op, readMpdvEnvelope('op:' + i, 7));
+      op.raw = readMpdvRaw('op:' + i);
     });
     const orderEnvelope = readMpdvEnvelope('order', 1);
     return {
@@ -4239,8 +4285,15 @@ function renderAdminSettings() {
       orderColumns: orderEnvelope.columns,
       orderRequestId: orderEnvelope.requestId,
       orderReturnAsObject: orderEnvelope.returnAsObject,
+      orderRaw: readMpdvRaw('order'),
       operations
     };
+  };
+  // The raw body is kept exactly as typed — no trimming, no reformatting.
+  const readMpdvRaw = (scope) => {
+    const box = $(`[data-mraw="${scope}"][data-f="body"]`);
+    const on = $(`[data-mraw="${scope}"][data-f="enabled"]`);
+    return { enabled: !!(on && on.checked), body: box ? box.value : '' };
   };
   // Adding or removing a row redraws the panel, so keep what is typed but not
   // yet saved — otherwise a half-filled form would be lost to a "+ Add field".
@@ -4253,6 +4306,52 @@ function renderAdminSettings() {
     store.settings.mpdv = cfg;
     renderAdmin();
   };
+  // ---- the raw request bodies ----
+  const rawBox = (scope) => $(`[data-mraw="${scope}"][data-f="body"]`);
+  const rawVerdict = (scope, html) => {
+    const host = $(`[data-raw-verdict="${scope}"]`);
+    if (host) host.innerHTML = html;
+  };
+  $$('[data-mraw][data-f="enabled"]', body).forEach((el) => el.addEventListener('change', () => {
+    // Showing the editor rather than redrawing the panel: a redraw would throw
+    // away whatever else is half-typed in this form.
+    const host = $(`[data-raw-body="${el.dataset.mraw}"]`);
+    if (host) host.classList.toggle('hidden', !el.checked);
+  }));
+  const fillRawFromFields = async (scope) => {
+    const box = rawBox(scope);
+    if (!box) return;
+    // The preview always builds from the fields, never from the raw editor, so
+    // this shows what the structured form would have sent.
+    const preview = await window.api.mpdvPreview(readMpdvForm());
+    const built = scope === 'order'
+      ? preview.payload
+      : ((preview.operationPayloads || [])[Number(scope.slice(3))] || {}).payload;
+    if (!built) { toast('Nothing to copy for that request.', 'error'); return; }
+    box.value = JSON.stringify(built, null, 2);
+    rawVerdict(scope, '<span class="fld-hint">Filled in from the fields above. The order number in it is a real one — swap it for <code>{orderNumber}</code> if every order should get its own.</span>');
+  };
+  $$('[data-raw-fill]', body).forEach((el) => el.addEventListener('click', () => {
+    const scope = el.dataset.rawFill;
+    const box = rawBox(scope);
+    if (box && box.value.trim()) {
+      confirmModal('Replace what is in the editor?',
+        'The body the fields above produce will overwrite what is typed here.',
+        () => fillRawFromFields(scope));
+    } else {
+      fillRawFromFields(scope);
+    }
+  }));
+  $$('[data-raw-check]', body).forEach((el) => el.addEventListener('click', async () => {
+    const scope = el.dataset.rawCheck;
+    const box = rawBox(scope);
+    if (!box) return;
+    const res = await window.api.mpdvCheckRaw(box.value);
+    rawVerdict(scope, res.ok
+      ? `<div class="raw-ok">✅ Valid JSON. This is what would be sent:</div><pre>${escapeHtml(res.preview)}</pre>`
+      : `<div class="mpdv-log-err">❌ ${escapeHtml(res.error)}</div>`);
+  }));
+
   $$('[data-mf-add]', body).forEach((el) => el.addEventListener('click', () =>
     editMpdvFields(el.dataset.mfAdd, (list) => list.push({ acronym: '', value: '' }))));
   $$('[data-mf-del]', body).forEach((el) => el.addEventListener('click', () =>

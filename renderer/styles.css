@@ -689,3 +689,27 @@ select.inp option:disabled { color: var(--text-muted); }
 }
 .env-row .switch { font-size: 13px; font-weight: 600; color: var(--text-muted); }
 .env-row .inp { padding: 4px 8px; font-size: 13px; }
+
+/* MPDV — the whole request body, typed by hand */
+.raw-block {
+  margin-top: 10px; padding: 10px;
+  border-top: 1px dashed var(--border);
+}
+.raw-block > .switch { font-size: 13px; color: var(--text); }
+.raw-body { margin-top: 10px; }
+.raw-body .mono {
+  width: 100%; resize: vertical;
+  font-family: ui-monospace, "SFMono-Regular", Consolas, monospace;
+  font-size: 13px; line-height: 1.5;
+}
+.raw-actions {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-top: 8px;
+}
+.raw-actions .fld-hint { flex: 1 1 260px; margin: 0; }
+.raw-verdict { margin-top: 8px; font-size: 13px; }
+.raw-verdict pre {
+  margin: 6px 0 0; padding: 10px; border-radius: 10px; overflow-x: auto;
+  background: var(--surface-2); border: 1px solid var(--border); font-size: 12px;
+}
+.raw-ok { color: #1e6f30; font-weight: 600; }
+:root[data-theme="dark"] .raw-ok { color: #7ee08f; }

@@ -61,12 +61,23 @@ function normalizeMpdvFields(mpdv, saved) {
   mpdv.orderColumns = cleanMpdvColumns(mpdv.orderColumns);
   mpdv.orderRequestId = cleanMpdvRequestId(mpdv.orderRequestId, 1);
   mpdv.orderReturnAsObject = mpdv.orderReturnAsObject !== false;
+  mpdv.orderRaw = cleanMpdvRaw(mpdv.orderRaw);
   (mpdv.operations || []).forEach((op) => {
     op.fields = cleanMpdvFields(Array.isArray(op.fields) ? op.fields : defaultMpdvOperationFields());
     op.columns = cleanMpdvColumns(op.columns);
     op.requestId = cleanMpdvRequestId(op.requestId, 7);
     op.returnAsObject = op.returnAsObject !== false;
+    op.raw = cleanMpdvRaw(op.raw);
   });
+}
+
+// The operator's own JSON for one request. Kept verbatim — it is theirs, and
+// reformatting what someone typed to send to a vendor helps nobody.
+function cleanMpdvRaw(raw) {
+  return {
+    enabled: !!(raw && raw.enabled),
+    body: raw && raw.body != null ? String(raw.body) : ''
+  };
 }
 
 // The arms in the cell. They share one broker but each has its own topics, so a
@@ -914,6 +925,77 @@ function buildMpdvOperationPayload(cfg, orderNumber, op, quantity, requestId) {
     timeZoneId: cfg.timeZoneId || 'Asia/Singapore',
     returnAsObject: op.returnAsObject !== false
   };
+}
+
+// ---------------------------------------------------------------------------
+// Raw request bodies
+//
+// The structured editor covers the order the shop normally sends, but a vendor
+// test may need a body it will not produce — a different `ordertype`, columns
+// asking for other fields back, params the app fills in itself. Raw mode sends
+// exactly what was typed, with placeholders for the few values that can only be
+// known per order.
+// ---------------------------------------------------------------------------
+
+const MPDV_RAW_PLACEHOLDERS = [
+  'orderNumber', 'quantity', 'orderType', 'productName', 'requestId', 'language', 'timeZoneId'
+];
+
+// Substituted into the text *before* it is parsed, so a placeholder works both
+// as a JSON string ("{orderNumber}") and as a bare number ({quantity}). Strings
+// are escaped, so a product name containing a quote cannot break the JSON.
+function renderMpdvRaw(template, values) {
+  return String(template == null ? '' : template).replace(/\{(\w+)\}/g, (match, key) => {
+    if (!Object.prototype.hasOwnProperty.call(values, key)) return match;
+    const value = values[key];
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+    return JSON.stringify(String(value == null ? '' : value)).slice(1, -1);
+  });
+}
+
+function mpdvRawEnabled(raw) {
+  return !!(raw && raw.enabled && String(raw.body || '').trim());
+}
+
+// A body that does not parse is a configuration mistake, so it is reported as
+// one instead of being sent as text MPDV would only reject.
+function buildMpdvRawBody(raw, values) {
+  const text = renderMpdvRaw(raw.body, values);
+  try {
+    return { ok: true, body: JSON.parse(text) };
+  } catch (e) {
+    return { ok: false, error: `The JSON typed for this request is not valid: ${e.message}`, text };
+  }
+}
+
+// What actually goes on the wire for the order: the operator's own JSON when
+// raw mode is on, otherwise the body built from the fields.
+function mpdvOrderBody(cfg, orderNumber, orderType, quantity, requestId, productName) {
+  const values = {
+    orderNumber,
+    quantity: mpdvQuantity(quantity),
+    orderType: String(orderType == null ? '0' : orderType),
+    productName: productName || '',
+    requestId: cleanMpdvRequestId(cfg.orderRequestId, Number(requestId) > 0 ? Number(requestId) : 1),
+    language: cfg.language || 'en',
+    timeZoneId: cfg.timeZoneId || 'Asia/Singapore'
+  };
+  if (mpdvRawEnabled(cfg.orderRaw)) return buildMpdvRawBody(cfg.orderRaw, values);
+  return { ok: true, body: buildMpdvOrderPayload(cfg, orderNumber, orderType, quantity, requestId) };
+}
+
+function mpdvOperationBody(cfg, orderNumber, op, quantity, requestId, productName, orderType) {
+  const values = {
+    orderNumber,
+    quantity: mpdvQuantity(quantity),
+    orderType: String(orderType == null ? '0' : orderType),
+    productName: productName || '',
+    requestId: cleanMpdvRequestId(op.requestId, Number(requestId) > 0 ? Number(requestId) : 7),
+    language: cfg.language || 'en',
+    timeZoneId: cfg.timeZoneId || 'Asia/Singapore'
+  };
+  if (mpdvRawEnabled(op.raw)) return buildMpdvRawBody(op.raw, values);
+  return { ok: true, body: buildMpdvOperationPayload(cfg, orderNumber, op, quantity, requestId) };
 }
 
 function mpdvRequest(cfg, body, endpoint) {
@@ -2109,17 +2191,27 @@ function registerIpc() {
         continue;
       }
 
+      // A request whose own JSON does not parse never reaches MPDV: it is
+      // reported exactly where a rejection would have been.
+      const unsendable = (kind, label, verdict) => ({
+        kind, label, ok: false, status: 0, attempt: 1,
+        error: verdict.error, createdId: null, response: '', request: verdict.text || ''
+      });
+
       // The order has to exist before an operation can reference its id
-      const orderCall = await send(
-        buildMpdvOrderPayload(cfg, orderNumber, line.orderType, quantity, requestId++),
-        'BOOrder', 'Order');
+      const orderBody = mpdvOrderBody(cfg, orderNumber, line.orderType, quantity, requestId++, line.name);
+      const orderCall = orderBody.ok
+        ? await send(orderBody.body, 'BOOrder', 'Order')
+        : unsendable('order', 'Order', orderBody);
       const calls = [orderCall];
 
       if (orderCall.ok) {
         for (const op of cfg.operations || []) {
-          calls.push(await send(
-            buildMpdvOperationPayload(cfg, orderNumber, op, quantity, requestId++),
-            'BOOperation', op.label || op.workplace || 'Operation'));
+          const label = op.label || op.workplace || 'Operation';
+          const opBody = mpdvOperationBody(cfg, orderNumber, op, quantity, requestId++, line.name, line.orderType);
+          calls.push(opBody.ok
+            ? await send(opBody.body, 'BOOperation', label)
+            : unsendable('operation', label, opBody));
         }
       }
 
@@ -2256,12 +2348,45 @@ function registerIpc() {
       remainingToday: Math.max(0, MPDV_MAX_ORDERS_PER_DAY - (counter.date === key ? Number(counter.seq) || 0 : 0)),
       orderUrl: mpdvUrl(cfg, 'BOOrder'),
       operationUrl: mpdvUrl(cfg, 'BOOperation'),
+      // What would actually go out — the operator's own JSON where raw mode is
+      // on, so the preview never shows a body that is not the one being sent.
       payload: buildMpdvOrderPayload(cfg, orderNumber, '0', 1, 1),
       operationPayloads: (cfg.operations || []).map((op, i) => ({
         label: op.label || op.workplace,
         payload: buildMpdvOperationPayload(cfg, orderNumber, op, 1, 7 + i)
-      }))
+      })),
+      raw: {
+        placeholders: MPDV_RAW_PLACEHOLDERS,
+        order: mpdvRawEnabled(cfg.orderRaw)
+          ? mpdvOrderBody(cfg, orderNumber, '0', 1, 1, 'Example product')
+          : null,
+        operations: (cfg.operations || []).map((op, i) => (mpdvRawEnabled(op.raw)
+          ? mpdvOperationBody(cfg, orderNumber, op, 1, 7 + i, 'Example product', '0')
+          : null))
+      }
     };
+  });
+
+  // Checks one raw body without sending anything: does it parse once the
+  // placeholders are filled in, and what comes out the other side?
+  ipcMain.handle('mpdv:checkRaw', (_ev, body) => {
+    const store = loadStore();
+    const cfg = store.settings.mpdv || {};
+    const key = mpdvDateKey(cfg.timeZoneId);
+    const counter = store.mpdvCounter || { date: '', seq: 0 };
+    const seq = (counter.date === key ? Number(counter.seq) || 0 : 0) + 1;
+    const verdict = buildMpdvRawBody({ body }, {
+      orderNumber: formatMpdvOrderNumber(key, Math.min(seq, MPDV_MAX_ORDERS_PER_DAY)),
+      quantity: 1,
+      orderType: '0',
+      productName: 'Example product',
+      requestId: 1,
+      language: cfg.language || 'en',
+      timeZoneId: cfg.timeZoneId || 'Asia/Singapore'
+    });
+    return verdict.ok
+      ? { ok: true, preview: JSON.stringify(verdict.body, null, 2) }
+      : { ok: false, error: verdict.error, text: verdict.text };
   });
 
   ipcMain.handle('mpdv:log', () => (loadStore().mpdvLog || []).slice(0, 20));
@@ -2649,6 +2774,11 @@ module.exports = {
   mpdvUrl,
   buildMpdvOrderPayload,
   buildMpdvOperationPayload,
+  mpdvOrderBody,
+  mpdvOperationBody,
+  renderMpdvRaw,
+  buildMpdvRawBody,
+  cleanMpdvRaw,
   defaultMpdvOperationFields,
   mpdvFieldValue,
   mpdvExtraParams,

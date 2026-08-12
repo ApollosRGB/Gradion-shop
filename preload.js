@@ -19,6 +19,7 @@ contextBridge.exposeInMainWorld('api', {
   syncOpenTokenPage: () => ipcRenderer.invoke('sync:openTokenPage'),
   mpdvCreateOrders: (payload) => ipcRenderer.invoke('mpdv:createOrders', payload),
   mpdvPreview: (cfg) => ipcRenderer.invoke('mpdv:preview', cfg),
+  mpdvCheckRaw: (body) => ipcRenderer.invoke('mpdv:checkRaw', body),
   mpdvLog: () => ipcRenderer.invoke('mpdv:log'),
   mpdvClearLog: () => ipcRenderer.invoke('mpdv:clearLog'),
   mpdvRuns: () => ipcRenderer.invoke('mpdv:runs'),
