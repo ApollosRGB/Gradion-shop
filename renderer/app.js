@@ -210,7 +210,7 @@ function mpdvRawHtml(scope, raw, sample) {
         <div class="raw-actions">
           <button class="chip-btn" data-raw-fill="${scope}">Start from the fields above</button>
           <button class="chip-btn" data-raw-check="${scope}">Check it</button>
-          <span class="fld-hint">Placeholders: <code>{orderNumber}</code> <code>{quantity}</code> <code>{orderType}</code> <code>{productName}</code> <code>{requestId}</code> <code>{language}</code> <code>{timeZoneId}</code> — each works as a JSON string (<code>"{orderNumber}"</code>) or as a bare number (<code>{quantity}</code>).</span>
+          <span class="fld-hint">Placeholders: <code>{orderNumber}</code> <code>{quantity}</code> <code>{orderType}</code> <code>{productName}</code> <code>{requestId}</code> <code>{language}</code> <code>{timeZoneId}</code> — each works as a JSON string (<code>"{orderNumber}"</code>) or as a bare number (<code>{quantity}</code>). <code>//</code> and <code>/* */</code> comments and trailing commas are allowed here; they are stripped before sending.</span>
         </div>
         <div class="raw-verdict" data-raw-verdict="${scope}"></div>
         ${sample ? `<details class="mpdv-log-raw"><summary>An example body</summary><pre>${escapeHtml(sample)}</pre></details>` : ''}
@@ -4347,8 +4347,9 @@ function renderAdminSettings() {
     const box = rawBox(scope);
     if (!box) return;
     const res = await window.api.mpdvCheckRaw(box.value);
+    const warnings = (res.warnings || []).map((w) => `<div class="handover-warn">⚠️ ${escapeHtml(w)}</div>`).join('');
     rawVerdict(scope, res.ok
-      ? `<div class="raw-ok">✅ Valid JSON. This is what would be sent:</div><pre>${escapeHtml(res.preview)}</pre>`
+      ? `<div class="raw-ok">✅ Valid. This is what would be sent:</div>${warnings}<pre>${escapeHtml(res.preview)}</pre>`
       : `<div class="mpdv-log-err">❌ ${escapeHtml(res.error)}</div>`);
   }));
 

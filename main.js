@@ -957,12 +957,95 @@ function mpdvRawEnabled(raw) {
   return !!(raw && raw.enabled && String(raw.body || '').trim());
 }
 
+// Bodies are pasted from vendor documentation and from a colleague's notes, and
+// those arrive annotated: `// this must be unique` beside a field, a trailing
+// comma left behind by a deleted line. None of that is JSON, but refusing it
+// would mean hand-editing every sample before it can be tried. Both are removed
+// here — with a scanner rather than a regular expression, so a `//` inside a
+// string (a URL, say) is left exactly where it is. The comments are ours alone:
+// what reaches MPDV is the parsed body.
+function stripJsonComments(text) {
+  let out = '';
+  let inString = false, escaped = false, inLine = false, inBlock = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    const next = text[i + 1];
+    if (inLine) {
+      if (c === '\n') { inLine = false; out += c; }
+      continue;
+    }
+    if (inBlock) {
+      if (c === '*' && next === '/') { inBlock = false; i++; }
+      else if (c === '\n') out += c;          // keep the line numbering honest
+      continue;
+    }
+    if (inString) {
+      out += c;
+      if (escaped) escaped = false;
+      else if (c === '\\') escaped = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') { inString = true; out += c; continue; }
+    if (c === '/' && next === '/') { inLine = true; i++; continue; }
+    if (c === '/' && next === '*') { inBlock = true; i++; continue; }
+    out += c;
+  }
+  return out;
+}
+
+// A comma with nothing after it but a closing brace or bracket. Strings are
+// skipped for the same reason as above.
+function stripTrailingCommas(text) {
+  let out = '';
+  let inString = false, escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inString) {
+      out += c;
+      if (escaped) escaped = false;
+      else if (c === '\\') escaped = true;
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') { inString = true; out += c; continue; }
+    if (c === ',') {
+      let j = i + 1;
+      while (j < text.length && /\s/.test(text[j])) j++;
+      if (text[j] === '}' || text[j] === ']') continue;   // drop the comma
+    }
+    out += c;
+  }
+  return out;
+}
+
+function parseLooseJson(text) {
+  return JSON.parse(stripTrailingCommas(stripJsonComments(text)));
+}
+
+// Nothing here stops a body being sent — it is about what happens on the
+// *second* send. Checked against the text as typed rather than the filled-in
+// body, because a placeholder is exactly what stops the id repeating.
+function mpdvRawWarnings(rawText, body) {
+  const warnings = [];
+  const params = body && Array.isArray(body.params) ? body.params : [];
+  const id = params.find((p) => p && p.acronym === 'order.id');
+  if (id && !/\{orderNumber\}/.test(String(rawText || ''))) {
+    warnings.push(`Every order sent with this body would carry the id "${id.value}". MPDV keeps order ids unique, so the next one is refused as a duplicate — put {orderNumber} in that value to give each send its own.`);
+  }
+  const quantity = params.find((p) => p && p.acronym === 'order.plan.yield.base');
+  if (quantity && !/\{quantity\}/.test(String(rawText || ''))) {
+    warnings.push(`The planned yield is fixed at ${JSON.stringify(quantity.value)}, so what the customer ordered is ignored — use {quantity} if it should follow the cart.`);
+  }
+  return warnings;
+}
+
 // A body that does not parse is a configuration mistake, so it is reported as
 // one instead of being sent as text MPDV would only reject.
 function buildMpdvRawBody(raw, values) {
   const text = renderMpdvRaw(raw.body, values);
   try {
-    return { ok: true, body: JSON.parse(text) };
+    return { ok: true, body: parseLooseJson(text) };
   } catch (e) {
     return { ok: false, error: `The JSON typed for this request is not valid: ${e.message}`, text };
   }
@@ -2385,7 +2468,7 @@ function registerIpc() {
       timeZoneId: cfg.timeZoneId || 'Asia/Singapore'
     });
     return verdict.ok
-      ? { ok: true, preview: JSON.stringify(verdict.body, null, 2) }
+      ? { ok: true, preview: JSON.stringify(verdict.body, null, 2), warnings: mpdvRawWarnings(body, verdict.body) }
       : { ok: false, error: verdict.error, text: verdict.text };
   });
 
