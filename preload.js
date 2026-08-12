@@ -21,8 +21,13 @@ contextBridge.exposeInMainWorld('api', {
   mpdvPreview: (cfg) => ipcRenderer.invoke('mpdv:preview', cfg),
   mpdvLog: () => ipcRenderer.invoke('mpdv:log'),
   mpdvClearLog: () => ipcRenderer.invoke('mpdv:clearLog'),
+  mpdvRuns: () => ipcRenderer.invoke('mpdv:runs'),
+  mpdvSkipWait: (runId) => ipcRenderer.invoke('mpdv:skipWait', runId),
+  mpdvCancelRun: (runId) => ipcRenderer.invoke('mpdv:cancelRun', runId),
+  mpdvClearRuns: () => ipcRenderer.invoke('mpdv:clearRuns'),
   armTest: (arm) => ipcRenderer.invoke('arm:test', arm),
-  armTestPublish: (arm) => ipcRenderer.invoke('arm:testPublish', arm),
+  armTestPublish: (arm, armId) => ipcRenderer.invoke('arm:testPublish', arm, armId),
   armStatus: () => ipcRenderer.invoke('arm:status'),
-  onRelayChanged: (fn) => ipcRenderer.on('relay:changed', () => fn())
+  onRelayChanged: (fn) => ipcRenderer.on('relay:changed', () => fn()),
+  onMpdvRunsChanged: (fn) => ipcRenderer.on('mpdv:runsChanged', () => fn())
 });

@@ -101,6 +101,14 @@ function wireChrome() {
       if (currentView === 'admin' && adminTab === 'settings') refreshArmLog();
     });
   }
+  // The MPDV run supervisor lives in the main process too: it says when an AGV
+  // has arrived, when an arm was commanded and when it answered.
+  if (window.api.onMpdvRunsChanged) {
+    window.api.onMpdvRunsChanged(() => {
+      if (currentView === 'mpdv-result') refreshMpdvRuns();
+      if (currentView === 'admin' && adminTab === 'settings') refreshArmLog();
+    });
+  }
   $('#themeToggle').addEventListener('click', toggleTheme);
   $('#adminToggle').addEventListener('click', onAdminToggle);
   $('#modeBadge').addEventListener('click', () => showView('start'));
@@ -187,6 +195,49 @@ function mpdvFieldRowsHtml(rows, scope, placeholder) {
       <input class="inp" data-mf="${scope}" data-i="${i}" data-f="value"
              value="${escapeHtml(row.value == null ? '' : String(row.value))}" placeholder="value">
       <button class="row-del" data-mf-del="${scope}" data-i="${i}" title="Remove this field">✕</button>
+    </div>`).join('');
+}
+
+// One card per arm. The state topic is the one that matters — it is where the
+// arm says Finished — so it is named as such rather than hidden among the rest.
+function armCardsHtml(arms) {
+  if (!arms.length) return '<p class="hint">No arms are configured.</p>';
+  return arms.map((arm, i) => `
+    <div class="op-row">
+      <span class="chip">${escapeHtml(arm.label || arm.id)}</span>
+      <label class="inline-fld">name
+        <input class="inp" data-arm="${i}" data-f="label" value="${escapeHtml(arm.label || '')}" style="max-width:150px;">
+      </label>
+      <label class="inline-fld">command topic
+        <input class="inp" data-arm="${i}" data-f="commandTopic" value="${escapeHtml(arm.commandTopic || '')}" style="max-width:210px;">
+      </label>
+      <label class="inline-fld">state topic
+        <input class="inp" data-arm="${i}" data-f="stateTopic" value="${escapeHtml(arm.stateTopic || '')}" style="max-width:210px;">
+      </label>
+      <div class="op-fields">
+        <div class="field-row">
+          <label class="inline-fld">state field
+            <input class="inp" data-arm="${i}" data-f="stateField" value="${escapeHtml(arm.stateField || '')}" placeholder="state" style="max-width:110px;">
+          </label>
+          <label class="inline-fld">“Finished” value
+            <input class="inp" data-arm="${i}" data-f="doneValue" value="${escapeHtml(arm.doneValue || '')}" placeholder="Finished" style="max-width:120px;">
+          </label>
+          <label class="inline-fld">task-id field
+            <input class="inp" data-arm="${i}" data-f="matchField" value="${escapeHtml(arm.matchField || '')}" placeholder="task_id" style="max-width:120px;">
+          </label>
+          <label class="inline-fld">status topic (log only)
+            <input class="inp" data-arm="${i}" data-f="statusTopic" value="${escapeHtml(arm.statusTopic || '')}" placeholder="(optional)" style="max-width:210px;">
+          </label>
+        </div>
+        <label class="fld full">Command payload
+          <textarea class="inp" data-arm="${i}" data-f="payloadTemplate" rows="5" spellcheck="false">${escapeHtml(arm.payloadTemplate || '')}</textarea>
+          <span class="fld-hint">Placeholders: <code>{taskId}</code> <code>{method}</code> <code>{quantity}</code> <code>{from}</code> <code>{to}</code> <code>{orderId}</code> <code>{orderNumber}</code> <code>{productName}</code> <code>{unitId}</code> <code>{transferId}</code> — rename the JSON fields to whatever this arm expects.</span>
+        </label>
+        <div class="progress-actions" style="margin-top:6px; align-items:center; flex-wrap:wrap;">
+          <button class="btn btn-secondary" data-arm-test="${i}">Send test command to ${escapeHtml(arm.label || arm.id)}</button>
+          <span class="fld-hint">⚠️ This moves the real arm.</span>
+        </div>
+      </div>
     </div>`).join('');
 }
 
@@ -529,12 +580,16 @@ function renderMpdvResult(results, total) {
           ? `Order no. <b>${escapeHtml(r.orderNumber)}</b>`
           : 'No order number was issued'}${mpdvCreatedIdNote(r)}</div>
         ${r.ok ? '' : `<div class="err-text">${escapeHtml(r.error || 'Rejected by MPDV')}</div>`}
+        ${r.armNote ? `<div class="tl-meta">🤝 ${escapeHtml(r.armNote)}</div>` : ''}
         ${mpdvCallsHtml(r)}
       </div>
       <div class="qty-lbl">Qty: ${r.quantity}${r.orderType != null ? `<div class="tl-meta">AGV ${escapeHtml(r.orderType)} — ${escapeHtml(mpdvAgvName(r.orderType))}</div>` : ''}</div>
     </div>`).join('');
 
   const allOk = okCount === results.length && results.length > 0;
+  // The runs this send started, so the panel below follows these orders and not
+  // whatever else the cell may still be finishing.
+  mpdvWatchedRunIds = results.filter((r) => r.run && r.run.id).map((r) => r.run.id);
   $('#mpdvResultWrap').innerHTML = `
     <div class="order-card" style="text-align:center;">
       <div style="font-size:56px;">${allOk ? '🏭' : okCount ? '⚠️' : '❌'}</div>
@@ -543,6 +598,7 @@ function renderMpdvResult(results, total) {
         : okCount ? 'Partly sent to production' : 'MPDV did not accept the order'}</h2>
       <p class="hint">${okCount} of ${results.length} line(s) reached MPDV.</p>
     </div>
+    <div id="mpdvRunsWrap"></div>
     <div class="order-items-card">
       <h3>Order lines</h3>
       ${rows}
@@ -555,6 +611,96 @@ function renderMpdvResult(results, total) {
       <button class="btn btn-primary" id="mpdvBackToShop">← Back to Shop</button>
     </div>`;
   $('#mpdvBackToShop').addEventListener('click', () => showView('shop'));
+  refreshMpdvRuns();
+}
+
+// ===========================================================================
+// MPDV — what the cell does once the order is in the MES
+//
+// The order and its operations are already created. From here the app watches
+// SYNAOS for the AGV reaching each hand-over station, commands that arm, and
+// waits for its Finished before the order moves on. All of it runs in the main
+// process, so this is only the window onto it.
+// ===========================================================================
+
+let mpdvWatchedRunIds = [];
+
+function mpdvRunStateText(state, armLabel, stationName) {
+  switch (state) {
+    case 'waiting-for-agv': return `waiting for an AGV to reach ${stationName || 'the station'}`;
+    case 'arm-running': return `${armLabel || 'the arm'} is working`;
+    case 'failed': return 'given up';
+    case 'done': return 'finished';
+    default: return state || '';
+  }
+}
+
+function mpdvStageRowHtml(stage, index, run) {
+  const isCurrent = index === run.index && run.state !== 'done' && run.state !== 'failed';
+  const mark = stage.state === 'done' ? '✅'
+    : stage.state === 'continued' ? '⚠️'
+      : isCurrent ? (run.state === 'arm-running' ? '🤖' : '⏳') : '○';
+  const where = `${escapeHtml(stage.stationName || stage.stationId || '')}${stage.action ? ` · ${escapeHtml(stage.action)}` : ''}`;
+  const detail = isCurrent
+    ? mpdvRunStateText(run.state, stage.armLabel, stage.stationName)
+    : stage.state === 'done' ? 'reported Finished'
+      : stage.state === 'continued' ? (stage.note || 'continued without a Finished')
+        : 'waiting its turn';
+  return `<div class="arm-log-row">
+    <span class="dir">${mark}</span>
+    <span class="msg"><b>${escapeHtml(stage.armLabel || stage.armId)}</b> at ${where} — ${escapeHtml(detail)}</span>
+  </div>`;
+}
+
+function mpdvRunCardHtml(run) {
+  const stages = (run.stages || []).map((s, i) => mpdvStageRowHtml(s, i, run)).join('');
+  const busy = run.state === 'waiting-for-agv' || run.state === 'arm-running';
+  const head = run.state === 'done' ? '✅ The cell has finished this order'
+    : run.state === 'failed' ? '⚠️ Given up on this order'
+      : `⏳ Stage ${run.index + 1} of ${(run.stages || []).length} — ${mpdvRunStateText(run.state, ((run.stages || [])[run.index] || {}).armLabel, ((run.stages || [])[run.index] || {}).stationName)}`;
+  return `<div class="op-row" style="flex-direction:column;align-items:stretch;">
+    <div class="mpdv-call-head">
+      <b>Order ${escapeHtml(run.orderNumber || '')}</b>
+      <span class="chip">${escapeHtml(run.productName || '')}</span>
+      <span class="chip">Qty ${run.quantity}</span>
+    </div>
+    <div class="tl-meta" style="margin:4px 0 8px;">${escapeHtml(head)}</div>
+    ${stages}
+    ${run.lastError ? `<div class="mpdv-log-err">${escapeHtml(run.lastError)}</div>` : ''}
+    ${busy ? `<div class="progress-actions" style="margin-top:8px;flex-wrap:wrap;">
+      <button class="btn btn-secondary" data-run-skip="${escapeHtml(run.id)}">${run.state === 'arm-running' ? 'The arm is done — carry on' : 'The AGV is there — carry on'}</button>
+      <button class="link-btn danger" data-run-cancel="${escapeHtml(run.id)}">Stop watching this order</button>
+    </div>` : ''}
+  </div>`;
+}
+
+// Draws the runs this send started. Called again whenever the main process says
+// something moved, so the screen follows the cell without being asked.
+async function refreshMpdvRuns() {
+  const host = $('#mpdvRunsWrap');
+  if (!host) return;
+  let runs = [];
+  try { runs = await window.api.mpdvRuns(); } catch (e) { return; }
+  const mine = runs.filter((r) => mpdvWatchedRunIds.includes(r.id));
+  if (!host.isConnected) return;
+  if (!mine.length) { host.innerHTML = ''; return; }
+  host.innerHTML = `<div class="order-items-card">
+    <h3>In the cell</h3>
+    <p class="hint">The AGV has to reach the hand-over station before its arm is commanded; the order only moves on once that arm reports Finished.</p>
+    ${mine.map(mpdvRunCardHtml).join('')}
+  </div>`;
+  $$('[data-run-skip]', host).forEach((b) => b.addEventListener('click', async () => {
+    b.disabled = true;
+    const res = await window.api.mpdvSkipWait(b.dataset.runSkip);
+    if (!res.ok) toast(res.error || 'That run is no longer listed.', 'error');
+    refreshMpdvRuns();
+  }));
+  $$('[data-run-cancel]', host).forEach((b) => b.addEventListener('click', async () => {
+    b.disabled = true;
+    await window.api.mpdvCancelRun(b.dataset.runCancel);
+    toast('Stopped watching — the MPDV order itself is untouched.');
+    refreshMpdvRuns();
+  }));
 }
 
 // ===========================================================================
@@ -666,6 +812,33 @@ function isHandoverStep(step) {
   return step && step.kind === 'handover';
 }
 
+// The arms configured under Settings. Every hand-over names one of them, so a
+// route can send the Openmind arm to one station and the Kuka to another.
+function armList() {
+  const arms = ((store.settings || {}).arm || {}).arms;
+  return Array.isArray(arms) ? arms.filter((a) => a && a.id) : [];
+}
+
+// A hand-over that names no arm means the first one — that is what a route
+// written before there was more than one arm has always meant.
+function armDefFor(armId) {
+  const list = armList();
+  return list.find((a) => a.id === armId) || list[0] || null;
+}
+
+function armLabelFor(armId) {
+  const def = armDefFor(armId);
+  return def ? (def.label || def.id) : 'no arm configured';
+}
+
+function armPickerHtml(attr, index, selected) {
+  const list = armList();
+  if (!list.length) return '<span class="fld-hint">No arm is configured.</span>';
+  const chosen = (armDefFor(selected) || {}).id;
+  return `<select class="inp" ${attr}="${index}" style="max-width:170px;">${list.map((a) =>
+    `<option value="${escapeHtml(a.id)}" ${a.id === chosen ? 'selected' : ''}>${escapeHtml(a.label || a.id)}</option>`).join('')}</select>`;
+}
+
 // The robot's configured waiting spot, appended as a trailing MOVE so it parks
 // itself once its part of the route is done. Only possible when we know which
 // robot runs the leg — an unassigned leg is chosen by SYNAOS, so it has no home.
@@ -702,7 +875,13 @@ function buildLegsForUnit(product, index, orderQuantity) {
     // A hand-over is an instruction to the arm, not a SYNAOS milestone: it ends
     // the current leg and gates the next one.
     if (isHandoverStep(step)) {
-      pendingHandover = { method: step.method || 'grasp', quantity };
+      pendingHandover = {
+        method: step.method || 'grasp',
+        quantity,
+        // Which arm does it. Resolved here so a route naming an arm that has
+        // since been removed still falls back to a real one.
+        armId: (armDefFor(step.armId) || {}).id || ''
+      };
       return;
     }
     const { resourceId, fellBack } = resolveStepResource(product, step, index);
@@ -1309,6 +1488,7 @@ function renderAdminProducts() {
     <div class="panel">
       <h2>Jobs / Products</h2>
       <p class="hint">Each product maps to a SYNAOS transport job. Configure its milestones (station + action), price, image, and whether users can see it.</p>
+      ${isMpdv() ? '<p class="hint">In <b>MPDV</b> mode the order and its operations are what reach the MES — but the route is still read for its <b>hand-overs</b>: each one says which arm works at which station, and the order waits there for that arm to report Finished.</p>' : ''}
       <div class="admin-list">${list || '<p class="hint">No products yet.</p>'}</div>
       <button class="btn btn-primary" id="addProduct" style="margin-top:16px;">+ New job / product</button>
     </div>`;
@@ -1385,6 +1565,9 @@ function renderProductEditor(body) {
       <div class="step-editor-row handover-row">
         <span class="chip">${i + 1}</span>
         <span class="handover-label">🤝 Hand-over — robotic arm</span>
+        <label class="inline-fld">arm
+          ${armPickerHtml('data-ho-arm', i, s.armId)}
+        </label>
         <label class="inline-fld">method
           <input class="inp" data-ho-method="${i}" value="${escapeHtml(s.method || 'grasp')}" style="max-width:110px;">
         </label>
@@ -1412,7 +1595,7 @@ function renderProductEditor(body) {
   const previewLegs = buildLegsForUnit(p, 0, 1).legs;
   const legPreview = previewLegs.length > 1
     ? `<div class="leg-preview">This route will be sent as <b>${previewLegs.length} chained jobs</b>:
-        ${previewLegs.map((l, i) => `<div class="leg-line">${l.armBefore ? `<div class="leg-arm">🤝 arm: ${escapeHtml(l.armBefore.method)} × the ordered quantity — the next AGV waits for “${escapeHtml((store.settings.arm || {}).statusDoneValue || 'Finished')}”</div>` : ''}<span class="chip">Job ${i + 1}</span> <b>${escapeHtml(l.resourceId || 'SYNAOS decides')}</b> — ${escapeHtml(l.steps.map((x) => `${stationName(x.stationRef)}·${x.action}`).join(' → '))}${l.parkNode ? ` <span class="chip">then parks at ${escapeHtml(l.parkNode.id)}</span>` : ''}</div>`).join('')}
+        ${previewLegs.map((l, i) => `<div class="leg-line">${l.armBefore ? `<div class="leg-arm">🤝 ${escapeHtml(armLabelFor(l.armBefore.armId))}: ${escapeHtml(l.armBefore.method)} × the ordered quantity — the next AGV waits for “${escapeHtml((armDefFor(l.armBefore.armId) || {}).doneValue || 'Finished')}” on ${escapeHtml((armDefFor(l.armBefore.armId) || {}).stateTopic || 'its state topic')}</div>` : ''}<span class="chip">Job ${i + 1}</span> <b>${escapeHtml(l.resourceId || 'SYNAOS decides')}</b> — ${escapeHtml(l.steps.map((x) => `${stationName(x.stationRef)}·${x.action}`).join(' → '))}${l.parkNode ? ` <span class="chip">then parks at ${escapeHtml(l.parkNode.id)}</span>` : ''}</div>`).join('')}
         <span class="fld-hint">Each job starts only after the previous one has finished.</span>
       </div>`
     : '';
@@ -1420,11 +1603,18 @@ function renderProductEditor(body) {
   const issuesHtml = issues.length
     ? `<div class="handover-warn">⚠️ ${issues.join('<br>⚠️ ')}</div>`
     : '';
+  // In MPDV mode the hand-overs are the only part of the route the app acts on,
+  // so a route without one quietly commands no arm at all. Say so here rather
+  // than let it be discovered when an order runs and nothing happens.
+  const noHandoverHtml = isMpdv() && !(p.steps || []).some(isHandoverStep)
+    ? '<div class="handover-warn">⚠️ This product has no hand-over, so no arm is commanded while its MPDV order runs. Add one to say which arm works at which station.</div>'
+    : '';
 
   body.innerHTML = `
     <div class="panel">
       <h2>${p._new ? 'New job / product' : 'Edit job / product'}</h2>
       <p class="hint">Example: “Notebook” = KUKA moves to K2 (PICK) then K1 (DROP).</p>
+      ${noHandoverHtml}
       <div class="form-grid">
         <label class="fld full">Product name
           <input class="inp" id="f-name" value="${escapeHtml(p.name)}" placeholder="e.g. Mini Branded Notebook">
@@ -1514,6 +1704,10 @@ function renderProductEditor(body) {
   });
   $$('[data-ho-method]', body).forEach((el) => el.addEventListener('change', (e) => {
     p.steps[+el.dataset.hoMethod].method = e.target.value.trim() || 'grasp';
+    renderAdmin();
+  }));
+  $$('[data-ho-arm]', body).forEach((el) => el.addEventListener('change', (e) => {
+    p.steps[+el.dataset.hoArm].armId = e.target.value;
     renderAdmin();
   }));
   $('#f-pickimg').addEventListener('click', async () => {
@@ -2456,6 +2650,9 @@ function renderRecallEditor(body) {
       <div class="step-editor-row handover-row">
         <span class="chip">${i + 1}</span>
         <span class="handover-label">🤝 Hand-over — robotic arm</span>
+        <label class="inline-fld">arm
+          ${armPickerHtml('data-rc-ho-arm', i, s.armId)}
+        </label>
         <label class="inline-fld">method
           <input class="inp" data-rc-ho="${i}" value="${escapeHtml(s.method || 'grasp')}" style="max-width:110px;">
         </label>
@@ -2515,6 +2712,7 @@ function renderRecallEditor(body) {
   $$('[data-rc-action]', body).forEach((el) => el.addEventListener('change', (e) => { r.steps[+el.dataset.rcAction].action = e.target.value; renderAdmin(); }));
   $$('[data-rc-robot]', body).forEach((el) => el.addEventListener('change', (e) => { r.steps[+el.dataset.rcRobot].resourceId = e.target.value || STEP_INHERIT; renderAdmin(); }));
   $$('[data-rc-ho]', body).forEach((el) => el.addEventListener('change', (e) => { r.steps[+el.dataset.rcHo].method = e.target.value.trim() || 'grasp'; renderAdmin(); }));
+  $$('[data-rc-ho-arm]', body).forEach((el) => el.addEventListener('change', (e) => { r.steps[+el.dataset.rcHoArm].armId = e.target.value; renderAdmin(); }));
   $$('[data-rc-step-del]', body).forEach((el) => el.addEventListener('click', () => { r.steps.splice(+el.dataset.rcStepDel, 1); renderAdmin(); }));
   $('#rc-add-step').addEventListener('click', () => {
     r.steps.push({ stationRef: store.stations[0] ? store.stations[0].id : '', action: 'MOVE', resourceId: STEP_INHERIT });
@@ -3113,8 +3311,15 @@ async function refreshArmLog() {
       <code>${escapeHtml(l.topic)}</code><span class="msg">${escapeHtml(l.message)}</span></div>`).join('');
   const pend = (st.pending || []).map((p) =>
     `<div class="arm-log-row"><span class="dir">⏳</span><span class="msg">${escapeHtml(p.productName)} — leg ${p.leg}/${p.totalLegs}, ${escapeHtml(p.state)}${p.lastError ? ' — ' + escapeHtml(p.lastError) : ''}</span></div>`).join('');
+  const runs = (st.mpdvRuns || []).map((r) =>
+    `<div class="arm-log-row"><span class="dir">⏳</span><span class="msg">Order ${escapeHtml(r.orderNumber || '')} — ${escapeHtml(r.productName)}, stage ${r.stage}/${r.totalStages}: ${escapeHtml(mpdvRunStateText(r.state, r.armLabel, r.stationName))}${r.lastError ? ' — ' + escapeHtml(r.lastError) : ''}</span></div>`).join('');
+  const topics = (st.topics || []).length
+    ? `<div class="arm-log-title">Listening on</div><div class="arm-log-row"><span class="dir in">▼</span><code>${st.topics.map(escapeHtml).join('</code> <code>')}</code></div>`
+    : '';
   if (!host.isConnected) return;
   host.innerHTML = (pend ? `<div class="arm-log-title">Hand-overs in progress</div>${pend}` : '')
+    + (runs ? `<div class="arm-log-title">MPDV orders running</div>${runs}` : '')
+    + topics
     + (rows ? `<div class="arm-log-title">Recent MQTT traffic</div>${rows}` : '');
 }
 
@@ -3262,6 +3467,31 @@ function mpdvFromSetup(incoming) {
   return mpdv;
 }
 
+// A setup published before v1.14 describes a single arm, with its topics at the
+// top level and no state topic at all — that arm reported on a status topic.
+// Fold it into the first arm of the list, and derive the state topic from the
+// status one (…/status → …/state), which is how the cell names them.
+function armFromSetup(incoming) {
+  const arm = Object.assign({}, incoming || {});
+  const legacy = ['commandTopic', 'statusTopic', 'payloadTemplate', 'statusField', 'statusDoneValue', 'statusMatchField'];
+  if (!Array.isArray(arm.arms) && (arm.commandTopic || arm.statusTopic)) {
+    const status = String(arm.statusTopic || '').trim();
+    arm.arms = [{
+      id: 'openmind',
+      label: 'Openmind arm',
+      commandTopic: String(arm.commandTopic || '').trim(),
+      stateTopic: /\/status$/.test(status) ? status.replace(/\/status$/, '/state') : '',
+      statusTopic: status,
+      payloadTemplate: arm.payloadTemplate || '',
+      stateField: arm.statusField === 'status' ? 'state' : (arm.statusField || 'state'),
+      doneValue: arm.statusDoneValue || 'Finished',
+      matchField: arm.statusMatchField || 'task_id'
+    }];
+  }
+  legacy.forEach((key) => delete arm[key]);
+  return arm;
+}
+
 // Replaces what belongs to the shop and leaves what belongs to this machine:
 // its own orders, logs, counters, theme, chosen system and any password the
 // published file did not carry.
@@ -3283,7 +3513,7 @@ async function applySyncedConfig(config) {
 
   local.apiBaseUrl = incoming.apiBaseUrl || local.apiBaseUrl;
   local.apiUsername = incoming.apiUsername || local.apiUsername;
-  local.arm = Object.assign({}, local.arm, incoming.arm || {}, { password: secrets.armPassword || (local.arm || {}).password });
+  local.arm = Object.assign({}, local.arm, armFromSetup(incoming.arm), { password: secrets.armPassword || (local.arm || {}).password });
   local.mpdv = Object.assign({}, local.mpdv, mpdvFromSetup(incoming.mpdv), { password: secrets.mpdvPassword || (local.mpdv || {}).password });
   if (secrets.apiPassword) local.apiPassword = secrets.apiPassword;
   if (secrets.adminPassword) local.adminPassword = secrets.adminPassword;
@@ -3490,15 +3720,15 @@ function renderAdminSettings() {
       <button class="link-btn" id="clearMpdvLog">Clear log</button>
     </div>
     <div class="panel">
-      <h2>Robotic arm (MQTT)</h2>
-      <p class="hint">When a route changes robot, the arm moves the load between the two AGVs at the hand-over station. The receiving AGV's job is only created once the arm reports the transfer done.</p>
+      <h2>Robotic arms (MQTT)</h2>
+      <p class="hint">A hand-over in a route is done by one of these arms: the app publishes to that arm's command topic and nothing continues until the arm reports <b>Finished</b> on its state topic. In <b>SYNAOS</b> mode the receiving AGV's job is only created then; in <b>MPDV</b> mode the order only moves to its next stage then.</p>
       <label class="fld switch" style="margin-bottom:14px;">
-        <input type="checkbox" id="a-enabled" ${a.enabled ? 'checked' : ''}> Use the robotic arm for hand-overs
+        <input type="checkbox" id="a-enabled" ${a.enabled ? 'checked' : ''}> Use the robotic arms
       </label>
       <div class="form-grid">
         <label class="fld full">Broker URL
           <input class="inp" id="a-url" value="${escapeHtml(a.brokerUrl || '')}" placeholder="mqtt://192.168.1.50:1883">
-          <span class="fld-hint">mqtt:// · mqtts:// (TLS) · ws:// · wss:// are all supported.</span>
+          <span class="fld-hint">mqtt:// · mqtts:// (TLS) · ws:// · wss:// are all supported. All arms share this one broker.</span>
         </label>
         <label class="fld switch full">
           <input type="checkbox" id="a-tlsinsecure" ${a.tlsInsecure ? 'checked' : ''}> Don't validate the broker's TLS certificate
@@ -3510,36 +3740,31 @@ function renderAdminSettings() {
         <label class="fld">Password
           <input class="inp" id="a-pass" type="password" value="${escapeHtml(a.password || '')}" placeholder="(optional)">
         </label>
-        <label class="fld">Command topic
-          <input class="inp" id="a-cmd" value="${escapeHtml(a.commandTopic || '')}" placeholder="arm/command">
-        </label>
-        <label class="fld">Status topic
-          <input class="inp" id="a-stat" value="${escapeHtml(a.statusTopic || '')}" placeholder="arm/status">
-        </label>
-        <label class="fld full">Command payload
-          <textarea class="inp" id="a-tpl" rows="6" spellcheck="false">${escapeHtml(a.payloadTemplate || '')}</textarea>
-          <span class="fld-hint">Placeholders: <code>{from}</code> <code>{to}</code> <code>{orderId}</code> <code>{unitId}</code> <code>{transferId}</code> — rename the JSON fields to whatever the arm expects.</span>
-        </label>
-        <label class="fld">Status field
-          <input class="inp" id="a-sfield" value="${escapeHtml(a.statusField || '')}" placeholder="status">
-          <span class="fld-hint">JSON field to read. Leave blank to match the raw text.</span>
-        </label>
-        <label class="fld">“Finished” value
-          <input class="inp" id="a-sdone" value="${escapeHtml(a.statusDoneValue || '')}" placeholder="done">
-        </label>
-        <label class="fld">Transfer-id field
-          <input class="inp" id="a-smatch" value="${escapeHtml(a.statusMatchField || '')}" placeholder="transferId">
-          <span class="fld-hint">If the arm echoes this back, statuses are matched to the right transfer.</span>
-        </label>
-        <label class="fld">Timeout (seconds)
+        <label class="fld">Arm timeout (seconds)
           <input class="inp" id="a-timeout" type="number" min="5" step="5" value="${Number(a.timeoutSeconds) || 120}">
-          <span class="fld-hint">If the arm stays silent this long, the order continues anyway.</span>
+          <span class="fld-hint">If an arm stays silent this long during a SYNAOS hand-over, the order continues anyway.</span>
+        </label>
+      </div>
+      <h3 style="margin:22px 0 6px;">The arms</h3>
+      ${armCardsHtml(a.arms || [])}
+      <h3 style="margin:22px 0 6px;">MPDV — while the order runs</h3>
+      <p class="hint">In MPDV mode the app creates no AGV job, so it watches SYNAOS instead: when a milestone at the hand-over's station has finished, the AGV is there and that arm is commanded. The order and its operations are still created exactly as before — this is only what happens afterwards.</p>
+      <div class="form-grid">
+        <label class="fld switch full">
+          <input type="checkbox" id="a-mpdv-enabled" ${(a.mpdvWait || {}).enabled !== false ? 'checked' : ''}> Command the arms while an MPDV order runs
+        </label>
+        <label class="fld">Wait for the AGV (seconds)
+          <input class="inp" id="a-mpdv-arrival" type="number" min="30" step="30" value="${Number((a.mpdvWait || {}).arrivalTimeoutSeconds) || 1800}">
+          <span class="fld-hint">If no AGV reaches the station in this time the run is given up, and the arm is not commanded.</span>
+        </label>
+        <label class="fld">Wait for the arm (seconds)
+          <input class="inp" id="a-mpdv-arm" type="number" min="5" step="30" value="${Number((a.mpdvWait || {}).armTimeoutSeconds) || 600}">
+          <span class="fld-hint">If the arm stays silent this long the order moves on regardless, and the stage says so.</span>
         </label>
       </div>
       <div class="progress-actions" style="margin-top:16px; align-items:center; flex-wrap:wrap;">
         <button class="btn btn-secondary" id="saveArm">Save arm settings</button>
         <button class="btn btn-secondary" id="testArm">Test connection</button>
-        <button class="btn btn-secondary" id="testArmPub">Send test transfer</button>
         <span class="api-status" id="armStatus"><span class="dot"></span> Not tested</span>
       </div>
       <div id="armLog" class="arm-log"></div>
@@ -3747,19 +3972,32 @@ function renderAdminSettings() {
   showMpdvState();
 
   // ---- Robotic arm ----
+  // The arms are read back out of their cards, in the order they are shown, so
+  // what is saved is exactly what the operator is looking at.
+  const readArmsFromForm = () => {
+    const current = armList();
+    const out = current.map((arm) => Object.assign({}, arm));
+    $$('[data-arm]').forEach((el) => {
+      const i = +el.dataset.arm;
+      if (!out[i]) return;
+      const field = el.dataset.f;
+      out[i][field] = field === 'payloadTemplate' ? el.value : el.value.trim();
+    });
+    return out;
+  };
   const readArmForm = () => ({
     enabled: $('#a-enabled').checked,
     brokerUrl: $('#a-url').value.trim(),
     tlsInsecure: $('#a-tlsinsecure').checked,
     username: $('#a-user').value,
     password: $('#a-pass').value,
-    commandTopic: $('#a-cmd').value.trim(),
-    statusTopic: $('#a-stat').value.trim(),
-    payloadTemplate: $('#a-tpl').value,
-    statusField: $('#a-sfield').value.trim(),
-    statusDoneValue: $('#a-sdone').value.trim(),
-    statusMatchField: $('#a-smatch').value.trim(),
-    timeoutSeconds: parseInt($('#a-timeout').value, 10) || 120
+    timeoutSeconds: parseInt($('#a-timeout').value, 10) || 120,
+    arms: readArmsFromForm(),
+    mpdvWait: {
+      enabled: $('#a-mpdv-enabled').checked,
+      arrivalTimeoutSeconds: parseInt($('#a-mpdv-arrival').value, 10) || 1800,
+      armTimeoutSeconds: parseInt($('#a-mpdv-arm').value, 10) || 600
+    }
   });
   const armStatusEl = () => $('#armStatus');
   const showArmLog = refreshArmLog;
@@ -3768,22 +4006,26 @@ function renderAdminSettings() {
     store.settings.arm = Object.assign({}, store.settings.arm, readArmForm());
     await persist();
     toast('Arm settings saved', 'success');
+    renderAdmin();      // the hand-over pickers read their names from here
   });
+  $$('[data-arm-test]').forEach((btn) => btn.addEventListener('click', async () => {
+    const arm = readArmForm();
+    const def = (arm.arms || [])[+btn.dataset.armTest];
+    if (!def) return;
+    armStatusEl().innerHTML = `<span class="dot"></span> Commanding ${escapeHtml(def.label || def.id)}…`;
+    const res = await window.api.armTestPublish(arm, def.id);
+    armStatusEl().innerHTML = res.ok
+      ? (res.via === 'state'
+        ? `<span class="dot ok"></span> ${escapeHtml(def.label || def.id)} reported Finished`
+        : `<span class="dot bad"></span> Published, but ${escapeHtml(res.note || 'no Finished came back')}`)
+      : `<span class="dot bad"></span> ${escapeHtml(res.error || res.note || 'Failed')}`;
+    showArmLog();
+  }));
   $('#testArm').addEventListener('click', async () => {
     armStatusEl().innerHTML = '<span class="dot"></span> Connecting…';
     const res = await window.api.armTest(readArmForm());
     armStatusEl().innerHTML = res.ok
       ? `<span class="dot ok"></span> Connected${res.subscribed ? ' · subscribed to ' + escapeHtml(res.subscribed) : ''}`
-      : `<span class="dot bad"></span> ${escapeHtml(res.error || 'Failed')}`;
-    showArmLog();
-  });
-  $('#testArmPub').addEventListener('click', async () => {
-    armStatusEl().innerHTML = '<span class="dot"></span> Publishing test transfer…';
-    const res = await window.api.armTestPublish(readArmForm());
-    armStatusEl().innerHTML = res.ok
-      ? (res.via === 'status'
-        ? '<span class="dot ok"></span> Arm confirmed the transfer'
-        : `<span class="dot bad"></span> Published, but no confirmation (${escapeHtml(res.via)})`)
       : `<span class="dot bad"></span> ${escapeHtml(res.error || 'Failed')}`;
     showArmLog();
   });
