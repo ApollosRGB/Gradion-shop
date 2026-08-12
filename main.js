@@ -83,8 +83,13 @@ function cleanMpdvRaw(raw) {
 // The arms in the cell. They share one broker but each has its own topics, so a
 // route step can name the arm it needs. `stateTopic` is the one that matters:
 // the arm reports Finished there and nothing continues until it does.
+//
+// Neither arm's protocol is settled, so nothing about it is baked in: the
+// command word, the values that count as finished or failed, the field they
+// arrive in and every topic are all editable per arm (v1.17). The values here
+// are only what the arms speak today.
 function defaultArms() {
-  const template = '{\n  "task_id": "{taskId}",\n  "method": "{method}",\n  "quantity": {quantity}\n}';
+  const template = '{\n  "task_id": "{taskId}",\n  "method": "{command}",\n  "quantity": {quantity}\n}';
   return [
     {
       id: 'openmind',
@@ -92,11 +97,13 @@ function defaultArms() {
       commandTopic: 'Openmind/robot01/cmd',
       stateTopic: 'Openmind/robot01/state',
       statusTopic: 'Openmind/robot01/status',   // watched too, but only for the log
-      // Placeholders: {taskId} {method} {quantity} {from} {to} {orderId}
-      // {unitId} {transferId} {orderNumber} {productName}
+      // Placeholders: {taskId} {command} {method} {quantity} {from} {to}
+      // {orderId} {unitId} {transferId} {orderNumber} {productName}
       payloadTemplate: template,
-      stateField: 'state',        // JSON field to read ('' = match the raw text)
-      doneValue: 'Finished',      // the value that means this arm is done
+      command: 'grasp',           // what this arm is told to do; a route step may override it
+      stateField: 'state',        // JSON field(s) to read, comma-separated ('' = match the raw text)
+      doneValue: 'Finished',      // value(s) that mean this arm is done, comma-separated
+      errorValues: '',            // value(s) that mean it has given up — the wait ends at once
       matchField: 'task_id'       // field tying a state message back to our command
     },
     {
@@ -106,8 +113,10 @@ function defaultArms() {
       stateTopic: 'kuka/robot01/state',
       statusTopic: '',
       payloadTemplate: template,
+      command: 'grasp',
       stateField: 'state',
       doneValue: 'Finished',
+      errorValues: '',
       matchField: 'task_id'
     }
   ];
@@ -209,6 +218,8 @@ function defaultStore() {
     pendingRelays: [],
     pendingMpdvRuns: [],
     armConfigVersion: ARM_CONFIG_VERSION,
+    // A fresh install has no hand-over carrying the pre-v1.17 command
+    handoverCommandsMoved: true,
     products: [
       {
         id: 'p-pen',
@@ -308,6 +319,25 @@ function migrateArmsList(arm) {
   return true;
 }
 
+// v1.17 gave each arm its own command, with the route step's `method` demoted to
+// an override. Every hand-over ever added carries the old shipped `grasp`
+// though, so without this the arm's command would be overridden everywhere and
+// changing it would appear to do nothing. A step saying `grasp` was never a
+// choice — it is what the editor put there — so it is cleared once; anything
+// else the operator typed is left exactly as it is.
+const LEGACY_HANDOVER_METHOD = 'grasp';
+
+function migrateHandoverCommands(data) {
+  if (data.handoverCommandsMoved) return false;
+  [...(data.products || []), ...(data.recalls || [])].forEach((route) => {
+    ((route && route.steps) || []).forEach((step) => {
+      if (step && step.kind === 'handover' && step.method === LEGACY_HANDOVER_METHOD) step.method = '';
+    });
+  });
+  data.handoverCommandsMoved = true;
+  return true;
+}
+
 // Arms arrive from the admin form and from synced setups, so nothing is taken on
 // trust: an arm needs an id and at least one topic to be worth keeping.
 function normalizeArms(arm) {
@@ -324,8 +354,14 @@ function normalizeArms(arm) {
         stateTopic: String((raw && raw.stateTopic) || '').trim(),
         statusTopic: String((raw && raw.statusTopic) || '').trim(),
         payloadTemplate: raw && raw.payloadTemplate != null ? String(raw.payloadTemplate) : base.payloadTemplate,
+        // The command word and the values the arm answers with are the part of
+        // the protocol still being settled, so a blank one falls back to what
+        // the app ships rather than being taken as "no command" / "never done".
+        command: String((raw && raw.command) || '').trim() || base.command || 'grasp',
         stateField: raw && raw.stateField != null ? String(raw.stateField).trim() : base.stateField,
         doneValue: String((raw && raw.doneValue) || '').trim() || base.doneValue,
+        // An arm that reports no failure of its own simply has none listed here
+        errorValues: raw && raw.errorValues != null ? String(raw.errorValues).trim() : (base.errorValues || ''),
         matchField: raw && raw.matchField != null ? String(raw.matchField).trim() : base.matchField
       };
     })
@@ -444,6 +480,11 @@ function loadStore() {
     });
     data.recallLog = data.recallLog || [];
     data.orders = data.orders || [];
+    // v1.17 moved the command onto the arm; do this after products and recalls
+    // exist, since it is their hand-over steps that are being cleared.
+    if (migrateHandoverCommands(data) && storePath) {
+      try { saveStore(data); } catch (e) { /* read-only run; migration still applies in memory */ }
+    }
     return data;
   } catch (e) {
     return defaultStore();
@@ -656,18 +697,55 @@ function connectArm(arm) {
   });
 }
 
-// Whether a state message means this arm has finished. The field is configurable
-// because the arms need not speak the same JSON; `state` and `status` are both
-// tried when the configured field is absent, and a bare word is matched as text.
-function messageIsDone(def, body, text) {
-  const doneValue = String((def && def.doneValue) || 'Finished').trim().toLowerCase();
-  if (!doneValue) return false;
+// One configured box of values into a list. Written as `Finished, Done, 2`,
+// because an arm whose wording is not settled may end up answering with any of
+// several — and asking an operator for one exact word would be a promise the
+// integration cannot keep.
+function armValueList(raw) {
+  return String(raw == null ? '' : raw)
+    .split(/[,\n]/)
+    .map((v) => v.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+// The fields a state message might carry it in, most specific first. The
+// configured one wins; `state` and `status` are tried after it so an arm that
+// changes its wrapper keeps working without anyone editing a setting.
+function armStateFields(def) {
+  const configured = String((def && def.stateField) || '')
+    .split(/[,\n]/).map((f) => f.trim()).filter(Boolean);
+  return [...new Set([...configured, 'state', 'status'])];
+}
+
+// What a state message means for this arm: 'done', 'error', or null for
+// anything else (an interim `Started`, another task's traffic). Both lists are
+// configurable per arm because the arms need not speak the same JSON, and a
+// message with no recognisable field is matched against the raw text.
+function armStateVerdict(def, body, text) {
+  const done = armValueList(def && def.doneValue);
+  const failed = armValueList(def && def.errorValues);
+  if (!done.length && !failed.length) return null;
+
   if (body && typeof body === 'object') {
-    for (const field of [def.stateField, 'state', 'status'].filter(Boolean)) {
-      if (body[field] !== undefined) return String(body[field]).trim().toLowerCase() === doneValue;
+    for (const field of armStateFields(def)) {
+      if (body[field] === undefined) continue;
+      const value = String(body[field]).trim().toLowerCase();
+      if (failed.includes(value)) return { verdict: 'error', value: String(body[field]).trim() };
+      if (done.includes(value)) return { verdict: 'done', value: String(body[field]).trim() };
+      return null;      // the state field spoke, and it said something else
     }
   }
-  return String(text || '').toLowerCase().includes(doneValue);
+  const raw = String(text || '').toLowerCase();
+  const hitError = failed.find((v) => raw.includes(v));
+  if (hitError) return { verdict: 'error', value: hitError };
+  const hitDone = done.find((v) => raw.includes(v));
+  return hitDone ? { verdict: 'done', value: hitDone } : null;
+}
+
+// Kept because a hand-over only ever asked one question of a state message.
+function messageIsDone(def, body, text) {
+  const res = armStateVerdict(def, body, text);
+  return !!res && res.verdict === 'done';
 }
 
 // A message arrived on one of the subscribed topics. Only a state topic releases
@@ -681,7 +759,8 @@ function handleArmMessage(arm, topic, text) {
   try { body = JSON.parse(text); } catch (e) { /* plain text state */ }
 
   for (const def of defs) {
-    if (!messageIsDone(def, body, text)) continue;
+    const verdict = armStateVerdict(def, body, text);
+    if (!verdict) continue;
     const raw = body && def.matchField ? body[def.matchField] : undefined;
     const taskId = raw === undefined || raw === null ? null : String(raw);
     let taken = false;
@@ -690,12 +769,16 @@ function handleArmMessage(arm, topic, text) {
       // A waiter that knows its task id only accepts that one; an arm that
       // echoes nothing back releases whoever is waiting on its topic.
       if (waiter.taskId && taskId && taskId !== waiter.taskId) continue;
-      waiter.done('state');
+      // An arm that says it has given up is answered now rather than waited out
+      // for the whole timeout — the order carries on either way, but promptly
+      // and with the arm's own word for what went wrong.
+      waiter.done(verdict.verdict === 'error' ? 'error' : 'state', verdict.value);
       taken = true;
     }
     // Nobody was waiting yet — remember it briefly so the wait that is about to
-    // start does not sit through a Finished that has already been said.
-    if (!taken) armState.lastDone.set(topic, { at: Date.now(), taskId });
+    // start does not sit through a Finished that has already been said. Only a
+    // Finished is held: an error belongs to the run that is over.
+    if (!taken && verdict.verdict === 'done') armState.lastDone.set(topic, { at: Date.now(), taskId });
     return;
   }
 }
@@ -722,11 +805,11 @@ function waitForArmDone(arm, def, opts) {
   return new Promise((resolve) => {
     const waiter = { topic, taskId, tag: o.tag || null };
     let timer = null;
-    waiter.done = (via) => {
+    waiter.done = (via, detail) => {
       if (!armState.waiters.has(waiter)) return;
       armState.waiters.delete(waiter);
       if (timer) clearTimeout(timer);
-      resolve({ ok: via === 'state', via });
+      resolve({ ok: via === 'state', via, detail: detail || null });
     };
     armState.waiters.add(waiter);
     timer = setTimeout(() => waiter.done('timeout'), seconds * 1000);
@@ -738,11 +821,12 @@ function waitForArmDone(arm, def, opts) {
 function describeArmOutcome(result) {
   if (!result || result.ok) return null;
   switch (result.via) {
-    case 'timeout': return 'The arm never reported Finished; continued after the timeout.';
+    case 'error': return `The arm reported “${result.detail || 'an error'}”; continued without it finishing.`;
+    case 'timeout': return 'The arm never reported that it had finished; continued after the timeout.';
     case 'skipped': return 'The wait for the arm was skipped by hand.';
     case 'no-arm': return 'No arm is configured, so nothing was commanded.';
     case 'no-command-topic': return 'That arm has no command topic, so nothing was published.';
-    case 'no-state-topic': return 'That arm has no state topic, so its Finished could not be heard.';
+    case 'no-state-topic': return 'That arm has no state topic, so its answer could not be heard.';
     case 'no-handover': return null;
     default: return null;
   }
@@ -783,9 +867,16 @@ async function runArmTransfer(arm, def, values, opts) {
   await connectArm(arm);
   if (!def.commandTopic) return { ok: false, via: 'no-command-topic' };
 
+  // What this arm is told to do. The route step may name it; otherwise it is the
+  // arm's own command, which is where it belongs while the arms are still
+  // settling on their wording. `{method}` is the older spelling of `{command}`,
+  // so a template written before v1.17 renders exactly as it always did.
+  const command = String(values.command || values.method || def.command || 'grasp');
+  const filled = Object.assign({}, values, { command, method: command });
+
   // Subscribed before publishing, so a fast arm cannot answer into a void
   const since = Date.now();
-  const payload = renderArmPayload(def.payloadTemplate, values);
+  const payload = renderArmPayload(def.payloadTemplate, filled);
   armState.client.publish(def.commandTopic, payload, { qos: 1 });
   armLog('out', def.commandTopic, payload);
 
@@ -1721,7 +1812,9 @@ async function runRelaySupervisor() {
           const def = findArmDef(arm, handover.armId);
           armResult = await runArmTransfer(arm, def, {
             taskId: nextArmTaskId(),
-            method: handover.method || 'grasp',
+            // Blank means the arm's own command, resolved at publish time so a
+            // command changed after the order was placed is the one that goes out
+            command: handover.method || '',
             quantity: Number(handover.quantity) > 0 ? Number(handover.quantity) : 1,
             from: (watch.address && watch.address.id) || '',
             to: (next.milestones[0].address && next.milestones[0].address.id) || '',
@@ -1833,7 +1926,9 @@ function mpdvStagesForProduct(product, stations, arm) {
     stages.push({
       armId: def.id,
       armLabel: def.label || def.id,
-      method: step.method || 'grasp',
+      // Empty means the arm's own command, read when the stage is published so
+      // a command corrected mid-run is the one that goes out
+      method: step.method || '',
       stationRef: prev.stationRef,
       stationId: station.stationId,
       stationName: station.name || station.stationId,
@@ -1985,7 +2080,7 @@ async function runMpdvSupervisor() {
         const def = findArmDef(arm, current.armId);
         result = await runArmTransfer(arm, def, {
           taskId: current.taskId,
-          method: current.method || 'grasp',
+          command: current.method || '',
           quantity: Number(target.quantity) > 0 ? Number(target.quantity) : 1,
           from: current.stationId,
           to: current.stationId,
@@ -2541,7 +2636,9 @@ function registerIpc() {
     if (!def) return { ok: false, error: 'No arm is configured.' };
     try {
       const res = await runArmTransfer(arm, def, {
-        taskId: nextArmTaskId(), method: 'grasp', quantity: 1,
+        // The command this arm is configured with — a test that sent something
+        // else would prove nothing about what an order will publish
+        taskId: nextArmTaskId(), command: def.command || '', quantity: 1,
         from: 'K1', to: 'T2', fromStation: 'K1', toStation: 'T2',
         orderId: 'test-order', orderNumber: 'test-order', productName: 'Test',
         unitId: 'test-unit', transferId: 'test-transfer'
@@ -2907,11 +3004,15 @@ module.exports = {
   renderArmPayload,
   handleArmMessage,
   messageIsDone,
+  armStateVerdict,
+  armValueList,
   armDefs,
   findArmDef,
   armTopics,
   normalizeArms,
   migrateArmsList,
+  migrateHandoverCommands,
+  describeArmOutcome,
   waitForArmDone,
   cancelArmWaits,
   mpdvStagesForProduct,

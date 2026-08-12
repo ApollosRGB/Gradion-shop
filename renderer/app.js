@@ -249,8 +249,11 @@ function mpdvFieldRowsHtml(rows, scope, placeholder) {
     </div>`).join('');
 }
 
-// One card per arm. The state topic is the one that matters — it is where the
-// arm says Finished — so it is named as such rather than hidden among the rest.
+// One card per arm. Nothing here is fixed by the app: the topics it talks on,
+// the command it is sent and the states it answers with are all this arm's own,
+// because the two arms are still settling their protocol. The state topic is
+// the one that matters — it is where the arm says it has finished — so it is
+// named as such rather than hidden among the rest.
 function armCardsHtml(arms) {
   if (!arms.length) return '<p class="hint">No arms are configured.</p>';
   return arms.map((arm, i) => `
@@ -266,12 +269,18 @@ function armCardsHtml(arms) {
         <input class="inp" data-arm="${i}" data-f="stateTopic" value="${escapeHtml(arm.stateTopic || '')}" style="max-width:210px;">
       </label>
       <div class="op-fields">
-        <div class="field-row">
-          <label class="inline-fld">state field
-            <input class="inp" data-arm="${i}" data-f="stateField" value="${escapeHtml(arm.stateField || '')}" placeholder="state" style="max-width:110px;">
+        <div class="field-row arm-protocol">
+          <label class="inline-fld">command
+            <input class="inp" data-arm="${i}" data-f="command" value="${escapeHtml(arm.command || '')}" placeholder="grasp" style="max-width:130px;">
           </label>
-          <label class="inline-fld">“Finished” value
-            <input class="inp" data-arm="${i}" data-f="doneValue" value="${escapeHtml(arm.doneValue || '')}" placeholder="Finished" style="max-width:120px;">
+          <label class="inline-fld">state field
+            <input class="inp" data-arm="${i}" data-f="stateField" value="${escapeHtml(arm.stateField || '')}" placeholder="state" style="max-width:130px;">
+          </label>
+          <label class="inline-fld">“finished” state
+            <input class="inp" data-arm="${i}" data-f="doneValue" value="${escapeHtml(arm.doneValue || '')}" placeholder="Finished" style="max-width:170px;">
+          </label>
+          <label class="inline-fld">“failed” state
+            <input class="inp" data-arm="${i}" data-f="errorValues" value="${escapeHtml(arm.errorValues || '')}" placeholder="(optional)" style="max-width:170px;">
           </label>
           <label class="inline-fld">task-id field
             <input class="inp" data-arm="${i}" data-f="matchField" value="${escapeHtml(arm.matchField || '')}" placeholder="task_id" style="max-width:120px;">
@@ -280,9 +289,12 @@ function armCardsHtml(arms) {
             <input class="inp" data-arm="${i}" data-f="statusTopic" value="${escapeHtml(arm.statusTopic || '')}" placeholder="(optional)" style="max-width:210px;">
           </label>
         </div>
+        <span class="fld-hint"><b>Command</b> is what this arm is told to do — it fills <code>{command}</code> in the payload below, and a hand-over in a route may override it.
+          <b>State field</b> is where its answer arrives (several may be listed, tried in order; <code>state</code> and <code>status</code> are always tried last, and a blank one matches the raw message text).
+          The <b>“finished” state</b> is the value that lets the order carry on, and the optional <b>“failed” state</b> ends the wait at once instead of sitting out the timeout — <b>both accept several values, comma-separated</b> (<code>Finished, Done, 2</code>), so the arm can change its wording without a new release. Matching ignores upper/lower case.</span>
         <label class="fld full">Command payload
           <textarea class="inp" data-arm="${i}" data-f="payloadTemplate" rows="5" spellcheck="false">${escapeHtml(arm.payloadTemplate || '')}</textarea>
-          <span class="fld-hint">Placeholders: <code>{taskId}</code> <code>{method}</code> <code>{quantity}</code> <code>{from}</code> <code>{to}</code> <code>{orderId}</code> <code>{orderNumber}</code> <code>{productName}</code> <code>{unitId}</code> <code>{transferId}</code> — rename the JSON fields to whatever this arm expects.</span>
+          <span class="fld-hint">Placeholders: <code>{command}</code> (<code>{method}</code> means the same) <code>{taskId}</code> <code>{quantity}</code> <code>{from}</code> <code>{to}</code> <code>{orderId}</code> <code>{orderNumber}</code> <code>{productName}</code> <code>{unitId}</code> <code>{transferId}</code> — rename the JSON fields to whatever this arm expects.</span>
         </label>
         <div class="progress-actions" style="margin-top:6px; align-items:center; flex-wrap:wrap;">
           <button class="btn btn-secondary" data-arm-test="${i}">Send test command to ${escapeHtml(arm.label || arm.id)}</button>
@@ -767,8 +779,8 @@ function mpdvStageRowHtml(stage, index, run) {
   const where = `${escapeHtml(stage.stationName || stage.stationId || '')}${stage.action ? ` · ${escapeHtml(stage.action)}` : ''}`;
   const detail = isCurrent
     ? mpdvRunStateText(run.state, stage.armLabel, stage.stationName)
-    : stage.state === 'done' ? 'reported Finished'
-      : stage.state === 'continued' ? (stage.note || 'continued without a Finished')
+    : stage.state === 'done' ? 'reported it had finished'
+      : stage.state === 'continued' ? (stage.note || 'continued without the arm confirming')
         : 'waiting its turn';
   return `<div class="arm-log-row">
     <span class="dir">${mark}</span>
@@ -810,7 +822,7 @@ async function refreshMpdvRuns() {
   if (!mine.length) { host.innerHTML = ''; return; }
   host.innerHTML = `<div class="order-items-card">
     <h3>In the cell</h3>
-    <p class="hint">The AGV has to reach the hand-over station before its arm is commanded; the order only moves on once that arm reports Finished.</p>
+    <p class="hint">The AGV has to reach the hand-over station before its arm is commanded; the order only moves on once that arm reports it has finished.</p>
     ${mine.map(mpdvRunCardHtml).join('')}
   </div>`;
   $$('[data-run-skip]', host).forEach((b) => b.addEventListener('click', async () => {
@@ -955,6 +967,35 @@ function armLabelFor(armId) {
   return def ? (def.label || def.id) : 'no arm configured';
 }
 
+// What the arm will actually be told to do: the hand-over's own word if it was
+// given one, otherwise the arm's command from Settings. This is the same
+// fallback the main process applies when the command goes out, so a preview
+// here cannot promise something the arm will not be sent.
+function armCommandFor(armId, override) {
+  const own = String(override || '').trim();
+  if (own) return own;
+  const def = armDefFor(armId);
+  return (def && def.command) || 'grasp';
+}
+
+// The values an arm may answer with, as configured — one box holding several,
+// comma-separated, because an arm whose wording is not settled may end up
+// saying any of them.
+function armStateValues(raw, fallback) {
+  const list = String(raw == null ? '' : raw).split(/[,\n]/).map((v) => v.trim()).filter(Boolean);
+  return list.length ? list : (fallback ? [fallback] : []);
+}
+
+// A hand-over as it reads in a route preview: what the arm is sent, and what it
+// has to say back before the next job is created.
+function handoverPreviewHtml(handover) {
+  const def = armDefFor(handover.armId) || {};
+  const done = armStateValues(def.doneValue, 'Finished')
+    .map((v) => `“${escapeHtml(v)}”`).join(' or ');
+  return `<div class="leg-arm">🤝 ${escapeHtml(armLabelFor(handover.armId))}: ${escapeHtml(armCommandFor(handover.armId, handover.method))}
+    × the ordered quantity — the next AGV waits for ${done} on ${escapeHtml(def.stateTopic || 'its state topic')}</div>`;
+}
+
 function armPickerHtml(attr, index, selected) {
   const list = armList();
   if (!list.length) return '<span class="fld-hint">No arm is configured.</span>';
@@ -1000,7 +1041,9 @@ function buildLegsForUnit(product, index, orderQuantity) {
     // the current leg and gates the next one.
     if (isHandoverStep(step)) {
       pendingHandover = {
-        method: step.method || 'grasp',
+        // Blank leaves it to the arm's own command, read when the command is
+        // actually published rather than fixed here when the order is placed
+        method: step.method || '',
         quantity,
         // Which arm does it. Resolved here so a route naming an arm that has
         // since been removed still falls back to a real one.
@@ -1867,7 +1910,7 @@ function renderAdminProducts() {
     <div class="panel">
       <h2>Jobs / Products</h2>
       <p class="hint">Each product maps to a SYNAOS transport job. Configure its milestones (station + action), price, image, and whether users can see it.</p>
-      ${isMpdv() ? '<p class="hint">In <b>MPDV</b> mode the order and its operations are what reach the MES — but the route is still read for its <b>hand-overs</b>: each one says which arm works at which station, and the order waits there for that arm to report Finished.</p>' : ''}
+      ${isMpdv() ? '<p class="hint">In <b>MPDV</b> mode the order and its operations are what reach the MES — but the route is still read for its <b>hand-overs</b>: each one says which arm works at which station, and the order waits there for that arm to report it has finished.</p>' : ''}
       <div class="admin-list">${list || '<p class="hint">No products yet.</p>'}</div>
       <button class="btn btn-primary" id="addProduct" style="margin-top:16px;">+ New job / product</button>
     </div>`;
@@ -1947,8 +1990,9 @@ function renderProductEditor(body) {
         <label class="inline-fld">arm
           ${armPickerHtml('data-ho-arm', i, s.armId)}
         </label>
-        <label class="inline-fld">method
-          <input class="inp" data-ho-method="${i}" value="${escapeHtml(s.method || 'grasp')}" style="max-width:110px;">
+        <label class="inline-fld" title="Leave empty to send the command set for this arm in Settings — change it there once and every route follows">command
+          <input class="inp" data-ho-method="${i}" value="${escapeHtml(s.method || '')}"
+                 placeholder="${escapeHtml(armCommandFor(s.armId, ''))}" style="max-width:120px;">
         </label>
         <span class="inline-fld" title="The whole cart line travels in one trip, so the arm moves as many as the customer ordered">quantity: <b>from the order</b></span>
         <button class="link-btn danger" data-step-del="${i}">Remove</button>
@@ -1974,7 +2018,7 @@ function renderProductEditor(body) {
   const previewLegs = buildLegsForUnit(p, 0, 1).legs;
   const legPreview = previewLegs.length > 1
     ? `<div class="leg-preview">This route will be sent as <b>${previewLegs.length} chained jobs</b>:
-        ${previewLegs.map((l, i) => `<div class="leg-line">${l.armBefore ? `<div class="leg-arm">🤝 ${escapeHtml(armLabelFor(l.armBefore.armId))}: ${escapeHtml(l.armBefore.method)} × the ordered quantity — the next AGV waits for “${escapeHtml((armDefFor(l.armBefore.armId) || {}).doneValue || 'Finished')}” on ${escapeHtml((armDefFor(l.armBefore.armId) || {}).stateTopic || 'its state topic')}</div>` : ''}<span class="chip">Job ${i + 1}</span> <b>${escapeHtml(l.resourceId || 'SYNAOS decides')}</b> — ${escapeHtml(l.steps.map((x) => `${stationName(x.stationRef)}·${x.action}`).join(' → '))}${l.parkNode ? ` <span class="chip">then parks at ${escapeHtml(l.parkNode.id)}</span>` : ''}</div>`).join('')}
+        ${previewLegs.map((l, i) => `<div class="leg-line">${l.armBefore ? handoverPreviewHtml(l.armBefore) : ''}<span class="chip">Job ${i + 1}</span> <b>${escapeHtml(l.resourceId || 'SYNAOS decides')}</b> — ${escapeHtml(l.steps.map((x) => `${stationName(x.stationRef)}·${x.action}`).join(' → '))}${l.parkNode ? ` <span class="chip">then parks at ${escapeHtml(l.parkNode.id)}</span>` : ''}</div>`).join('')}
         <span class="fld-hint">Each job starts only after the previous one has finished.</span>
       </div>`
     : '';
@@ -2078,11 +2122,13 @@ function renderProductEditor(body) {
     renderAdmin();
   });
   $('#addHandover').addEventListener('click', () => {
-    p.steps.push({ kind: 'handover', method: 'grasp', quantity: 1 });
+    // No command of its own: it follows the arm's, which is where a protocol
+    // that is still changing should be corrected — once, not route by route.
+    p.steps.push({ kind: 'handover', method: '', quantity: 1 });
     renderAdmin();
   });
   $$('[data-ho-method]', body).forEach((el) => el.addEventListener('change', (e) => {
-    p.steps[+el.dataset.hoMethod].method = e.target.value.trim() || 'grasp';
+    p.steps[+el.dataset.hoMethod].method = e.target.value.trim();
     renderAdmin();
   }));
   $$('[data-ho-arm]', body).forEach((el) => el.addEventListener('change', (e) => {
@@ -3032,8 +3078,9 @@ function renderRecallEditor(body) {
         <label class="inline-fld">arm
           ${armPickerHtml('data-rc-ho-arm', i, s.armId)}
         </label>
-        <label class="inline-fld">method
-          <input class="inp" data-rc-ho="${i}" value="${escapeHtml(s.method || 'grasp')}" style="max-width:110px;">
+        <label class="inline-fld" title="Leave empty to send the command set for this arm in Settings">command
+          <input class="inp" data-rc-ho="${i}" value="${escapeHtml(s.method || '')}"
+                 placeholder="${escapeHtml(armCommandFor(s.armId, ''))}" style="max-width:120px;">
         </label>
         <button class="link-btn danger" data-rc-step-del="${i}">Remove</button>
       </div>`;
@@ -3090,7 +3137,7 @@ function renderRecallEditor(body) {
   $$('[data-rc-station]', body).forEach((el) => el.addEventListener('change', (e) => { r.steps[+el.dataset.rcStation].stationRef = e.target.value; renderAdmin(); }));
   $$('[data-rc-action]', body).forEach((el) => el.addEventListener('change', (e) => { r.steps[+el.dataset.rcAction].action = e.target.value; renderAdmin(); }));
   $$('[data-rc-robot]', body).forEach((el) => el.addEventListener('change', (e) => { r.steps[+el.dataset.rcRobot].resourceId = e.target.value || STEP_INHERIT; renderAdmin(); }));
-  $$('[data-rc-ho]', body).forEach((el) => el.addEventListener('change', (e) => { r.steps[+el.dataset.rcHo].method = e.target.value.trim() || 'grasp'; renderAdmin(); }));
+  $$('[data-rc-ho]', body).forEach((el) => el.addEventListener('change', (e) => { r.steps[+el.dataset.rcHo].method = e.target.value.trim(); renderAdmin(); }));
   $$('[data-rc-ho-arm]', body).forEach((el) => el.addEventListener('change', (e) => { r.steps[+el.dataset.rcHoArm].armId = e.target.value; renderAdmin(); }));
   $$('[data-rc-step-del]', body).forEach((el) => el.addEventListener('click', () => { r.steps.splice(+el.dataset.rcStepDel, 1); renderAdmin(); }));
   $('#rc-add-step').addEventListener('click', () => {
@@ -3098,7 +3145,7 @@ function renderRecallEditor(body) {
     renderAdmin();
   });
   $('#rc-add-ho').addEventListener('click', () => {
-    r.steps.push({ kind: 'handover', method: 'grasp', quantity: 1 });
+    r.steps.push({ kind: 'handover', method: '', quantity: 1 });
     renderAdmin();
   });
   $('#rc-cancel').addEventListener('click', () => { recallDraft = null; renderAdmin(); });
@@ -3862,8 +3909,10 @@ function armFromSetup(incoming) {
       stateTopic: /\/status$/.test(status) ? status.replace(/\/status$/, '/state') : '',
       statusTopic: status,
       payloadTemplate: arm.payloadTemplate || '',
+      command: 'grasp',            // what the single-arm setups always sent
       stateField: arm.statusField === 'status' ? 'state' : (arm.statusField || 'state'),
       doneValue: arm.statusDoneValue || 'Finished',
+      errorValues: '',
       matchField: arm.statusMatchField || 'task_id'
     }];
   }
@@ -3884,6 +3933,10 @@ async function applySyncedConfig(config) {
   store.nodes = config.nodes || store.nodes;
   store.capability = config.capability || store.capability;
   store.products = config.products || store.products;
+  // A setup published by a machine still on ≤1.16 carries hand-overs with the
+  // old shipped `grasp` written into every one of them, which would override the
+  // arm's own command. Ask for the migration again so the incoming routes get it.
+  delete store.handoverCommandsMoved;
   // Keep each recall's own countdown and in-flight run — that is this machine's
   store.recalls = (config.recalls || store.recalls || []).map((r) => {
     const here = (store.recalls || []).find((x) => x.id === r.id);
@@ -4102,7 +4155,7 @@ function renderAdminSettings() {
     </div>
     <div class="panel">
       <h2>Robotic arms (MQTT)</h2>
-      <p class="hint">A hand-over in a route is done by one of these arms: the app publishes to that arm's command topic and nothing continues until the arm reports <b>Finished</b> on its state topic. In <b>SYNAOS</b> mode the receiving AGV's job is only created then; in <b>MPDV</b> mode the order only moves to its next stage then.</p>
+      <p class="hint">A hand-over in a route is done by one of these arms: the app publishes to that arm's command topic and nothing continues until the arm reports its <b>finished</b> state. In <b>SYNAOS</b> mode the receiving AGV's job is only created then; in <b>MPDV</b> mode the order only moves to its next stage then. <b>Nothing below is fixed by the app</b> — the topics, the command each arm is sent and the states it answers with are all set here, so an arm that changes its protocol is followed by editing this panel rather than waiting for a new version.</p>
       <label class="fld switch" style="margin-bottom:14px;">
         <input type="checkbox" id="a-enabled" ${a.enabled ? 'checked' : ''}> Use the robotic arms
       </label>
@@ -4480,12 +4533,18 @@ function renderAdminSettings() {
     const arm = readArmForm();
     const def = (arm.arms || [])[+btn.dataset.armTest];
     if (!def) return;
-    armStatusEl().innerHTML = `<span class="dot"></span> Commanding ${escapeHtml(def.label || def.id)}…`;
+    // The test publishes exactly what an order would — this arm's own command —
+    // so what comes back says something about the real configuration.
+    const command = String(def.command || '').trim() || 'grasp';
+    armStatusEl().innerHTML = `<span class="dot"></span> Sending “${escapeHtml(command)}” to ${escapeHtml(def.label || def.id)}…`;
     const res = await window.api.armTestPublish(arm, def.id);
+    // What it was listening for, so a test that hears nothing says which value
+    // would have counted rather than leaving it to be guessed.
+    const expected = armStateValues(def.doneValue, 'Finished').map((v) => `“${escapeHtml(v)}”`).join(' or ');
     armStatusEl().innerHTML = res.ok
       ? (res.via === 'state'
-        ? `<span class="dot ok"></span> ${escapeHtml(def.label || def.id)} reported Finished`
-        : `<span class="dot bad"></span> Published, but ${escapeHtml(res.note || 'no Finished came back')}`)
+        ? `<span class="dot ok"></span> ${escapeHtml(def.label || def.id)} reported it had finished`
+        : `<span class="dot bad"></span> Published, but ${res.note ? escapeHtml(res.note) : `nothing came back saying ${expected}`}`)
       : `<span class="dot bad"></span> ${escapeHtml(res.error || res.note || 'Failed')}`;
     showArmLog();
   }));

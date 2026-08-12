@@ -585,6 +585,10 @@ select.inp option:disabled { color: var(--text-muted); }
 .row-del:hover { border-color: #d64545; color: #d64545; }
 /* An arm's fields sit under its identity boxes, indented to read as its own */
 .op-fields { flex: 1 0 100%; margin-top: 4px; padding-left: 12px; border-left: 2px solid var(--border); }
+/* The arm's protocol boxes — command, state field, the states it answers with —
+   are six small fields on one line, so they wrap rather than squash each other */
+.arm-protocol { flex-wrap: wrap; row-gap: 8px; }
+.arm-protocol .inp { flex: 0 1 auto; }
 @media (max-width: 640px) {
   .field-row { flex-wrap: wrap; }
   .field-row .field-acr { flex: 1 1 100%; }
