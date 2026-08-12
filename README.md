@@ -7,7 +7,7 @@ A Shopee-style desktop ordering app that dispatches orders to either of two syst
 
 Built with Electron for Windows and macOS, with light/dark mode and separate **user** and **admin** interfaces.
 
-![status](https://img.shields.io/badge/version-1.16.1-e0563f)
+![status](https://img.shields.io/badge/version-1.16.2-e0563f)
 
 ## Features
 
@@ -74,7 +74,9 @@ Selected from the start menu (or the badge in the top bar). Each **cart line** b
 
 **Everything the app does not fill in itself is editable** in **Admin → Settings → MPDV** (v1.13). The order and each operation carry a list of **acronym/value rows** you can add to, change and remove, so a field this MPDV wants — `order.article`, a different cycle target, another formula — needs no new build. The three order fields in bold above and each operation's identity boxes are filled in per order and shown locked; a row naming one of them is ignored rather than allowed to overwrite the running number or the ordered quantity. A value is sent as a **JSON number when it is one and nothing else** — `60000` goes as `60000`, while `0010` stays the string it was typed as instead of being flattened to `10`.
 
-**Or send your own JSON (v1.16).** The fields build the order the shop normally sends; a vendor test often needs one it will not build — a different `ordertype`, other `columns` back, or params the app fills in itself. Each request — the order and each operation — has a **Send my own JSON for this request** switch and an editor holding the whole body, sent exactly as typed. Anything set above it is then ignored for that request, including the order id, ordertype and quantity, and the panel says so. **Placeholders** put the per-order values back where they are wanted: `{orderNumber}` `{quantity}` `{orderType}` `{productName}` `{requestId}` `{language}` `{timeZoneId}` — each works as a JSON string (`"{orderNumber}"`) or as a bare number (`{quantity}`), and a value containing a quote is escaped rather than allowed to break the body. Bodies are pasted from vendor documentation and from someone's notes, so the editor accepts them **as they arrive** (v1.16.1): `//` and `/* … */` **comments** and **trailing commas** are all allowed and stripped before sending — a `//` inside a string, such as a URL, is left exactly where it is. **Start from the fields above** drops in the body the structured form would have produced, and **Check it** parses it with the placeholders filled in and shows exactly what would go on the wire, along with warnings about what will bite on the *second* send — an `order.id` with no `{orderNumber}` in it repeats, and MPDV refuses a duplicate; a fixed `order.plan.yield.base` ignores what the customer ordered. A body that does not parse is reported as a failed call for that request and **never sent** — with the text that failed, so the mistake is visible.
+**Or send your own JSON (v1.16).** The fields build the order the shop normally sends; a vendor test often needs one it will not build — a different `ordertype`, other `columns` back, or params the app fills in itself. Each request — the order and each operation — has a **Send my own JSON for this request** switch and an editor holding the whole body, sent exactly as typed. Anything set above it is then ignored for that request, including the order id, ordertype and quantity, and the panel says so. **Placeholders** put the per-order values back where they are wanted: `{orderNumber}` `{quantity}` `{orderType}` `{productName}` `{requestId}` `{language}` `{timeZoneId}` — each works as a JSON string (`"{orderNumber}"`) or as a bare number (`{quantity}`), and a value containing a quote is escaped rather than allowed to break the body. **The operations follow the id the order actually used (v1.16.2).** A raw order body carrying its own `order.id` is the one the operations reference, and the one the shop quotes — before this they still pointed at the running number the app had reserved, so MPDV was given operations hanging off an order that was never created. A raw body that supplies its own id no longer spends one of the day's 99 numbers either, and one that asks for `{orderNumber}` still gets it.
+
+Bodies are pasted from vendor documentation and from someone's notes, so the editor accepts them **as they arrive** (v1.16.1): `//` and `/* … */` **comments** and **trailing commas** are all allowed and stripped before sending — a `//` inside a string, such as a URL, is left exactly where it is. **Start from the fields above** drops in the body the structured form would have produced, and **Check it** parses it with the placeholders filled in and shows exactly what would go on the wire, along with warnings about what will bite on the *second* send — an `order.id` with no `{orderNumber}` in it repeats, and MPDV refuses a duplicate; a fixed `order.plan.yield.base` ignores what the customer ordered. A body that does not parse is reported as a failed call for that request and **never sent** — with the text that failed, so the mistake is visible.
 
 The **envelope** around those params is editable too (v1.13.1): **`columns`** (comma-separated, e.g. `operation.id, operation.ordertype`), the **`requestId`** MPDV echoes back, and **`returnAsObject`** — set per request, so the order and each arm can differ. `language` and `timeZoneId` were already editable. A requestId left unusable falls back to the counter that numbers the calls within a send, and blank entries in `columns` are dropped, so nothing typed into those boxes can produce a malformed body.
 
@@ -116,8 +118,8 @@ Authentication is HTTP Basic. All admin configuration (products, stations, price
 ## Download
 
 Grab the latest installers from the [Releases page](../../releases):
-- **Windows** — `GradionShop-Setup-1.16.1.exe`
-- **macOS** — `GradionShop-1.16.1.dmg`
+- **Windows** — `GradionShop-Setup-1.16.2.exe`
+- **macOS** — `GradionShop-1.16.2.dmg`
 
 ## Development
 

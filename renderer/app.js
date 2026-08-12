@@ -676,11 +676,16 @@ function mpdvCallsHtml(entry) {
 }
 
 function mpdvCreatedIdNote(entry) {
-  if (!entry.createdId) return '';
+  // In raw mode the body carries its own id, so say which one actually went out
+  // rather than let the reserved number look like the one MPDV was given.
+  const own = entry.reservedNumber
+    ? ` — <span class="mpdv-id-warn">from your own JSON, not the app's ${escapeHtml(entry.reservedNumber)}</span>`
+    : '';
+  if (!entry.createdId) return own;
   const same = entry.orderNumber && entry.createdId === entry.orderNumber;
-  return same
+  return own + (same
     ? ` — MPDV created <b>${escapeHtml(entry.createdId)}</b>`
-    : ` — <span class="mpdv-id-warn">MPDV stored it as <b>${escapeHtml(entry.createdId)}</b></span>`;
+    : ` — <span class="mpdv-id-warn">MPDV stored it as <b>${escapeHtml(entry.createdId)}</b></span>`);
 }
 
 function renderMpdvResult(results, total, orderId) {

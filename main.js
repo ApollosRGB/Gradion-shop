@@ -1023,6 +1023,31 @@ function parseLooseJson(text) {
   return JSON.parse(stripTrailingCommas(stripJsonComments(text)));
 }
 
+// The id the order actually went out with. In raw mode the operator's own body
+// decides it, and everything downstream has to follow that — the operations
+// reference it, and the shop quotes it — or the operations would hang off an
+// order that was never created.
+function orderIdFromBody(body, fallback) {
+  const params = body && Array.isArray(body.params) ? body.params : [];
+  const hit = params.find((p) => p && p.acronym === 'order.id');
+  const value = hit && hit.value != null ? String(hit.value).trim() : '';
+  return value || fallback || null;
+}
+
+// A raw body that carries its own order.id needs no number from the app, so one
+// is not reserved — a vendor test must not eat into the 99 ids the day has, nor
+// be refused because they are gone.
+function mpdvRawSuppliesId(cfg) {
+  if (!mpdvRawEnabled(cfg.orderRaw)) return false;
+  const text = String(cfg.orderRaw.body || '');
+  if (/\{orderNumber\}/.test(text)) return false;      // it wants the app's number
+  try {
+    return !!orderIdFromBody(parseLooseJson(text), null);
+  } catch (e) {
+    return false;                                       // unparseable: fall back to reserving one
+  }
+}
+
 // Nothing here stops a body being sent — it is about what happens on the
 // *second* send. Checked against the text as typed rather than the filled-in
 // body, because a placeholder is exactly what stops the id repeating.
@@ -2259,19 +2284,25 @@ function registerIpc() {
       return last;
     };
 
+    // A raw order body carrying its own id needs nothing from the app's daily
+    // numbering, so none is taken.
+    const rawSuppliesId = mpdvRawSuppliesId(cfg);
+
     for (const line of lines || []) {
       const quantity = mpdvQuantity(line.quantity);
-      let orderNumber;
-      try {
-        orderNumber = nextMpdvOrderNumber(cfg.timeZoneId);
-      } catch (err) {
-        const entry = {
-          productName: line.name || '', orderNumber: null, quantity,
-          ok: false, status: 0, error: err.message, response: '', calls: []
-        };
-        recordMpdvLog(entry);
-        results.push(entry);
-        continue;
+      let orderNumber = null;
+      if (!rawSuppliesId) {
+        try {
+          orderNumber = nextMpdvOrderNumber(cfg.timeZoneId);
+        } catch (err) {
+          const entry = {
+            productName: line.name || '', orderNumber: null, quantity,
+            ok: false, status: 0, error: err.message, response: '', calls: []
+          };
+          recordMpdvLog(entry);
+          results.push(entry);
+          continue;
+        }
       }
 
       // A request whose own JSON does not parse never reaches MPDV: it is
@@ -2283,6 +2314,9 @@ function registerIpc() {
 
       // The order has to exist before an operation can reference its id
       const orderBody = mpdvOrderBody(cfg, orderNumber, line.orderType, quantity, requestId++, line.name);
+      // Whatever id the order actually carried is the one the operations must
+      // use — in raw mode that is the operator's, not the number reserved here.
+      const sentOrderId = orderBody.ok ? orderIdFromBody(orderBody.body, orderNumber) : orderNumber;
       const orderCall = orderBody.ok
         ? await send(orderBody.body, 'BOOrder', 'Order')
         : unsendable('order', 'Order', orderBody);
@@ -2291,7 +2325,7 @@ function registerIpc() {
       if (orderCall.ok) {
         for (const op of cfg.operations || []) {
           const label = op.label || op.workplace || 'Operation';
-          const opBody = mpdvOperationBody(cfg, orderNumber, op, quantity, requestId++, line.name, line.orderType);
+          const opBody = mpdvOperationBody(cfg, sentOrderId, op, quantity, requestId++, line.name, line.orderType);
           calls.push(opBody.ok
             ? await send(opBody.body, 'BOOperation', label)
             : unsendable('operation', label, opBody));
@@ -2301,7 +2335,10 @@ function registerIpc() {
       const failed = calls.find((c) => !c.ok);
       const entry = {
         productName: line.name || '',
-        orderNumber,
+        // What the shop should quote is the id the order went out with, not the
+        // number the app happened to reserve.
+        orderNumber: sentOrderId,
+        reservedNumber: orderNumber && orderNumber !== sentOrderId ? orderNumber : null,
         quantity,
         orderType: String(line.orderType == null ? '0' : line.orderType),
         ok: !failed,
@@ -2324,7 +2361,7 @@ function registerIpc() {
         if (stages.length) {
           const run = {
             id: crypto.randomUUID(),
-            orderNumber,
+            orderNumber: sentOrderId,
             productId: line.productId || null,
             productName: line.name || '',
             quantity,
