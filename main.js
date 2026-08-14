@@ -22,6 +22,45 @@ function defaultMpdvOperationFields() {
   ];
 }
 
+// An MPDV order moves exactly one AGV, and `order.ordertype` is which one. That
+// makes the ordertype — not the product's SYNAOS route — the whole description
+// of what the cell has to do for the order, so each one is a row here: the AGV
+// it names, that AGV's id in SYNAOS (which is how its arrival is recognised),
+// where it stops, and the arm that works on it there.
+function defaultMpdvAgvs() {
+  return [
+    { orderType: '0', label: 'kuka', resourceId: '1001', stationRef: null, action: '', armId: '', command: '' },
+    { orderType: '1', label: 'tusk', resourceId: '36029', stationRef: null, action: '', armId: '', command: '' }
+  ];
+}
+
+// The AGV rows come from the admin form and from synced setups, so nothing is
+// taken on trust. An ordertype is what identifies a row, so a row without one —
+// or a second row claiming an ordertype already taken — is not a row.
+function cleanMpdvAgvs(rows) {
+  const seen = new Set();
+  return (Array.isArray(rows) ? rows : [])
+    .map((raw) => ({
+      orderType: String((raw && raw.orderType) != null ? raw.orderType : '').trim(),
+      label: String((raw && raw.label) || '').trim(),
+      // The AGV's resource id in SYNAOS. Blank means "any AGV at that station",
+      // which is what every install did before this became configurable.
+      resourceId: String((raw && raw.resourceId) || '').trim(),
+      stationRef: (raw && raw.stationRef) || null,
+      // Which milestone at that station means the load is ready for the arm.
+      // Blank = either; the AGV usually DROPs and the arm takes it from there.
+      action: String((raw && raw.action) || '').trim().toUpperCase(),
+      armId: String((raw && raw.armId) || '').trim(),
+      // Empty = the arm's own command, resolved when the stage is published
+      command: String((raw && raw.command) || '').trim()
+    }))
+    .filter((row) => {
+      if (!row.orderType || seen.has(row.orderType)) return false;
+      seen.add(row.orderType);
+      return true;
+    });
+}
+
 // Rows arrive from the admin form, so take nothing on trust: a row is an
 // acronym and a value, both strings, and an unnamed row is not a field.
 function cleanMpdvFields(rows) {
@@ -142,8 +181,8 @@ function defaultStore() {
         arms: defaultArms(),
         timeoutSeconds: 120,         // give up waiting for an arm and continue anyway
         // In MPDV mode the app creates no AGV job, so it watches SYNAOS for the
-        // AGV reaching the hand-over station, then commands the arm and waits
-        // for it exactly as a SYNAOS hand-over does.
+        // AGV named by the order's ordertype reaching that AGV's station, then
+        // commands the arm and waits for it as a SYNAOS hand-over does.
         mpdvWait: {
           enabled: true,
           arrivalTimeoutSeconds: 1800,   // how long to watch for the AGV
@@ -161,6 +200,9 @@ function defaultStore() {
         tlsInsecure: true,           // host does not serve its full certificate chain
         language: 'en',
         timeZoneId: 'Asia/Singapore',
+        // Which AGV each `order.ordertype` names, and what the cell does when it
+        // arrives. One order moves one AGV, so this row is the whole run.
+        agvs: defaultMpdvAgvs(),
         // What goes on the order besides the three the app fills in itself
         // (id, ordertype, planned yield). Free acronym/value rows, so a field
         // MPDV accepts can be added without a new release.
@@ -419,6 +461,11 @@ function loadStore() {
     // editable rows. The one order field an install already had was the
     // deadline, so it becomes the first row rather than being lost.
     normalizeMpdvFields(mpdv, (data.settings && data.settings.mpdv) || {});
+    // v1.18 gave the ordertype an AGV of its own. An install from before that
+    // has none, so it gets the two the cell runs — kuka (1001) and tusk
+    // (36029) — with the station and arm left for the operator to point at.
+    mpdv.agvs = cleanMpdvAgvs(mpdv.agvs);
+    if (!mpdv.agvs.length) mpdv.agvs = defaultMpdvAgvs();
     const sync = Object.assign({}, def.settings.sync, (data.settings && data.settings.sync) || {});
     // Setups used to be committed to main alongside the code. Move an existing
     // install onto the data branch once; reading falls back to the default
@@ -1880,15 +1927,16 @@ async function runRelaySupervisor() {
 //
 // In MPDV mode the app creates no AGV job: the order and its operations go to
 // the MES, which sends the AGV. The arms still have to be told when to work, and
-// they only work once the AGV has actually arrived — so for each hand-over in
-// the product's route the supervisor:
+// they only work once the AGV has actually arrived — so for the one AGV the
+// order's `order.ordertype` names the supervisor:
 //
-//   1. watches SYNAOS until a milestone at that station has FINISHED,
-//   2. publishes the command to that hand-over's arm,
+//   1. watches SYNAOS until that AGV has FINISHED a milestone at its station,
+//   2. publishes the command to the arm that works there,
 //   3. waits for the arm's state topic to say Finished,
 //
-// and only then moves the order on to its next stage. Runs are advanced one at a
-// time: there is one cell, and two orders must not command an arm at once.
+// and the order is done. An MPDV order moves a single AGV, so it is a single
+// stage; the list is kept because a site may yet want two. Runs are advanced one
+// at a time: there is one cell, and two orders must not command an arm at once.
 // ---------------------------------------------------------------------------
 
 let mpdvTimer = null;
@@ -1910,43 +1958,73 @@ function scheduleMpdvSupervisor() {
   runMpdvSupervisor();
 }
 
-// The stages an MPDV order goes through, read from the product's own route: each
-// hand-over the operator placed there is one stage, and the step before it says
-// where the AGV has to get to before that arm can work.
-function mpdvStagesForProduct(product, stations, arm) {
-  const steps = (product && product.steps) || [];
-  const stages = [];
-  steps.forEach((step, i) => {
-    if (!step || step.kind !== 'handover') return;
-    const prev = steps.slice(0, i).reverse().find((s) => s && s.kind !== 'handover');
-    if (!prev) return;         // a hand-over with nothing before it has no station
-    const station = (stations || []).find((s) => s.id === prev.stationRef);
-    const def = findArmDef(arm, step.armId);
-    if (!station || !def) return;
-    stages.push({
+function findMpdvAgv(mpdv, orderType) {
+  const want = String(orderType == null ? '0' : orderType).trim();
+  return ((mpdv && mpdv.agvs) || []).find((a) => String(a.orderType) === want) || null;
+}
+
+// What the cell has to do for one MPDV order. An order names one AGV through its
+// `order.ordertype`, so there is one stage and the AGV table describes it: the
+// product's SYNAOS route is not read here at all — in MPDV mode the MES sends
+// the AGV, and a route meant for jobs the app creates itself says nothing about
+// where this one stops. `why` explains an empty list in the operator's terms.
+function mpdvStagesForOrderType(orderType, mpdv, stations, arm) {
+  const type = String(orderType == null ? '0' : orderType);
+  const agv = findMpdvAgv(mpdv, type);
+  const named = agv ? `AGV ${agv.label || type}` : `ordertype ${type}`;
+  if (!agv) {
+    return { stages: [], why: `No AGV is set up for ordertype ${type}, so no arm is commanded.` };
+  }
+  const station = (stations || []).find((s) => s.id === agv.stationRef);
+  if (!station) {
+    return { stages: [], why: `${named} has no station set in the MPDV AGV table, so no arm is commanded.` };
+  }
+  // findArmDef falls back to the first arm, which is right for a hand-over that
+  // simply never named one — but here an unset arm means the row is unfinished,
+  // and guessing would command a robot nobody asked for.
+  const def = agv.armId ? findArmDef(arm, agv.armId) : null;
+  if (!def || def.id !== agv.armId) {
+    return {
+      stages: [],
+      why: agv.armId
+        ? `${named} names the arm "${agv.armId}", which is not configured, so no arm is commanded.`
+        : `${named} has no arm set in the MPDV AGV table, so no arm is commanded.`
+    };
+  }
+  return {
+    stages: [{
+      orderType: type,
+      agvLabel: agv.label || type,
+      // Which robot in SYNAOS this is. Blank accepts whichever AGV turns up,
+      // which is how it behaved before the ordertype named one.
+      resourceId: agv.resourceId || null,
       armId: def.id,
       armLabel: def.label || def.id,
       // Empty means the arm's own command, read when the stage is published so
       // a command corrected mid-run is the one that goes out
-      method: step.method || '',
-      stationRef: prev.stationRef,
+      method: agv.command || '',
+      stationRef: agv.stationRef,
       stationId: station.stationId,
       stationName: station.name || station.stationId,
       system: station.system || 'STATION',
-      action: prev.action || null,
+      action: agv.action || null,
       state: 'pending',
       taskId: null,
       note: null
-    });
-  });
-  return stages;
+    }],
+    why: null
+  };
 }
 
-// Has an AGV finished a milestone at this station since the order was sent? The
-// app did not create the job, so there is no id to follow — station, action and
-// "after we sent the order" is what there is to go on.
+// Has this order's AGV finished a milestone at its station since the order was
+// sent? The app did not create the job, so there is no id to follow — the robot
+// the ordertype named, the station, the action and "after we sent the order" is
+// what there is to go on.
 function findStationArrival(jobs, stage, sinceMs) {
   for (const job of jobs || []) {
+    // One order moves one AGV: another robot passing through the same station is
+    // somebody else's order, so its milestones must not release this arm.
+    if (stage.resourceId && String(job.assignedResourceId || '') !== String(stage.resourceId)) continue;
     for (const m of job.milestones || []) {
       const address = m.address || {};
       if (String(address.id || '') !== String(stage.stationId)) continue;
@@ -2052,7 +2130,12 @@ async function runMpdvSupervisor() {
           const target = findMpdvRun(fresh, run.id);
           if (target) {
             target.state = 'failed';
-            target.lastError = `No AGV reached ${stage.stationName} within the time allowed, so ${stage.armLabel} was not commanded.`;
+            // Naming the robot matters here: the run may well have watched an
+            // AGV go past that was not the one this order's ordertype named.
+            const which = stage.resourceId
+              ? `AGV ${stage.agvLabel || stage.orderType} (${stage.resourceId}) did not reach`
+              : 'No AGV reached';
+            target.lastError = `${which} ${stage.stationName} within the time allowed, so ${stage.armLabel} was not commanded.`;
             saveStore(fresh);
             notifyMpdvRunsChanged();
           }
@@ -2436,6 +2519,10 @@ function registerIpc() {
         reservedNumber: orderNumber && orderNumber !== sentOrderId ? orderNumber : null,
         quantity,
         orderType: String(line.orderType == null ? '0' : line.orderType),
+        // The AGV that ordertype names, so the shop can say which robot is
+        // coming rather than only quoting the number MPDV was sent
+        agvLabel: (findMpdvAgv(cfg, line.orderType) || {}).label || null,
+        agvResourceId: (findMpdvAgv(cfg, line.orderType) || {}).resourceId || null,
         ok: !failed,
         status: (failed || orderCall).status,
         error: failed ? `${failed.label}: ${failed.error}` : null,
@@ -2447,12 +2534,11 @@ function registerIpc() {
         calls
       };
 
-      // The order is in the MES; now the cell has to run it. Each hand-over in
-      // the product's route becomes a stage: AGV to the station, arm commanded,
-      // arm finished. A line whose order was refused runs nothing.
+      // The order is in the MES; now the cell has to run it. The ordertype names
+      // one AGV, and that AGV's row says the rest: AGV to its station, arm
+      // commanded, arm finished. A line whose order was refused runs nothing.
       if (!failed && armGating) {
-        const product = (startStore.products || []).find((p) => p.id === line.productId);
-        const stages = mpdvStagesForProduct(product, startStore.stations, armCfg);
+        const { stages, why } = mpdvStagesForOrderType(line.orderType, cfg, startStore.stations, armCfg);
         if (stages.length) {
           const run = {
             id: crypto.randomUUID(),
@@ -2470,11 +2556,14 @@ function registerIpc() {
             lastError: brokerError ? `Broker unreachable when the order was sent: ${brokerError}` : null
           };
           queued.push(run);
-          entry.run = { id: run.id, stages: stages.map((s) => ({ armLabel: s.armLabel, stationName: s.stationName })) };
+          entry.run = {
+            id: run.id,
+            stages: stages.map((s) => ({ armLabel: s.armLabel, stationName: s.stationName, agvLabel: s.agvLabel }))
+          };
         }
         entry.armNote = brokerError
           ? `The order reached MPDV, but the arm broker did not answer: ${brokerError}`
-          : (stages.length ? null : 'No hand-over is set in this product\'s route, so no arm is commanded.');
+          : (stages.length ? null : why);
       }
 
       recordMpdvLog(entry);
@@ -2499,10 +2588,12 @@ function registerIpc() {
     quantity: r.quantity,
     state: r.state,
     index: r.index,
+    orderType: r.orderType || null,
     lastError: r.lastError || null,
     createdAt: r.createdAt,
     stages: (r.stages || []).map((s) => ({
       armId: s.armId, armLabel: s.armLabel, stationName: s.stationName, stationId: s.stationId,
+      agvLabel: s.agvLabel || null, resourceId: s.resourceId || null,
       action: s.action, state: s.state, note: s.note || null,
       arrivedAt: s.arrivedAt || null, arrivedBy: s.arrivedBy || null, taskId: s.taskId || null
     }))
@@ -2667,6 +2758,8 @@ function registerIpc() {
           stage: r.index + 1, totalStages: (r.stages || []).length,
           armLabel: ((r.stages || [])[r.index] || {}).armLabel || '',
           stationName: ((r.stages || [])[r.index] || {}).stationName || '',
+          agvLabel: ((r.stages || [])[r.index] || {}).agvLabel || '',
+          resourceId: ((r.stages || [])[r.index] || {}).resourceId || '',
           lastError: r.lastError || null
         }))
     };
@@ -3015,7 +3108,10 @@ module.exports = {
   describeArmOutcome,
   waitForArmDone,
   cancelArmWaits,
-  mpdvStagesForProduct,
+  mpdvStagesForOrderType,
+  findMpdvAgv,
+  cleanMpdvAgvs,
+  defaultMpdvAgvs,
   findStationArrival,
   runMpdvSupervisor,
   resumeMpdvRuns,

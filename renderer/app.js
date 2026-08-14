@@ -142,15 +142,36 @@ function isMpdv() {
   return (store.settings || {}).mode === 'mpdv';
 }
 
-// order.ordertype tells MPDV which AGV goes for the item: 0 kuka, 1 tusk.
-// It belongs to the product, so a cart line decides its own.
-const MPDV_AGVS = [{ value: '0', label: 'kuka' }, { value: '1', label: 'tusk' }];
+// order.ordertype tells MPDV which AGV goes for the item — as it ships, 0 is the
+// kuka (SYNAOS resource 1001) and 1 the tusk (36029). One order moves one AGV,
+// so the ordertype is the whole of it: which robot goes, where it stops and
+// which arm works on it are all one row of the MPDV AGV table in Settings. It
+// belongs to the product, so a cart line decides its own.
+function mpdvAgvs() {
+  const rows = (((store || {}).settings || {}).mpdv || {}).agvs;
+  return Array.isArray(rows) && rows.length ? rows : [];
+}
 function mpdvOrderTypeOf(product) {
-  return String((product || {}).mpdvOrderType) === '1' ? '1' : '0';
+  const rows = mpdvAgvs();
+  const want = String((product || {}).mpdvOrderType == null ? '' : (product || {}).mpdvOrderType);
+  if (rows.some((a) => String(a.orderType) === want)) return want;
+  // A product set to an ordertype the table no longer has falls back to the
+  // first AGV rather than to a number that names nothing.
+  return rows.length ? String(rows[0].orderType) : '0';
+}
+function mpdvAgvRow(value) {
+  return mpdvAgvs().find((a) => String(a.orderType) === String(value)) || null;
 }
 function mpdvAgvName(value) {
-  const hit = MPDV_AGVS.find((a) => a.value === String(value));
-  return hit ? hit.label : String(value);
+  const hit = mpdvAgvRow(value);
+  return hit ? (hit.label || String(value)) : String(value);
+}
+// "kuka · 1001" — the name the shop floor uses and the id SYNAOS knows it by,
+// which is what an arrival is matched on.
+function mpdvAgvFullName(value) {
+  const hit = mpdvAgvRow(value);
+  if (!hit) return String(value);
+  return hit.resourceId ? `${hit.label || value} · ${hit.resourceId}` : (hit.label || String(value));
 }
 
 // The order fields the app fills in per order. Shown so the payload reads as a
@@ -158,7 +179,7 @@ function mpdvAgvName(value) {
 // is built, rather than being allowed to overwrite the running number.
 const MPDV_ORDER_AUTO = [
   { acronym: 'order.id', note: 'the running order number, ddmmyyxx' },
-  { acronym: 'order.ordertype', note: 'which AGV fetches it — set per product' },
+  { acronym: 'order.ordertype', note: 'which AGV fetches it — set per product, from the AGV table below' },
   { acronym: 'order.plan.yield.base', note: 'the quantity ordered' }
 ];
 
@@ -236,6 +257,56 @@ function mpdvEnvelopeHtml(scope, columns, requestId, returnAsObject, defaultId) 
         returnAsObject
       </label>
     </div>`;
+}
+
+// One row per `order.ordertype`. This is the whole of what an MPDV order asks of
+// the cell: the AGV the MES will send, the id SYNAOS knows that AGV by, where it
+// stops and which arm meets it there. Nothing here reads the product's SYNAOS
+// route — an MPDV order moves one AGV, and this row says which.
+function mpdvAgvRowsHtml(agvs, stations, arms) {
+  if (!agvs.length) return '<p class="hint">No AGVs are set up, so an MPDV order commands no arm.</p>';
+  const stationOpts = (ref) => (stations || []).map((s) =>
+    `<option value="${escapeHtml(s.id)}" ${s.id === ref ? 'selected' : ''}>${escapeHtml(s.name || s.stationId)} (${escapeHtml(s.stationId)})</option>`).join('');
+  const armOpts = (id) => (arms || []).map((a) =>
+    `<option value="${escapeHtml(a.id)}" ${a.id === id ? 'selected' : ''}>${escapeHtml(a.label || a.id)}</option>`).join('');
+  return agvs.map((agv, i) => `
+    <div class="op-row">
+      <span class="chip">ordertype</span>
+      <label class="inline-fld"><input class="inp" data-m-agv="${i}" data-f="orderType"
+        value="${escapeHtml(String(agv.orderType == null ? '' : agv.orderType))}" style="max-width:60px;"></label>
+      <label class="inline-fld">is the AGV
+        <input class="inp" data-m-agv="${i}" data-f="label" value="${escapeHtml(agv.label || '')}"
+          placeholder="kuka" style="max-width:110px;">
+      </label>
+      <label class="inline-fld">SYNAOS id
+        <input class="inp" data-m-agv="${i}" data-f="resourceId" value="${escapeHtml(agv.resourceId || '')}"
+          placeholder="1001" style="max-width:110px;">
+      </label>
+      <label class="inline-fld">stops at
+        <select class="inp" data-m-agv="${i}" data-f="stationRef" style="max-width:180px;">
+          <option value="" ${!agv.stationRef ? 'selected' : ''}>— not set —</option>
+          ${stationOpts(agv.stationRef)}
+        </select>
+      </label>
+      <label class="inline-fld">on
+        <select class="inp" data-m-agv="${i}" data-f="action" style="max-width:110px;">
+          <option value="" ${!agv.action ? 'selected' : ''}>either</option>
+          <option value="PICK" ${agv.action === 'PICK' ? 'selected' : ''}>PICK</option>
+          <option value="DROP" ${agv.action === 'DROP' ? 'selected' : ''}>DROP</option>
+        </select>
+      </label>
+      <label class="inline-fld">arm
+        <select class="inp" data-m-agv="${i}" data-f="armId" style="max-width:150px;">
+          <option value="" ${!agv.armId ? 'selected' : ''}>— none —</option>
+          ${armOpts(agv.armId)}
+        </select>
+      </label>
+      <label class="inline-fld">command
+        <input class="inp" data-m-agv="${i}" data-f="command" value="${escapeHtml(agv.command || '')}"
+          placeholder="the arm's own" style="max-width:130px;">
+      </label>
+      <button class="row-del" data-magv-del="${i}" title="Remove this AGV">✕</button>
+    </div>`).join('');
 }
 
 function mpdvFieldRowsHtml(rows, scope, placeholder) {
@@ -634,7 +705,8 @@ function buildMpdvOrderRecord(lines, results, total) {
       runIndex: 0,
       lastError: null,
       stages: run ? (run.stages || []).map((s) => ({
-        armLabel: s.armLabel, stationName: s.stationName, state: 'pending', note: null
+        armLabel: s.armLabel, stationName: s.stationName, agvLabel: s.agvLabel || null,
+        state: 'pending', note: null
       })) : []
     };
   });
@@ -716,7 +788,9 @@ function renderMpdvResult(results, total, orderId) {
         ${r.armNote ? `<div class="tl-meta">🤝 ${escapeHtml(r.armNote)}</div>` : ''}
         ${mpdvCallsHtml(r)}
       </div>
-      <div class="qty-lbl">Qty: ${r.quantity}${r.orderType != null ? `<div class="tl-meta">AGV ${escapeHtml(r.orderType)} — ${escapeHtml(mpdvAgvName(r.orderType))}</div>` : ''}</div>
+      <div class="qty-lbl">Qty: ${r.quantity}${r.orderType != null
+        ? `<div class="tl-meta">ordertype ${escapeHtml(r.orderType)} — AGV ${escapeHtml(r.agvLabel || mpdvAgvName(r.orderType))}${r.agvResourceId ? ` · ${escapeHtml(r.agvResourceId)}` : ''}</div>`
+        : ''}</div>
     </div>`).join('');
 
   const allOk = okCount === results.length && results.length > 0;
@@ -754,21 +828,30 @@ function renderMpdvResult(results, total, orderId) {
 // MPDV — what the cell does once the order is in the MES
 //
 // The order and its operations are already created. From here the app watches
-// SYNAOS for the AGV reaching each hand-over station, commands that arm, and
-// waits for its Finished before the order moves on. All of it runs in the main
-// process, so this is only the window onto it.
+// SYNAOS for the one AGV the order's ordertype named reaching that AGV's
+// station, commands the arm that works there, and waits for its Finished. All
+// of it runs in the main process, so this is only the window onto it.
 // ===========================================================================
 
 let mpdvWatchedRunIds = [];
 
-function mpdvRunStateText(state, armLabel, stationName) {
+function mpdvRunStateText(state, armLabel, stationName, agvName) {
   switch (state) {
-    case 'waiting-for-agv': return `waiting for an AGV to reach ${stationName || 'the station'}`;
+    case 'waiting-for-agv': return `waiting for ${agvName ? `AGV ${agvName}` : 'an AGV'} to reach ${stationName || 'the station'}`;
     case 'arm-running': return `${armLabel || 'the arm'} is working`;
     case 'failed': return 'given up';
     case 'done': return 'finished';
     default: return state || '';
   }
+}
+
+// A stage carries the AGV it belongs to; an older run written before v1.18 does
+// not, so fall back to what the ordertype names now.
+function mpdvStageAgvName(stage) {
+  const label = stage.agvLabel || '';
+  const id = stage.resourceId || '';
+  if (label && id) return `${label} · ${id}`;
+  return label || id || '';
 }
 
 function mpdvStageRowHtml(stage, index, run) {
@@ -777,28 +860,35 @@ function mpdvStageRowHtml(stage, index, run) {
     : stage.state === 'continued' ? '⚠️'
       : isCurrent ? (run.state === 'arm-running' ? '🤖' : '⏳') : '○';
   const where = `${escapeHtml(stage.stationName || stage.stationId || '')}${stage.action ? ` · ${escapeHtml(stage.action)}` : ''}`;
+  const agvName = mpdvStageAgvName(stage);
   const detail = isCurrent
-    ? mpdvRunStateText(run.state, stage.armLabel, stage.stationName)
+    ? mpdvRunStateText(run.state, stage.armLabel, stage.stationName, agvName)
     : stage.state === 'done' ? 'reported it had finished'
       : stage.state === 'continued' ? (stage.note || 'continued without the arm confirming')
         : 'waiting its turn';
   return `<div class="arm-log-row">
     <span class="dir">${mark}</span>
-    <span class="msg"><b>${escapeHtml(stage.armLabel || stage.armId)}</b> at ${where} — ${escapeHtml(detail)}</span>
+    <span class="msg"><b>${escapeHtml(stage.armLabel || stage.armId)}</b> at ${where}${agvName ? ` for AGV ${escapeHtml(agvName)}` : ''} — ${escapeHtml(detail)}</span>
   </div>`;
 }
 
 function mpdvRunCardHtml(run) {
   const stages = (run.stages || []).map((s, i) => mpdvStageRowHtml(s, i, run)).join('');
   const busy = run.state === 'waiting-for-agv' || run.state === 'arm-running';
+  const current = (run.stages || [])[run.index] || {};
+  const total = (run.stages || []).length;
   const head = run.state === 'done' ? '✅ The cell has finished this order'
     : run.state === 'failed' ? '⚠️ Given up on this order'
-      : `⏳ Stage ${run.index + 1} of ${(run.stages || []).length} — ${mpdvRunStateText(run.state, ((run.stages || [])[run.index] || {}).armLabel, ((run.stages || [])[run.index] || {}).stationName)}`;
+      // One AGV per MPDV order means one stage; saying "1 of 1" would only look
+      // like something is missing.
+      : `⏳ ${total > 1 ? `Stage ${run.index + 1} of ${total} — ` : ''}${mpdvRunStateText(run.state, current.armLabel, current.stationName, mpdvStageAgvName(current))}`;
+  const agv = mpdvStageAgvName(current) || (run.orderType != null ? mpdvAgvFullName(run.orderType) : '');
   return `<div class="op-row" style="flex-direction:column;align-items:stretch;">
     <div class="mpdv-call-head">
       <b>Order ${escapeHtml(run.orderNumber || '')}</b>
       <span class="chip">${escapeHtml(run.productName || '')}</span>
       <span class="chip">Qty ${run.quantity}</span>
+      ${agv ? `<span class="chip">AGV ${escapeHtml(agv)}</span>` : ''}
     </div>
     <div class="tl-meta" style="margin:4px 0 8px;">${escapeHtml(head)}</div>
     ${stages}
@@ -1497,13 +1587,17 @@ function mpdvStepLines(order) {
       const past = i < line.runIndex;
       const armDone = past || stage.state === 'done' || stage.state === 'continued';
       const arrived = armDone || !!stage.arrivedAt || (current && line.runState === 'arm-running');
+      // The ordertype named one AGV, so the rail says which one is coming rather
+      // than "an AGV" — any other robot at that station is somebody else's order.
+      const agv = mpdvStageAgvName(stage);
+      const named = agv ? `AGV ${agv}` : 'an AGV';
       steps.push({
         icon: '🚚',
         label: arrived ? 'AGV arrived' : 'AGV on its way',
         place: `${tag}${stage.stationName || stage.stationId || ''}`,
         text: arrived
-          ? `The AGV reached ${stage.stationName || 'the station'}`
-          : `Waiting for an AGV to reach ${stage.stationName || 'the station'}`,
+          ? `${agv ? `AGV ${agv}` : 'The AGV'} reached ${stage.stationName || 'the station'}`
+          : `Waiting for ${named} to reach ${stage.stationName || 'the station'}`,
         state: arrived ? 'done' : current ? 'active' : 'pending',
         at: stage.arrivedAt || null
       });
@@ -2066,9 +2160,13 @@ function renderProductEditor(body) {
         </label>
         <label class="fld full">MPDV — which AGV fetches it (<code>order.ordertype</code>)
           <select class="inp" id="f-otype">
-            ${MPDV_AGVS.map((a) => `<option value="${a.value}" ${mpdvOrderTypeOf(p) === a.value ? 'selected' : ''}>${a.value} — ${a.label}</option>`).join('')}
+            ${mpdvAgvs().map((a) => {
+              const value = String(a.orderType);
+              const where = a.resourceId ? ` (AGV ${escapeHtml(a.resourceId)})` : '';
+              return `<option value="${escapeHtml(value)}" ${mpdvOrderTypeOf(p) === value ? 'selected' : ''}>${escapeHtml(value)} — ${escapeHtml(a.label || value)}${where}</option>`;
+            }).join('')}
           </select>
-          <span class="fld-hint">Only used in MPDV mode; sent as this line's <code>order.ordertype</code>.</span>
+          <span class="fld-hint">Only used in MPDV mode; sent as this line's <code>order.ordertype</code>. One order moves this one AGV — where it stops and which arm works on it are set for the AGV itself, under Settings / MPDV.</span>
         </label>
         <label class="fld switch full">
           <input type="checkbox" id="f-visible" ${p.visible ? 'checked' : ''}> Show this job to users
@@ -3737,8 +3835,11 @@ async function refreshArmLog() {
       <code>${escapeHtml(l.topic)}</code><span class="msg">${escapeHtml(l.message)}</span></div>`).join('');
   const pend = (st.pending || []).map((p) =>
     `<div class="arm-log-row"><span class="dir">⏳</span><span class="msg">${escapeHtml(p.productName)} — leg ${p.leg}/${p.totalLegs}, ${escapeHtml(p.state)}${p.lastError ? ' — ' + escapeHtml(p.lastError) : ''}</span></div>`).join('');
-  const runs = (st.mpdvRuns || []).map((r) =>
-    `<div class="arm-log-row"><span class="dir">⏳</span><span class="msg">Order ${escapeHtml(r.orderNumber || '')} — ${escapeHtml(r.productName)}, stage ${r.stage}/${r.totalStages}: ${escapeHtml(mpdvRunStateText(r.state, r.armLabel, r.stationName))}${r.lastError ? ' — ' + escapeHtml(r.lastError) : ''}</span></div>`).join('');
+  const runs = (st.mpdvRuns || []).map((r) => {
+    const where = r.totalStages > 1 ? `stage ${r.stage}/${r.totalStages}: ` : '';
+    const agv = mpdvStageAgvName(r);
+    return `<div class="arm-log-row"><span class="dir">⏳</span><span class="msg">Order ${escapeHtml(r.orderNumber || '')} — ${escapeHtml(r.productName)}, ${where}${escapeHtml(mpdvRunStateText(r.state, r.armLabel, r.stationName, agv))}${r.lastError ? ' — ' + escapeHtml(r.lastError) : ''}</span></div>`;
+  }).join('');
   const topics = (st.topics || []).length
     ? `<div class="arm-log-title">Listening on</div><div class="arm-log-row"><span class="dir in">▼</span><code>${st.topics.map(escapeHtml).join('</code> <code>')}</code></div>`
     : '';
@@ -4081,7 +4182,7 @@ function renderAdminSettings() {
     </div>
     <div class="panel">
       <h2>MPDV production orders</h2>
-      <p class="hint">Used when the shop is set to <b>MPDV</b>. Each cart line becomes an <b>order</b> (<code>BOOrder/insert</code>) followed by <b>one operation per arm</b> (<code>BOOperation/insert</code>). The order goes first because the operations reference its id; the ordered quantity becomes <code>order.plan.yield.base</code> and each operation's <code>plan.yield.primary</code>. Which AGV fetches an item (<code>order.ordertype</code>) is set per product under Jobs / Products.</p>
+      <p class="hint">Used when the shop is set to <b>MPDV</b>. Each cart line becomes an <b>order</b> (<code>BOOrder/insert</code>) followed by <b>one operation per arm</b> (<code>BOOperation/insert</code>). The order goes first because the operations reference its id; the ordered quantity becomes <code>order.plan.yield.base</code> and each operation's <code>plan.yield.primary</code>. Which AGV fetches an item (<code>order.ordertype</code>) is set per product under Jobs / Products, and the table below says what that ordertype means.</p>
       <div class="form-grid">
         <label class="fld">Base URL
           <input class="inp" id="m-base" value="${escapeHtml(m.baseUrl || '')}" placeholder="https://host:8080">
@@ -4108,6 +4209,10 @@ function renderAdminSettings() {
           <span class="fld-hint">Also decides which day the order number belongs to.</span>
         </label>
       </div>
+      <h3 style="margin:22px 0 6px;">AGVs — what each <code>order.ordertype</code> means</h3>
+      <p class="hint">An MPDV order moves <b>one</b> AGV, and <code>order.ordertype</code> is which. As shipped, <b>0 is the kuka — AGV 1001</b>, and <b>1 is the tusk — AGV 36029</b>. The <b>SYNAOS id</b> is how the app recognises that AGV arriving: only a milestone finished by that robot at the station below counts, so another AGV passing through does not set the arm off. A row with no station or no arm simply commands nothing. <b>The product's SYNAOS route is not used in MPDV mode</b> — it describes jobs the app creates itself, and here the MES sends the AGV.</p>
+      ${mpdvAgvRowsHtml(m.agvs || [], store.stations || [], (a.arms || []))}
+      <button class="chip-btn" data-magv-add="1">+ Add an AGV</button>
       <h3 style="margin:22px 0 6px;">Order — sent first</h3>
       <p class="hint">Three fields are filled in per order and cannot be edited; everything else the order carries is yours to set. Add a row for any <code>order.*</code> field your MPDV accepts.</p>
       ${mpdvAutoRowsHtml(MPDV_ORDER_AUTO)}
@@ -4182,14 +4287,14 @@ function renderAdminSettings() {
       <h3 style="margin:22px 0 6px;">The arms</h3>
       ${armCardsHtml(a.arms || [])}
       <h3 style="margin:22px 0 6px;">MPDV — while the order runs</h3>
-      <p class="hint">In MPDV mode the app creates no AGV job, so it watches SYNAOS instead: when a milestone at the hand-over's station has finished, the AGV is there and that arm is commanded. The order and its operations are still created exactly as before — this is only what happens afterwards.</p>
+      <p class="hint">In MPDV mode the app creates no AGV job, so it watches SYNAOS instead: when <b>the AGV the order's <code>ordertype</code> named</b> has finished a milestone at that AGV's station, it is there and the arm set for it is commanded. Which AGV, which station and which arm are the <b>MPDV AGV table</b> in the panel above — the product's SYNAOS route is not read here. The order and its operations are still created exactly as before; this is only what happens afterwards.</p>
       <div class="form-grid">
         <label class="fld switch full">
           <input type="checkbox" id="a-mpdv-enabled" ${(a.mpdvWait || {}).enabled !== false ? 'checked' : ''}> Command the arms while an MPDV order runs
         </label>
         <label class="fld">Wait for the AGV (seconds)
           <input class="inp" id="a-mpdv-arrival" type="number" min="30" step="30" value="${Number((a.mpdvWait || {}).arrivalTimeoutSeconds) || 1800}">
-          <span class="fld-hint">If no AGV reaches the station in this time the run is given up, and the arm is not commanded.</span>
+          <span class="fld-hint">If that AGV does not reach its station in this time the run is given up, and the arm is not commanded.</span>
         </label>
         <label class="fld">Wait for the arm (seconds)
           <input class="inp" id="a-mpdv-arm" type="number" min="5" step="30" value="${Number((a.mpdvWait || {}).armTimeoutSeconds) || 600}">
@@ -4321,6 +4426,19 @@ function renderAdminSettings() {
     });
     return env;
   };
+  // The AGV rows, read back by index. A blank row is kept here so adding two in
+  // a row does not throw the first away; a row with no ordertype is dropped in
+  // the main process, where the table is normalised.
+  const readMpdvAgvs = () => {
+    const rows = [];
+    $$('[data-m-agv]', body).forEach((el) => {
+      const i = Number(el.dataset.mAgv);
+      if (!rows[i]) rows[i] = { orderType: '', label: '', resourceId: '', stationRef: null, action: '', armId: '', command: '' };
+      const value = el.value.trim();
+      rows[i][el.dataset.f] = el.dataset.f === 'stationRef' ? (value || null) : value;
+    });
+    return rows.filter(Boolean);
+  };
   const readMpdvForm = () => {
     const operations = JSON.parse(JSON.stringify(store.settings.mpdv.operations || []));
     $$('[data-m-op]', body).forEach((el) => {
@@ -4341,6 +4459,7 @@ function renderAdminSettings() {
       tlsInsecure: $('#m-tls').checked,
       language: $('#m-lang').value.trim() || 'en',
       timeZoneId: $('#m-tz').value.trim() || 'Asia/Singapore',
+      agvs: readMpdvAgvs(),
       orderFields: readMpdvFieldRows('order'),
       orderColumns: orderEnvelope.columns,
       orderRequestId: orderEnvelope.requestId,
@@ -4444,6 +4563,19 @@ function renderAdminSettings() {
       ? `<div class="raw-ok">✅ Valid. This is what would be sent:</div>${warnings}<pre>${escapeHtml(res.preview)}</pre>`
       : `<div class="mpdv-log-err">❌ ${escapeHtml(res.error)}</div>`);
   }));
+
+  // Adding or removing an AGV redraws the panel, so what is typed elsewhere in
+  // the form is read back first, exactly as the field rows do.
+  const editMpdvAgvs = (change) => {
+    const cfg = Object.assign({}, store.settings.mpdv, readMpdvForm());
+    change(cfg.agvs);
+    store.settings.mpdv = cfg;
+    renderAdmin();
+  };
+  $$('[data-magv-add]', body).forEach((el) => el.addEventListener('click', () =>
+    editMpdvAgvs((list) => list.push({ orderType: '', label: '', resourceId: '', stationRef: null, action: '', armId: '', command: '' }))));
+  $$('[data-magv-del]', body).forEach((el) => el.addEventListener('click', () =>
+    editMpdvAgvs((list) => list.splice(Number(el.dataset.magvDel), 1))));
 
   $$('[data-mf-add]', body).forEach((el) => el.addEventListener('click', () =>
     editMpdvFields(el.dataset.mfAdd, (list) => list.push({ acronym: '', value: '' }))));
