@@ -174,6 +174,26 @@ function mpdvAgvFullName(value) {
   return hit.resourceId ? `${hit.label || value} · ${hit.resourceId}` : (hit.label || String(value));
 }
 
+// What stops this product's MPDV order from commanding an arm, in the same
+// terms the main process reports it in, or null when the row is complete. The
+// product's route says nothing about this — the ordertype's AGV row is the whole
+// of it — so an editor warning has to read that row and not the steps.
+function mpdvSetupGap(product) {
+  const type = mpdvOrderTypeOf(product);
+  const agv = mpdvAgvRow(type);
+  if (!agv) return `No AGV is set up for ordertype ${type}, so no arm is commanded while this product's MPDV order runs.`;
+  const named = `AGV ${agv.label || type}`;
+  const where = 'Settings → MPDV → AGVs';
+  if (!(store.stations || []).some((s) => s.id === agv.stationRef)) {
+    return `${named} has no station set in ${where}, so no arm is commanded while this product's MPDV order runs.`;
+  }
+  const arms = ((store.settings || {}).arm || {}).arms || [];
+  if (!agv.armId || !arms.some((a) => a.id === agv.armId)) {
+    return `${named} has no arm set in ${where}, so no arm is commanded while this product's MPDV order runs.`;
+  }
+  return null;
+}
+
 // The order fields the app fills in per order. Shown so the payload reads as a
 // whole, but not editable: a row naming one of these is dropped when the order
 // is built, rather than being allowed to overwrite the running number.
@@ -2004,7 +2024,7 @@ function renderAdminProducts() {
     <div class="panel">
       <h2>Jobs / Products</h2>
       <p class="hint">Each product maps to a SYNAOS transport job. Configure its milestones (station + action), price, image, and whether users can see it.</p>
-      ${isMpdv() ? '<p class="hint">In <b>MPDV</b> mode the order and its operations are what reach the MES — but the route is still read for its <b>hand-overs</b>: each one says which arm works at which station, and the order waits there for that arm to report it has finished.</p>' : ''}
+      ${isMpdv() ? '<p class="hint">In <b>MPDV</b> mode the order and its operations are what reach the MES, and <b>the route below is not used</b>: an MPDV order moves the one AGV its <code>order.ordertype</code> names, and that AGV\'s row in <b>Settings → MPDV → AGVs</b> says where it stops and which arm meets it. Only the ordertype is set per product.</p>' : ''}
       <div class="admin-list">${list || '<p class="hint">No products yet.</p>'}</div>
       <button class="btn btn-primary" id="addProduct" style="margin-top:16px;">+ New job / product</button>
     </div>`;
@@ -2120,12 +2140,11 @@ function renderProductEditor(body) {
   const issuesHtml = issues.length
     ? `<div class="handover-warn">⚠️ ${issues.join('<br>⚠️ ')}</div>`
     : '';
-  // In MPDV mode the hand-overs are the only part of the route the app acts on,
-  // so a route without one quietly commands no arm at all. Say so here rather
-  // than let it be discovered when an order runs and nothing happens.
-  const noHandoverHtml = isMpdv() && !(p.steps || []).some(isHandoverStep)
-    ? '<div class="handover-warn">⚠️ This product has no hand-over, so no arm is commanded while its MPDV order runs. Add one to say which arm works at which station.</div>'
-    : '';
+  // In MPDV mode the route is not acted on at all: the cell's work comes from
+  // the ordertype's AGV row. A row that is not finished quietly commands no arm,
+  // so say so here rather than let it be discovered when an order runs.
+  const mpdvGap = isMpdv() ? mpdvSetupGap(p) : null;
+  const noHandoverHtml = mpdvGap ? `<div class="handover-warn">⚠️ ${escapeHtml(mpdvGap)}</div>` : '';
 
   body.innerHTML = `
     <div class="panel">

@@ -7,7 +7,7 @@ A Shopee-style desktop ordering app that dispatches orders to either of two syst
 
 Built with Electron for Windows and macOS, with light/dark mode and separate **user** and **admin** interfaces.
 
-![status](https://img.shields.io/badge/version-1.18.0-e0563f)
+![status](https://img.shields.io/badge/version-1.18.1-e0563f)
 
 ## Features
 
@@ -97,7 +97,7 @@ The running number is **`DDMMYY` + a two-digit counter** that restarts each day 
 
 The **SYNAOS id** is how an arrival is recognised — `1001` for the kuka and `36029` for the tusk, the ids those two AGVs are known by in the fleet. Only a milestone finished **by that robot** counts, so the other AGV passing through the same station no longer sets an arm off; an id left blank goes back to accepting whichever AGV turns up. Rows are added and removed, so an ordertype a site adds later needs no new build; a product set to an ordertype the table no longer has falls back to the first AGV rather than to a number that names nothing.
 
-A row with **no station or no arm commands nothing**, and the order result says exactly which — the order is still in the MES, which is what the shop floor needs first. An arm named in a row that has since been deleted is reported too, rather than quietly swapped for whichever arm is first in the list.
+A row with **no station or no arm commands nothing**, and the order result says exactly which — the order is still in the MES, which is what the shop floor needs first. An arm named in a row that has since been deleted is reported too, rather than quietly swapped for whichever arm is first in the list. The **product editor says the same thing up front** (v1.18.1): open a product in MPDV mode and an unfinished row for *its* ordertype is flagged there, so it is not discovered when an order runs and nothing happens.
 
 **The product's SYNAOS route is not read in MPDV mode at all.** Hand-overs still drive SYNAOS orders exactly as before; they simply no longer decide anything here.
 
@@ -133,8 +133,8 @@ Authentication is HTTP Basic. All admin configuration (products, stations, price
 ## Download
 
 Grab the latest installers from the [Releases page](../../releases):
-- **Windows** — `GradionShop-Setup-1.18.0.exe`
-- **macOS** — `GradionShop-1.18.0.dmg`
+- **Windows** — `GradionShop-Setup-1.18.1.exe`
+- **macOS** — `GradionShop-1.18.1.dmg`
 
 ## Development
 
