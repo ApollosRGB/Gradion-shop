@@ -203,7 +203,8 @@ function mpdvRawHtml(scope, raw, sample) {
         <div class="raw-actions">
           <button class="btn btn-primary" data-raw-save="${scope}">💾 Save this JSON</button>
           <button class="chip-btn" data-raw-check="${scope}">Check it</button>
-          <button class="link-btn danger" data-raw-fill="${scope}">Discard this and use the fields above</button>
+          <button class="chip-btn" data-raw-fill="${scope}">Fill this in from the fields</button>
+          <button class="link-btn danger" data-raw-off="${scope}">Discard this and use the fields above</button>
           <span class="fld-hint">Placeholders: <code>{orderNumber}</code> <code>{quantity}</code> <code>{orderType}</code> <code>{productName}</code> <code>{requestId}</code> <code>{language}</code> <code>{timeZoneId}</code> — each works as a JSON string (<code>"{orderNumber}"</code>) or as a bare number (<code>{quantity}</code>). <code>//</code> and <code>/* */</code> comments and trailing commas are allowed here; they are stripped before sending.</span>
         </div>
         <div class="raw-verdict" data-raw-verdict="${scope}"></div>
@@ -4391,11 +4392,20 @@ function renderAdminSettings() {
     });
   });
 
-  $$('[data-mraw][data-f="enabled"]', body).forEach((el) => el.addEventListener('change', () => {
+  $$('[data-mraw][data-f="enabled"]', body).forEach((el) => el.addEventListener('change', async () => {
     // Showing the editor rather than redrawing the panel: a redraw would throw
     // away whatever else is half-typed in this form.
     const host = $(`[data-raw-body="${el.dataset.mraw}"]`);
     if (host) host.classList.toggle('hidden', !el.checked);
+    // This switch decides what actually goes on the wire, so it is written as
+    // soon as it moves. Leaving it to the button at the foot of the panel meant
+    // switching hand-typed JSON off looked done while the next order still went
+    // out as hand-typed JSON. Saving reads the whole panel first, so nothing
+    // else half-typed in the form is lost by doing it here.
+    await saveMpdvSettings();
+    rawVerdict(el.dataset.mraw, el.checked
+      ? '<span class="fld-hint">Saved — this request will be sent as the JSON below.</span>'
+      : '<div class="raw-ok">💾 Saved. This request is built from the fields above.</div>');
   }));
   const fillRawFromFields = async (scope) => {
     const box = rawBox(scope);
@@ -4408,17 +4418,46 @@ function renderAdminSettings() {
       : ((preview.operationPayloads || [])[Number(scope.slice(3))] || {}).payload;
     if (!built) { toast('Nothing to copy for that request.', 'error'); return; }
     box.value = JSON.stringify(built, null, 2);
-    rawVerdict(scope, '<span class="fld-hint">Filled in from the fields above. The order number in it is a real one — swap it for <code>{orderNumber}</code> if every order should get its own.</span>');
+    rawVerdict(scope, '<span class="fld-hint">Filled in from the fields above — <b>not saved yet</b>, click <b>Save this JSON</b>. This request still sends your own JSON. The order number in it is a real one — swap it for <code>{orderNumber}</code> if every order should get its own.</span>');
   };
   $$('[data-raw-fill]', body).forEach((el) => el.addEventListener('click', () => {
     const scope = el.dataset.rawFill;
     const box = rawBox(scope);
     if (box && box.value.trim()) {
-      confirmModal('Discard the JSON you typed?',
-        'It will be replaced by the body the fields above produce. This cannot be undone.',
+      confirmModal('Replace the JSON you typed?',
+        'It will be replaced by the body the fields above produce, as a starting point to edit. This request keeps sending your own JSON — use “Discard this and use the fields above” to go back to the fields. This cannot be undone.',
         () => fillRawFromFields(scope));
     } else {
       fillRawFromFields(scope);
+    }
+  }));
+
+  // "Use the fields above" has to mean it. This button used to do nothing but
+  // paste the built body into the editor: the switch stayed on, so the request
+  // still went out as hand-typed JSON, and nothing was written to disk, so even
+  // the paste was gone at the next redraw. Now it turns the switch off, clears
+  // the JSON, and saves both there and then.
+  const discardRaw = async (scope) => {
+    const box = rawBox(scope);
+    const on = $(`[data-mraw="${scope}"][data-f="enabled"]`);
+    if (box) box.value = '';
+    if (on) on.checked = false;
+    const host = $(`[data-raw-body="${scope}"]`);
+    if (host) host.classList.add('hidden');
+    // Reads the whole panel, so the rest of the form goes to disk as it stands
+    await saveMpdvSettings();
+    rawVerdict(scope, '<div class="raw-ok">💾 Saved. This request is built from the fields above again.</div>');
+    toast('This request now uses the fields above', 'success');
+  };
+  $$('[data-raw-off]', body).forEach((el) => el.addEventListener('click', () => {
+    const scope = el.dataset.rawOff;
+    const box = rawBox(scope);
+    if (box && box.value.trim()) {
+      confirmModal('Discard the JSON you typed?',
+        'This request goes back to being built from the fields above, and the JSON here is deleted. This cannot be undone.',
+        () => discardRaw(scope));
+    } else {
+      discardRaw(scope);
     }
   }));
   $$('[data-raw-check]', body).forEach((el) => el.addEventListener('click', async () => {

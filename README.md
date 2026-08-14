@@ -7,7 +7,7 @@ A Shopee-style desktop ordering app that dispatches orders to either of two syst
 
 Built with Electron for Windows and macOS, with light/dark mode and separate **user** and **admin** interfaces.
 
-![status](https://img.shields.io/badge/version-1.19.0-e0563f)
+![status](https://img.shields.io/badge/version-1.19.1-e0563f)
 
 ## Features
 
@@ -77,7 +77,7 @@ Selected from the start menu (or the badge in the top bar). Each **cart line** b
 
 **Or send your own JSON (v1.16).** The fields build the order the shop normally sends; a vendor test often needs one it will not build — a different `ordertype`, other `columns` back, or params the app fills in itself. Each request — the order and each operation — has a **Send my own JSON for this request** switch and an editor holding the whole body, sent exactly as typed. Anything set above it is then ignored for that request, including the order id and quantity the app fills in and the rows set above it, and the panel says so. **Placeholders** put the per-order values back where they are wanted: `{orderNumber}` `{quantity}` `{orderType}` `{productName}` `{requestId}` `{language}` `{timeZoneId}` — each works as a JSON string (`"{orderNumber}"`) or as a bare number (`{quantity}`), and a value containing a quote is escaped rather than allowed to break the body. **The operations follow the id the order actually used (v1.16.2).** A raw order body carrying its own `order.id` is the one the operations reference, and the one the shop quotes — before this they still pointed at the running number the app had reserved, so MPDV was given operations hanging off an order that was never created. A raw body that supplies its own id no longer spends one of the day's 99 numbers either, and one that asks for `{orderNumber}` still gets it.
 
-Bodies are pasted from vendor documentation and from someone's notes, so the editor accepts them **as they arrive** (v1.16.1): `//` and `/* … */` **comments** and **trailing commas** are all allowed and stripped before sending — a `//` inside a string, such as a URL, is left exactly where it is. The editor has its own **Save this JSON** button, because the one at the foot of a long panel is not where you are looking; typing after a save says *not saved yet* until you press it. **Check it** parses it with the placeholders filled in and shows exactly what would go on the wire, along with warnings about what will bite on the *second* send. **Discard this and use the fields above** replaces the editor with the body the structured form would have produced, and asks first — an `order.id` with no `{orderNumber}` in it repeats, and MPDV refuses a duplicate; a fixed `order.plan.yield.base` ignores what the customer ordered. A body that does not parse is reported as a failed call for that request and **never sent** — with the text that failed, so the mistake is visible.
+Bodies are pasted from vendor documentation and from someone's notes, so the editor accepts them **as they arrive** (v1.16.1): `//` and `/* … */` **comments** and **trailing commas** are all allowed and stripped before sending — a `//` inside a string, such as a URL, is left exactly where it is. The editor has its own **Save this JSON** button, because the one at the foot of a long panel is not where you are looking; typing after a save says *not saved yet* until you press it. **Check it** parses it with the placeholders filled in and shows exactly what would go on the wire, along with warnings about what will bite on the *second* send. **Going back to the fields is one button, and it takes effect (v1.19.1).** **Discard this and use the fields above** turns the switch off, deletes the JSON and **writes both to disk there and then** — that request is built from the fields again, and stays that way. Until v1.19.1 it did neither: it only pasted the built body into the editor, so the switch stayed on and the request still went out as hand-typed JSON, and because nothing was saved even the paste vanished at the next redraw. Pasting the built body in is still available, as its own **Fill this in from the fields** button — that one is a starting point to edit, left unsaved and clearly labelled as such, and it does *not* switch hand-typed JSON off. Both ask before overwriting what you typed. Mind what you edit into a body you keep: an `order.id` with no `{orderNumber}` in it repeats, and MPDV refuses a duplicate; a fixed `order.plan.yield.base` ignores what the customer ordered. The **Send my own JSON for this request** switch is saved the moment it moves, too, for the same reason — it decides what goes on the wire, so it must never sit unsaved. A body that does not parse is reported as a failed call for that request and **never sent** — with the text that failed, so the mistake is visible.
 
 The **envelope** around those params is editable too (v1.13.1): **`columns`** (comma-separated, e.g. `operation.id, operation.ordertype`), the **`requestId`** MPDV echoes back, and **`returnAsObject`** — set per request, so the order and each arm can differ. `language` and `timeZoneId` were already editable. A requestId left unusable falls back to the counter that numbers the calls within a send, and blank entries in `columns` are dropped, so nothing typed into those boxes can produce a malformed body.
 
@@ -119,8 +119,8 @@ Authentication is HTTP Basic. All admin configuration (products, stations, price
 ## Download
 
 Grab the latest installers from the [Releases page](../../releases):
-- **Windows** — `GradionShop-Setup-1.19.0.exe`
-- **macOS** — `GradionShop-1.19.0.dmg`
+- **Windows** — `GradionShop-Setup-1.19.1.exe`
+- **macOS** — `GradionShop-1.19.1.dmg`
 
 ## Development
 
