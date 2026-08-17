@@ -177,19 +177,14 @@ function defaultStore() {
         password: 'MpUWLrfoXlPBC4BXADgYjXtYO',
         clientId: '',
         arms: defaultArms(),
-        timeoutSeconds: 120,         // give up waiting for an arm and continue anyway
-        // In MPDV mode the app creates no AGV job, so it watches SYNAOS for the
-        // AGV reaching the hand-over station, then commands the arm and waits
-        // for it exactly as a SYNAOS hand-over does.
-        mpdvWait: {
-          enabled: true,
-          arrivalTimeoutSeconds: 1800,   // how long to watch for the AGV
-          armTimeoutSeconds: 600         // how long to wait for the arm afterwards
-        }
+        timeoutSeconds: 120          // give up waiting for an arm and continue anyway
       },
       // MPDV MES — an alternative to dispatching AGV jobs. An order placed here
       // becomes a BOOrder plus the one BOOperation its product names; the order
-      // goes first, because the operation references its id.
+      // goes first, because the operation references its id. That is the whole
+      // of it: MPDV is not SYNAOS, so nothing else goes out with it — no job, no
+      // milestones, no arm commands. How the order's progress is read back from
+      // MPDV is a separate matter, still to be specified.
       mpdv: {
         baseUrl: 'https://azu-tr-vhxw-10.mpdv.cloud:8080',
         accessId: '00099831',
@@ -258,7 +253,6 @@ function defaultStore() {
     recalls: [],
     recallLog: [],
     pendingRelays: [],
-    pendingMpdvRuns: [],
     armConfigVersion: ARM_CONFIG_VERSION,
     // A fresh install has no hand-over carrying the pre-v1.17 command
     handoverCommandsMoved: true,
@@ -443,7 +437,9 @@ function normalizeArms(arm) {
       return a.commandTopic || a.stateTopic || a.statusTopic;
     });
   arm.arms = list.length ? list : shipped;
-  arm.mpdvWait = Object.assign({ enabled: true, arrivalTimeoutSeconds: 1800, armTimeoutSeconds: 600 }, arm.mpdvWait || {});
+  // The arms belong to SYNAOS hand-overs. An install from before MPDV stopped
+  // commanding them carries the settings for that; they mean nothing now.
+  delete arm.mpdvWait;
 }
 
 function loadStore() {
@@ -514,14 +510,10 @@ function loadStore() {
       try { saveStore(data); } catch (e) { /* read-only run; migration still applies in memory */ }
     }
     data.pendingRelays = data.pendingRelays || [];
-    // Finished runs are kept for a day so the tracking screen can still show one
-    // that has just completed; the order itself keeps its own copy of the
-    // stages, so pruning here loses nothing from the history.
-    data.pendingMpdvRuns = (data.pendingMpdvRuns || []).filter((r) => {
-      if (!r || (r.state !== 'done' && r.state !== 'failed')) return true;
-      const at = Date.parse(r.finishedAt || r.createdAt || '') || 0;
-      return Date.now() - at < 24 * 60 * 60 * 1000;
-    });
+    // An MPDV order is two calls and nothing more, so there is no run to carry:
+    // an install from when the app drove the cell off SYNAOS milestones drops
+    // whatever it had left over.
+    delete data.pendingMpdvRuns;
     data.stations = data.stations || def.stations;
     data.stations.forEach((s) => {
       if (!s.system) s.system = 'STATION';
@@ -588,7 +580,7 @@ function loadStore() {
 }
 
 // Written by the main process only — see the store:set handler.
-const MAIN_OWNED_KEYS = ['pendingRelays', 'pendingMpdvRuns', 'mpdvLog', 'mpdvCounter'];
+const MAIN_OWNED_KEYS = ['pendingRelays', 'mpdvLog', 'mpdvCounter'];
 
 function saveStore(data) {
   fs.mkdirSync(path.dirname(storePath), { recursive: true });
@@ -1984,272 +1976,6 @@ async function runRelaySupervisor() {
 }
 
 // ---------------------------------------------------------------------------
-// MPDV run supervisor
-//
-// In MPDV mode the app creates no AGV job: the order and its operation go to
-// the MES, which sends the AGV. The arms still have to be told when to work, and
-// they only work once the AGV has actually arrived — so for each hand-over in
-// the product's route the supervisor:
-//
-//   1. watches SYNAOS until a milestone at that station has FINISHED,
-//   2. publishes the command to that hand-over's arm,
-//   3. waits for the arm's state topic to say Finished,
-//
-// and only then moves the order on to its next stage. Runs are advanced one at a
-// time: there is one cell, and two orders must not command an arm at once.
-// ---------------------------------------------------------------------------
-
-let mpdvTimer = null;
-let mpdvRunning = false;
-
-// How far back to ask SYNAOS for jobs. Running jobs are always included; the
-// window only decides how much finished history comes with them.
-const MPDV_JOB_WINDOW_SECONDS = 3600;
-
-function notifyMpdvRunsChanged() {
-  BrowserWindow.getAllWindows().forEach((w) => {
-    if (!w.isDestroyed()) w.webContents.send('mpdv:runsChanged');
-  });
-}
-
-function scheduleMpdvSupervisor() {
-  if (mpdvTimer) return;
-  mpdvTimer = setInterval(runMpdvSupervisor, 4000);
-  runMpdvSupervisor();
-}
-
-// The stages an MPDV order goes through, read from the product's own route: each
-// hand-over the operator placed there is one stage, and the step before it says
-// where the AGV has to get to before that arm can work.
-function mpdvStagesForProduct(product, stations, arm) {
-  const steps = (product && product.steps) || [];
-  const stages = [];
-  steps.forEach((step, i) => {
-    if (!step || step.kind !== 'handover') return;
-    const prev = steps.slice(0, i).reverse().find((s) => s && s.kind !== 'handover');
-    if (!prev) return;         // a hand-over with nothing before it has no station
-    const station = (stations || []).find((s) => s.id === prev.stationRef);
-    const def = findArmDef(arm, step.armId);
-    if (!station || !def) return;
-    stages.push({
-      armId: def.id,
-      armLabel: def.label || def.id,
-      // Empty means the arm's own command, read when the stage is published so
-      // a command corrected mid-run is the one that goes out
-      method: step.method || '',
-      stationRef: prev.stationRef,
-      stationId: station.stationId,
-      stationName: station.name || station.stationId,
-      system: station.system || 'STATION',
-      action: prev.action || null,
-      state: 'pending',
-      taskId: null,
-      note: null
-    });
-  });
-  return stages;
-}
-
-// Has an AGV finished a milestone at this station since the order was sent? The
-// app did not create the job, so there is no id to follow — station, action and
-// "after we sent the order" is what there is to go on.
-function findStationArrival(jobs, stage, sinceMs) {
-  for (const job of jobs || []) {
-    for (const m of job.milestones || []) {
-      const address = m.address || {};
-      if (String(address.id || '') !== String(stage.stationId)) continue;
-      if (stage.system && address.system && String(address.system) !== String(stage.system)) continue;
-      // The AGV puts the load down before the arm takes it, so when the route
-      // says DROP a PICK at the same station is somebody else's business.
-      if (stage.action && m.action && String(m.action) !== String(stage.action)) continue;
-      const finished = (m.eventHistory || []).find((e) => e && e.name === 'MILESTONE_FINISHED');
-      if (!finished) continue;
-      const at = finished.time ? Date.parse(finished.time) : NaN;
-      if (!Number.isFinite(at) || at < sinceMs) continue;
-      return { jobId: job.id, resourceId: job.assignedResourceId || null, at: finished.time };
-    }
-  }
-  return null;
-}
-
-function findMpdvRun(store, runId) {
-  return (store.pendingMpdvRuns || []).find((r) => r.id === runId) || null;
-}
-
-// A run that was waiting for an arm when the app closed has lost the wait it was
-// sitting in. The AGV is already at the station, so the stage starts again from
-// the command — say so plainly, because that means the arm is told twice.
-function resumeMpdvRuns() {
-  const store = loadStore();
-  const runs = store.pendingMpdvRuns || [];
-  if (!runs.length) return false;
-  let changed = false;
-  runs.forEach((run) => {
-    if (run.state !== 'arm-running') return;
-    run.state = 'waiting-for-agv';
-    run.skipArrival = true;
-    run.lastError = 'The app restarted while the arm was working, so it is being commanded again.';
-    const stage = (run.stages || [])[run.index];
-    if (stage) stage.state = 'pending';
-    changed = true;
-  });
-  if (changed) saveStore(store);
-  return runs.some((r) => r.state !== 'done' && r.state !== 'failed');
-}
-
-// Advances the oldest run that still has work. Everything is written to the
-// store as it happens, so closing the window does not lose an order mid-flight.
-async function runMpdvSupervisor() {
-  if (mpdvRunning) return;
-  mpdvRunning = true;
-  try {
-    const store = loadStore();
-    const runs = (store.pendingMpdvRuns || []).filter((r) => r.state !== 'done' && r.state !== 'failed');
-    if (!runs.length) {
-      if ((store.pendingMpdvRuns || []).every((r) => r.state === 'done')) {
-        clearInterval(mpdvTimer);
-        mpdvTimer = null;
-      }
-      return;
-    }
-
-    const run = runs[0];                       // one cell, one order at a time
-    const stage = (run.stages || [])[run.index];
-    if (!stage) {
-      run.state = 'done';
-      saveStore(store);
-      notifyMpdvRunsChanged();
-      return;
-    }
-
-    const arm = store.settings.arm || {};
-    const wait = arm.mpdvWait || {};
-    // Switching the arms off has to stop work that was already queued too —
-    // otherwise a run created earlier would still command an arm the operator
-    // has just disabled.
-    if (!arm.enabled || wait.enabled === false) return;
-    const sinceMs = Date.parse(run.since) || Date.parse(run.createdAt) || Date.now();
-
-    // A run marked as commanding an arm while nothing is waiting for one has
-    // lost its wait — the only way here is an error thrown mid-stage. Put it
-    // back rather than let it block every order behind it.
-    if (run.state === 'arm-running' && ![...armState.waiters].some((w) => w.tag === `mpdv:${run.id}`)) {
-      run.state = 'waiting-for-agv';
-      run.skipArrival = true;                 // the AGV is already at the station
-      stage.state = 'pending';
-      saveStore(store);
-      notifyMpdvRunsChanged();
-      return;
-    }
-
-    // ---- 1. has the AGV got there yet? ----
-    if (run.state === 'waiting-for-agv') {
-      let arrival = null;
-      if (run.skipArrival) {
-        arrival = { jobId: null, resourceId: null, at: new Date().toISOString(), byHand: true };
-      } else {
-        const res = await apiRequest(store.settings, 'GET', `/api/v1/jobs?finishedLessThanSecondsAgo=${MPDV_JOB_WINDOW_SECONDS}`);
-        if (!res.ok || !Array.isArray(res.data)) return;    // transient — try again next tick
-        arrival = findStationArrival(res.data, stage, sinceMs);
-      }
-
-      if (!arrival) {
-        const limit = Math.max(30, Number(wait.arrivalTimeoutSeconds) || 1800) * 1000;
-        if (Date.now() - sinceMs > limit) {
-          const fresh = loadStore();
-          const target = findMpdvRun(fresh, run.id);
-          if (target) {
-            target.state = 'failed';
-            target.lastError = `No AGV reached ${stage.stationName} within the time allowed, so ${stage.armLabel} was not commanded.`;
-            saveStore(fresh);
-            notifyMpdvRunsChanged();
-          }
-        }
-        return;
-      }
-
-      // ---- 2. the AGV is there: command the arm ----
-      const fresh = loadStore();
-      const target = findMpdvRun(fresh, run.id);
-      if (!target) return;
-      const current = target.stages[target.index];
-      current.state = 'arm-running';
-      current.taskId = nextArmTaskId();
-      current.arrivedAt = arrival.at || new Date().toISOString();
-      current.arrivedBy = arrival.byHand ? 'skipped by hand' : (arrival.resourceId || null);
-      target.state = 'arm-running';
-      target.skipArrival = false;
-      target.lastError = null;
-      saveStore(fresh);
-      notifyMpdvRunsChanged();
-
-      let result;
-      try {
-        const def = findArmDef(arm, current.armId);
-        result = await runArmTransfer(arm, def, {
-          taskId: current.taskId,
-          command: current.method || '',
-          quantity: Number(target.quantity) > 0 ? Number(target.quantity) : 1,
-          from: current.stationId,
-          to: current.stationId,
-          fromStation: current.stationId,
-          toStation: current.stationId,
-          orderId: target.orderNumber,
-          orderNumber: target.orderNumber,
-          productName: target.productName || '',
-          unitId: target.id,
-          transferId: `${target.orderNumber}-${target.index}`
-        }, { timeoutSeconds: wait.armTimeoutSeconds, tag: `mpdv:${target.id}` });
-      } catch (err) {
-        // Broker unreachable — put the stage back and try again next tick
-        const back = loadStore();
-        const r = findMpdvRun(back, run.id);
-        if (r) {
-          r.stages[r.index].state = 'pending';
-          r.state = 'waiting-for-agv';
-          r.lastError = `Arm unreachable: ${err.message}`;
-          // The AGV has already arrived, so do not make it arrive again
-          r.skipArrival = true;
-          saveStore(back);
-          notifyMpdvRunsChanged();
-        }
-        return;
-      }
-
-      // ---- 3. the arm has answered (or the wait ran out): move the order on ----
-      const after = loadStore();
-      const done = findMpdvRun(after, run.id);
-      if (!done) return;
-      const finishedStage = done.stages[done.index];
-      finishedStage.state = result.ok ? 'done' : 'continued';
-      finishedStage.note = describeArmOutcome(result);
-      finishedStage.finishedAt = new Date().toISOString();
-      done.index += 1;
-      done.lastError = finishedStage.note;
-      if (done.index >= done.stages.length) {
-        done.state = 'done';
-        done.finishedAt = new Date().toISOString();
-      } else {
-        done.state = 'waiting-for-agv';
-        done.since = new Date().toISOString();   // the next stage watches from now
-        // Two arms working at the same station means the load is already there:
-        // no AGV makes a second trip, so there would be no arrival to see.
-        const next = done.stages[done.index];
-        if (next.stationId === finishedStage.stationId && next.system === finishedStage.system) {
-          done.skipArrival = true;
-        }
-      }
-      saveStore(after);
-      notifyMpdvRunsChanged();
-    }
-  } catch (err) {
-    armState.lastError = `MPDV supervisor: ${err.message}`;
-  } finally {
-    mpdvRunning = false;
-  }
-}
-
-// ---------------------------------------------------------------------------
 // IPC
 // ---------------------------------------------------------------------------
 
@@ -2443,26 +2169,16 @@ function registerIpc() {
   });
 
   // Creates one MPDV order per cart line, then the single operation that line's
-  // product names against it. Returns a result per line, each carrying every
-  // call it made, so the shop can show exactly which step failed and in MPDV's
-  // own words.
+  // product names against it. Those two calls are the entire MPDV dispatch:
+  // MPDV is not SYNAOS, so no job is created, no milestone is watched and no arm
+  // is commanded off the back of one — the MES owns what happens next. Returns a
+  // result per line, each carrying every call it made, so the shop can show
+  // exactly which step failed and in MPDV's own words.
   ipcMain.handle('mpdv:createOrders', async (_ev, { lines }) => {
     const startStore = loadStore();
     const cfg = startStore.settings.mpdv || {};
-    const armCfg = startStore.settings.arm || {};
-    const armWait = armCfg.mpdvWait || {};
-    const armGating = !!(armCfg.enabled && armWait.enabled !== false);
     const results = [];
-    const queued = [];
     let requestId = 1;
-
-    // Subscribe before the first order goes out, so an arm that answers early is
-    // heard. A broker that cannot be reached is reported per line rather than
-    // stopping the order — the MES record is what the shop floor needs first.
-    let brokerError = null;
-    if (armGating) {
-      try { await connectArm(armCfg); } catch (err) { brokerError = err.message; }
-    }
 
     // An operation that fails is tried again before the next one is sent — a
     // refusal is usually MPDV being busy rather than the payload being wrong.
@@ -2497,7 +2213,7 @@ function registerIpc() {
       const product = (startStore.products || []).find((p) => p.id === line.productId);
       // One order, one operation — the product's own. A product naming none is
       // refused here, before a number is reserved: the day only has 99 of them,
-      // and an order with no operation is a record the cell cannot run.
+      // and an order with no operation is a record MPDV cannot produce.
       const operation = mpdvOperationForProduct(cfg, product);
       if (!operation) {
         const entry = {
@@ -2579,103 +2295,11 @@ function registerIpc() {
         calls
       };
 
-      // The order is in the MES; now the cell has to run it. Each hand-over in
-      // the product's route becomes a stage: AGV to the station, arm commanded,
-      // arm finished. A line whose order was refused runs nothing.
-      if (!failed && armGating) {
-        const stages = mpdvStagesForProduct(product, startStore.stations, armCfg);
-        if (stages.length) {
-          const run = {
-            id: crypto.randomUUID(),
-            orderNumber: sentOrderId,
-            productId: line.productId || null,
-            productName: line.name || '',
-            quantity,
-            stages,
-            index: 0,
-            state: 'waiting-for-agv',
-            // Only an arrival from here on belongs to this order
-            since: new Date().toISOString(),
-            createdAt: new Date().toISOString(),
-            lastError: brokerError ? `Broker unreachable when the order was sent: ${brokerError}` : null
-          };
-          queued.push(run);
-          entry.run = { id: run.id, stages: stages.map((s) => ({ armLabel: s.armLabel, stationName: s.stationName })) };
-        }
-        entry.armNote = brokerError
-          ? `The order reached MPDV, but the arm broker did not answer: ${brokerError}`
-          : (stages.length ? null : 'No hand-over is set in this product\'s route, so no arm is commanded.');
-      }
-
       recordMpdvLog(entry);
       results.push(entry);
     }
 
-    if (queued.length) {
-      const store = loadStore();
-      store.pendingMpdvRuns = (store.pendingMpdvRuns || []).concat(queued);
-      saveStore(store);
-      scheduleMpdvSupervisor();
-      notifyMpdvRunsChanged();
-    }
     return results;
-  });
-
-  // What the cell is doing with the MPDV orders that are running
-  ipcMain.handle('mpdv:runs', () => (loadStore().pendingMpdvRuns || []).map((r) => ({
-    id: r.id,
-    orderNumber: r.orderNumber,
-    productName: r.productName,
-    quantity: r.quantity,
-    state: r.state,
-    index: r.index,
-    lastError: r.lastError || null,
-    createdAt: r.createdAt,
-    stages: (r.stages || []).map((s) => ({
-      armId: s.armId, armLabel: s.armLabel, stationName: s.stationName, stationId: s.stationId,
-      action: s.action, state: s.state, note: s.note || null,
-      arrivedAt: s.arrivedAt || null, arrivedBy: s.arrivedBy || null, taskId: s.taskId || null
-    }))
-  })));
-
-  // Stop waiting: while watching for the AGV this says "it is there, go on"; while
-  // waiting for the arm it says "it is done, carry on without the message".
-  ipcMain.handle('mpdv:skipWait', (_ev, runId) => {
-    const store = loadStore();
-    const run = findMpdvRun(store, runId);
-    if (!run) return { ok: false, error: 'That run is no longer listed.' };
-    if (run.state === 'arm-running') {
-      const stopped = cancelArmWaits(`mpdv:${run.id}`, 'skipped');
-      return { ok: true, skipped: 'arm', stopped };
-    }
-    run.skipArrival = true;
-    run.state = 'waiting-for-agv';
-    saveStore(store);
-    scheduleMpdvSupervisor();
-    notifyMpdvRunsChanged();
-    return { ok: true, skipped: 'arrival' };
-  });
-
-  // Gives up on a run. The MES order stays exactly as it is — this only stops the
-  // app from commanding arms for it.
-  ipcMain.handle('mpdv:cancelRun', (_ev, runId) => {
-    const store = loadStore();
-    const run = findMpdvRun(store, runId);
-    if (!run) return { ok: false, error: 'That run is no longer listed.' };
-    cancelArmWaits(`mpdv:${run.id}`, 'skipped');
-    store.pendingMpdvRuns = (store.pendingMpdvRuns || []).filter((r) => r.id !== runId);
-    saveStore(store);
-    notifyMpdvRunsChanged();
-    return { ok: true };
-  });
-
-  // Clears the finished and abandoned runs out of the list
-  ipcMain.handle('mpdv:clearRuns', () => {
-    const store = loadStore();
-    store.pendingMpdvRuns = (store.pendingMpdvRuns || []).filter((r) => r.state !== 'done' && r.state !== 'failed');
-    saveStore(store);
-    notifyMpdvRunsChanged();
-    return true;
   });
 
   // Sends nothing; just reports what the next number would look like.
@@ -2790,16 +2414,7 @@ function registerIpc() {
       pending: (store.pendingRelays || []).map((r) => ({
         unitId: r.unitId, productName: r.productName, state: r.state,
         leg: r.nextIndex + 1, totalLegs: r.legs.length, lastError: r.lastError
-      })),
-      mpdvRuns: (store.pendingMpdvRuns || [])
-        .filter((r) => r.state !== 'done')
-        .map((r) => ({
-          orderNumber: r.orderNumber, productName: r.productName, state: r.state,
-          stage: r.index + 1, totalStages: (r.stages || []).length,
-          armLabel: ((r.stages || [])[r.index] || {}).armLabel || '',
-          stationName: ((r.stages || [])[r.index] || {}).stationName || '',
-          lastError: r.lastError || null
-        }))
+      }))
     };
   });
 
@@ -3097,7 +2712,6 @@ if (!gotLock) {
     createWindow();
     // Pick up hand-overs left in flight by a previous run
     if ((loadStore().pendingRelays || []).length) scheduleRelaySupervisor();
-    if (resumeMpdvRuns()) scheduleMpdvSupervisor();
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
     });
@@ -3151,10 +2765,6 @@ module.exports = {
   describeArmOutcome,
   waitForArmDone,
   cancelArmWaits,
-  mpdvStagesForProduct,
-  findStationArrival,
-  runMpdvSupervisor,
-  resumeMpdvRuns,
   connectArm,
   runArmTransfer,
   buildRelayPayloads,

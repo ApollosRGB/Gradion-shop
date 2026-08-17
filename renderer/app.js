@@ -101,20 +101,6 @@ function wireChrome() {
       if (currentView === 'admin' && adminTab === 'settings') refreshArmLog();
     });
   }
-  // The MPDV run supervisor lives in the main process too: it says when an AGV
-  // has arrived, when an arm was commanded and when it answered.
-  if (window.api.onMpdvRunsChanged) {
-    window.api.onMpdvRunsChanged(() => {
-      if (currentView === 'mpdv-result') refreshMpdvRuns();
-      if (currentView === 'admin' && adminTab === 'settings') refreshArmLog();
-      // The tracking screen polls as well, but a stage can turn over between
-      // two polls and the customer is watching that line, not the clock.
-      if (currentView === 'progress') {
-        const order = store.orders.find((o) => o.id === progressOrderId);
-        if (isMpdvOrder(order)) pollMpdvOnce(order);
-      }
-    });
-  }
   $('#themeToggle').addEventListener('click', toggleTheme);
   $('#adminToggle').addEventListener('click', onAdminToggle);
   $('#modeBadge').addEventListener('click', () => showView('start'));
@@ -637,7 +623,7 @@ async function onFinishMpdv() {
   }
 
   // A production order is an order like any other: it goes in the history and
-  // is tracked on the same screen, through the cell's stages rather than jobs.
+  // opens on the same screen, showing what the MES was sent rather than jobs.
   const order = buildMpdvOrderRecord(lines, results, total);
   store.orders.unshift(order);
   await persist();
@@ -652,9 +638,10 @@ async function onFinishMpdv() {
   showView('mpdv-result');
 }
 
-// The order record behind an MPDV send. `lines` carries what the MES was told
-// and, for each line that has hand-overs, the run the cell is working through —
-// kept on the order itself so the history survives the runs being cleared.
+// The order record behind an MPDV send. `lines` carries what the MES was told —
+// the order number it was given and the one operation it carried. Nothing about
+// how the cell then runs it: MPDV owns that, and reading it back is not
+// something this app does yet.
 function buildMpdvOrderRecord(lines, results, total) {
   const id = uid('ord');
   const items = [];
@@ -667,7 +654,6 @@ function buildMpdvOrderRecord(lines, results, total) {
         qty: line.quantity, image: line.image, steps: (product && product.steps) || []
       });
     }
-    const run = r.run || null;
     return {
       productId: line.productId || null,
       productName: r.productName || line.name || '',
@@ -678,17 +664,7 @@ function buildMpdvOrderRecord(lines, results, total) {
       createdId: r.createdId || null,
       quantity: r.quantity != null ? r.quantity : line.quantity,
       ok: !!r.ok,
-      error: r.error || null,
-      armNote: r.armNote || null,
-      runId: run ? run.id : null,
-      // 'no-arm' = the order is in the MES and there is nothing for the cell to
-      // do, so there is nothing to wait for either.
-      runState: !r.ok ? 'failed' : run ? 'waiting-for-agv' : 'no-arm',
-      runIndex: 0,
-      lastError: null,
-      stages: run ? (run.stages || []).map((s) => ({
-        armLabel: s.armLabel, stationName: s.stationName, state: 'pending', note: null
-      })) : []
+      error: r.error || null
     };
   });
 
@@ -777,16 +753,12 @@ function renderMpdvResult(results, total, orderId) {
           : 'No order number was issued'}${mpdvCreatedIdNote(r)}</div>
         ${mpdvOperationNote(r)}
         ${r.ok ? '' : `<div class="err-text">${escapeHtml(r.error || 'Rejected by MPDV')}</div>`}
-        ${r.armNote ? `<div class="tl-meta">🤝 ${escapeHtml(r.armNote)}</div>` : ''}
         ${mpdvCallsHtml(r)}
       </div>
       <div class="qty-lbl">Qty: ${r.quantity}</div>
     </div>`).join('');
 
   const allOk = okCount === results.length && results.length > 0;
-  // The runs this send started, so the panel below follows these orders and not
-  // whatever else the cell may still be finishing.
-  mpdvWatchedRunIds = results.filter((r) => r.run && r.run.id).map((r) => r.run.id);
   $('#mpdvResultWrap').innerHTML = `
     <div class="order-card" style="text-align:center;">
       <div style="font-size:56px;">${allOk ? '🏭' : okCount ? '⚠️' : '❌'}</div>
@@ -795,7 +767,6 @@ function renderMpdvResult(results, total, orderId) {
         : okCount ? 'Partly sent to production' : 'MPDV did not accept the order'}</h2>
       <p class="hint">${okCount} of ${results.length} line(s) reached MPDV.</p>
     </div>
-    <div id="mpdvRunsWrap"></div>
     <div class="order-items-card">
       <h3>Order lines</h3>
       ${rows}
@@ -811,96 +782,6 @@ function renderMpdvResult(results, total, orderId) {
   $('#mpdvBackToShop').addEventListener('click', () => showView('shop'));
   const track = $('#mpdvTrack');
   if (track) track.addEventListener('click', () => openProgress(orderId));
-  refreshMpdvRuns();
-}
-
-// ===========================================================================
-// MPDV — what the cell does once the order is in the MES
-//
-// The order and its operations are already created. From here the app watches
-// SYNAOS for the AGV reaching each hand-over station, commands that arm, and
-// waits for its Finished before the order moves on. All of it runs in the main
-// process, so this is only the window onto it.
-// ===========================================================================
-
-let mpdvWatchedRunIds = [];
-
-function mpdvRunStateText(state, armLabel, stationName) {
-  switch (state) {
-    case 'waiting-for-agv': return `waiting for an AGV to reach ${stationName || 'the station'}`;
-    case 'arm-running': return `${armLabel || 'the arm'} is working`;
-    case 'failed': return 'given up';
-    case 'done': return 'finished';
-    default: return state || '';
-  }
-}
-
-function mpdvStageRowHtml(stage, index, run) {
-  const isCurrent = index === run.index && run.state !== 'done' && run.state !== 'failed';
-  const mark = stage.state === 'done' ? '✅'
-    : stage.state === 'continued' ? '⚠️'
-      : isCurrent ? (run.state === 'arm-running' ? '🤖' : '⏳') : '○';
-  const where = `${escapeHtml(stage.stationName || stage.stationId || '')}${stage.action ? ` · ${escapeHtml(stage.action)}` : ''}`;
-  const detail = isCurrent
-    ? mpdvRunStateText(run.state, stage.armLabel, stage.stationName)
-    : stage.state === 'done' ? 'reported it had finished'
-      : stage.state === 'continued' ? (stage.note || 'continued without the arm confirming')
-        : 'waiting its turn';
-  return `<div class="arm-log-row">
-    <span class="dir">${mark}</span>
-    <span class="msg"><b>${escapeHtml(stage.armLabel || stage.armId)}</b> at ${where} — ${escapeHtml(detail)}</span>
-  </div>`;
-}
-
-function mpdvRunCardHtml(run) {
-  const stages = (run.stages || []).map((s, i) => mpdvStageRowHtml(s, i, run)).join('');
-  const busy = run.state === 'waiting-for-agv' || run.state === 'arm-running';
-  const head = run.state === 'done' ? '✅ The cell has finished this order'
-    : run.state === 'failed' ? '⚠️ Given up on this order'
-      : `⏳ Stage ${run.index + 1} of ${(run.stages || []).length} — ${mpdvRunStateText(run.state, ((run.stages || [])[run.index] || {}).armLabel, ((run.stages || [])[run.index] || {}).stationName)}`;
-  return `<div class="op-row" style="flex-direction:column;align-items:stretch;">
-    <div class="mpdv-call-head">
-      <b>Order ${escapeHtml(run.orderNumber || '')}</b>
-      <span class="chip">${escapeHtml(run.productName || '')}</span>
-      <span class="chip">Qty ${run.quantity}</span>
-    </div>
-    <div class="tl-meta" style="margin:4px 0 8px;">${escapeHtml(head)}</div>
-    ${stages}
-    ${run.lastError ? `<div class="mpdv-log-err">${escapeHtml(run.lastError)}</div>` : ''}
-    ${busy ? `<div class="progress-actions" style="margin-top:8px;flex-wrap:wrap;">
-      <button class="btn btn-secondary" data-run-skip="${escapeHtml(run.id)}">${run.state === 'arm-running' ? 'The arm is done — carry on' : 'The AGV is there — carry on'}</button>
-      <button class="link-btn danger" data-run-cancel="${escapeHtml(run.id)}">Stop watching this order</button>
-    </div>` : ''}
-  </div>`;
-}
-
-// Draws the runs this send started. Called again whenever the main process says
-// something moved, so the screen follows the cell without being asked.
-async function refreshMpdvRuns() {
-  const host = $('#mpdvRunsWrap');
-  if (!host) return;
-  let runs = [];
-  try { runs = await window.api.mpdvRuns(); } catch (e) { return; }
-  const mine = runs.filter((r) => mpdvWatchedRunIds.includes(r.id));
-  if (!host.isConnected) return;
-  if (!mine.length) { host.innerHTML = ''; return; }
-  host.innerHTML = `<div class="order-items-card">
-    <h3>In the cell</h3>
-    <p class="hint">The AGV has to reach the hand-over station before its arm is commanded; the order only moves on once that arm reports it has finished.</p>
-    ${mine.map(mpdvRunCardHtml).join('')}
-  </div>`;
-  $$('[data-run-skip]', host).forEach((b) => b.addEventListener('click', async () => {
-    b.disabled = true;
-    const res = await window.api.mpdvSkipWait(b.dataset.runSkip);
-    if (!res.ok) toast(res.error || 'That run is no longer listed.', 'error');
-    refreshMpdvRuns();
-  }));
-  $$('[data-run-cancel]', host).forEach((b) => b.addEventListener('click', async () => {
-    b.disabled = true;
-    await window.api.mpdvCancelRun(b.dataset.runCancel);
-    toast('Stopped watching — the MPDV order itself is untouched.');
-    refreshMpdvRuns();
-  }));
 }
 
 // ===========================================================================
@@ -1211,8 +1092,10 @@ function openProgress(orderId) {
   const ord = store.orders.find((o) => o.id === orderId);
   ratingDraft = ord && ord.ratings ? { ...ord.ratings } : {};
   showView('progress');
-  if (isMpdvOrder(ord)) renderMpdvProgress(ord);
-  else renderProgress(null);
+  // An MPDV order has nothing to poll — the app knows what it sent and no more,
+  // so the screen is drawn once and left alone.
+  if (isMpdvOrder(ord)) { renderMpdvProgress(ord); return; }
+  renderProgress(null);
   startPolling();
 }
 
@@ -1266,9 +1149,10 @@ async function pollOnce() {
   const order = store.orders.find((o) => o.id === progressOrderId);
   if (!order) { stopPolling(); return; }
   if (order.confirmed || order.state === 'completed') { stopPolling(); }
-  // An MPDV order has no jobs of its own to read; the cell's stages are its
-  // progress, and the main process is what watches them.
-  if (isMpdvOrder(order)) { await pollMpdvOnce(order); return; }
+  // An MPDV order has no SYNAOS job to read, and its status is not read from
+  // MPDV yet — so there is nothing to poll for. Draw what the send recorded and
+  // stop the timer rather than let it tick over the same screen.
+  if (isMpdvOrder(order)) { stopPolling(); renderMpdvProgress(order); return; }
 
   const liveJobs = {};
   let noted = false;
@@ -1474,59 +1358,20 @@ function renderProgress(liveJobs, orderArg) {
 // ===========================================================================
 // MPDV order tracking
 //
-// The MES has the order; what the customer wants to see is the cell working
-// through it. Each hand-over in the route is a stage — the AGV getting to the
-// station, then that arm doing its work — and the main process reports where it
-// has got to. What it reports is copied onto the order as it goes, so the
-// history still reads correctly long after the run itself has been cleared.
+// The MES has the order and its operation, and that is everything this app
+// knows. It does not create the AGV job, does not watch SYNAOS milestones and
+// does not command the arms for an MPDV order — SYNAOS is a different system,
+// and borrowing its progress would only be a guess at what MPDV is doing.
+//
+// So the screen shows what was actually established: the order went to MPDV,
+// carrying this operation. Reading the real status back out of MPDV is still to
+// be specified; when it is, this is where its stops belong.
 // ===========================================================================
 
-async function pollMpdvOnce(order) {
-  let runs = [];
-  try { runs = await window.api.mpdvRuns(); } catch (e) { renderMpdvProgress(order); return; }
-
-  const signature = (l) => JSON.stringify([l.runState, l.runIndex, l.lastError, l.stages]);
-  let changed = false;
-
-  (order.lines || []).forEach((line) => {
-    if (!line.runId) return;
-    const run = runs.find((r) => r.id === line.runId);
-    if (!run) {
-      // Cleared, stopped by hand or pruned. The stages already recorded stand,
-      // but a line still shown as waiting would wait for something nobody is
-      // watching any more — so say that instead.
-      if (line.runState === 'waiting-for-agv' || line.runState === 'arm-running') {
-        line.runState = 'stopped';
-        line.lastError = 'The app is no longer watching this order in the cell.';
-        changed = true;
-      }
-      return;
-    }
-    const before = signature(line);
-    line.runState = run.state;
-    line.runIndex = run.index;
-    line.lastError = run.lastError || null;
-    line.stages = run.stages || [];
-    if (signature(line) !== before) changed = true;
-  });
-
-  // Delivered once every line the MES accepted has been worked through. A line
-  // with no hand-over has nothing to wait for, so it never holds the order open.
-  const tracked = (order.lines || []).filter((l) => l.ok);
-  const allDone = tracked.length > 0 && tracked.every((l) => l.runState === 'done' || l.runState === 'no-arm');
-  if (allDone && !order.confirmed && order.state !== 'completed') {
-    markOrderDelivered(order);
-    changed = true;
-  }
-  if (changed) {
-    await persist();
-    renderOrdersBadge();
-  }
-  renderMpdvProgress(order);
-}
-
 // One stop for the AGV getting there and one for the arm, per stage, so the
-// screen shows which of the two the order is actually waiting on.
+// One stop per line the MES accepted, naming the operation it carried. Every
+// stop here is something the app watched happen on the wire — nothing stands in
+// for progress MPDV has not been asked for.
 function mpdvStepLines(order) {
   const lines = order.lines || [];
   const many = lines.filter((l) => l.ok).length > 1;
@@ -1542,47 +1387,13 @@ function mpdvStepLines(order) {
   lines.forEach((line) => {
     if (!line.ok) return;
     const tag = many ? `${line.productName} · ` : '';
-    if (!line.stages || !line.stages.length) {
-      steps.push({
-        icon: '🏭',
-        label: 'In production',
-        place: `${tag}MPDV ${line.orderNumber || ''}${line.operation ? ` · ${line.operation.label}` : ''}`.trim(),
-        text: `${line.productName} is with MPDV`,
-        state: 'done',
-        at: order.createdAt
-      });
-      return;
-    }
-    line.stages.forEach((stage, i) => {
-      // Nothing is "in progress" once the run has finished, been given up on or
-      // stopped being watched — those stops go back to being plain pending ones.
-      const watching = line.runState !== 'done' && line.runState !== 'failed' && line.runState !== 'stopped';
-      const current = watching && i === line.runIndex;
-      const past = i < line.runIndex;
-      const armDone = past || stage.state === 'done' || stage.state === 'continued';
-      const arrived = armDone || !!stage.arrivedAt || (current && line.runState === 'arm-running');
-      steps.push({
-        icon: '🚚',
-        label: arrived ? 'AGV arrived' : 'AGV on its way',
-        place: `${tag}${stage.stationName || stage.stationId || ''}`,
-        text: arrived
-          ? `The AGV reached ${stage.stationName || 'the station'}`
-          : `Waiting for an AGV to reach ${stage.stationName || 'the station'}`,
-        state: arrived ? 'done' : current ? 'active' : 'pending',
-        at: stage.arrivedAt || null
-      });
-      steps.push({
-        icon: stage.state === 'continued' ? '⚠️' : '🤖',
-        label: stage.armLabel || 'Arm',
-        place: `${tag}${stage.stationName || ''}`,
-        text: armDone
-          ? `${stage.armLabel || 'The arm'} finished at ${stage.stationName || 'the station'}`
-          : current && line.runState === 'arm-running'
-            ? `${stage.armLabel || 'The arm'} is working`
-            : `${stage.armLabel || 'The arm'} waits its turn`,
-        state: armDone ? 'done' : current && line.runState === 'arm-running' ? 'active' : 'pending',
-        at: stage.finishedAt || null
-      });
+    steps.push({
+      icon: '🏭',
+      label: 'In production',
+      place: `${tag}MPDV ${line.orderNumber || ''}${line.operation ? ` · ${line.operation.label}` : ''}`.trim(),
+      text: `${line.productName} is with MPDV`,
+      state: 'done',
+      at: order.createdAt
     });
   });
 
@@ -1591,7 +1402,7 @@ function mpdvStepLines(order) {
     icon: completed ? '🎉' : '🏁',
     label: 'Completed',
     place: completed ? 'Ready for you' : '',
-    text: completed ? 'The cell has finished this order' : 'Order complete',
+    text: completed ? 'This order is done' : 'Order complete',
     state: completed ? 'done' : 'pending'
   });
   return steps;
@@ -1605,47 +1416,19 @@ function renderMpdvProgress(orderArg) {
   const view = railGeometry(stepLines, completed);
 
   const failedLine = (order.lines || []).find((l) => !l.ok);
-  const givenUp = (order.lines || []).find((l) => l.runState === 'failed' || l.runState === 'stopped');
   const headNote = failedLine
     ? `<div class="err-text" style="text-align:center;margin-bottom:10px;">⚠️ MPDV did not accept ${escapeHtml(failedLine.productName || 'a line')}. ${escapeHtml(failedLine.error || '')}</div>`
-    : givenUp
-      ? `<div class="err-text" style="text-align:center;margin-bottom:10px;">⚠️ ${escapeHtml(givenUp.lastError || 'The cell gave up on this order.')}</div>`
-      : '';
+    : '';
 
-  const current = stepLines.find((s) => s.state === 'active')
-    || [...stepLines].reverse().find((s) => s.state === 'done')
-    || stepLines[0];
-  // Nothing is coming next once the cell has given up or stopped being watched,
-  // so the line that would promise one is left off.
-  const nextUp = givenUp ? null : stepLines.find((s) => s.state === 'pending');
+  const current = [...stepLines].reverse().find((s) => s.state === 'done') || stepLines[0];
   const statusHtml = `
-    <div class="status-line ${completed ? 'done' : view.moving ? 'moving' : 'waiting'}">
-      <span class="status-icon">${completed ? '🎉' : view.moving ? '🏭' : givenUp ? '⚠️' : '⏳'}</span>
+    <div class="status-line ${completed ? 'done' : 'waiting'}">
+      <span class="status-icon">${completed ? '🎉' : '🏭'}</span>
       <div class="status-body">
-        <div class="status-now">${escapeHtml(completed
-          ? 'The cell has finished this order'
-          : givenUp ? (givenUp.lastError || 'The cell is no longer working on this order')
-            : current.text)}</div>
-        ${!completed && nextUp ? `<div class="status-next">Next: ${escapeHtml(nextUp.text)}</div>` : ''}
+        <div class="status-now">${escapeHtml(completed ? 'This order is done' : current.text)}</div>
+        ${completed ? '' : '<div class="status-next">MPDV is producing it — the app is not reading its progress back yet.</div>'}
       </div>
-      ${!completed && view.moving ? '<span class="status-pips"><i></i><i></i><i></i></span>' : ''}
     </div>`;
-
-  // The same two ways out the result screen offers: something is true on the
-  // floor but silent on the wire, or the cell should stop being watched.
-  const busy = (order.lines || []).filter((l) => l.runId
-    && (l.runState === 'waiting-for-agv' || l.runState === 'arm-running'));
-  const controls = busy.length ? `
-    <div class="order-card">
-      <h3 style="margin-top:0;">Nothing moving?</h3>
-      <p class="hint">Use these if the floor is ahead of what the app can see.</p>
-      ${busy.map((l) => `
-        <div class="progress-actions" style="flex-wrap:wrap;margin-bottom:6px;">
-          <span class="chip">${escapeHtml(l.productName)}</span>
-          <button class="btn btn-secondary" data-run-skip="${escapeHtml(l.runId)}">${l.runState === 'arm-running' ? 'The arm is done — carry on' : 'The AGV is there — carry on'}</button>
-          <button class="link-btn danger" data-run-cancel="${escapeHtml(l.runId)}">Stop watching</button>
-        </div>`).join('')}
-    </div>` : '';
 
   // An MES order cannot be recalled through this API, so the screen never
   // offers to cancel one — only to confirm it has been collected.
@@ -1660,7 +1443,6 @@ function renderMpdvProgress(orderArg) {
 
   $('#progressWrap').innerHTML = `
     ${railCardHtml(order, stepLines, statusHtml, headNote, view)}
-    ${controls}
     ${confirmBlock}
     ${ratingBlockHtml(order, completed)}
     ${orderItemsCardHtml(order)}
@@ -1669,27 +1451,16 @@ function renderMpdvProgress(orderArg) {
     </div>`;
 
   wireProgressActions(order);
-  $$('[data-run-skip]').forEach((b) => b.addEventListener('click', async () => {
-    b.disabled = true;
-    const res = await window.api.mpdvSkipWait(b.dataset.runSkip);
-    if (!res.ok) toast(res.error || 'That run is no longer listed.', 'error');
-    pollMpdvOnce(order);
-  }));
-  $$('[data-run-cancel]').forEach((b) => b.addEventListener('click', async () => {
-    b.disabled = true;
-    await window.api.mpdvCancelRun(b.dataset.runCancel);
-    toast('Stopped watching — the MPDV order itself is untouched.');
-    pollMpdvOnce(order);
-  }));
 }
 
 // ---------------------------------------------------------------------------
 // The tracking screen's parts, shared by both systems
 //
-// A SYNAOS order is tracked through its job milestones and an MPDV one through
-// the cell's stages, but a customer is looking at the same thing either way —
-// the same rail, the same items, the same rating card. Only the stops differ,
-// so only the stops are worked out separately.
+// A SYNAOS order is tracked through its job milestones; an MPDV one shows what
+// the MES was sent, and will show what MPDV reports back once that is
+// specified. A customer is looking at the same thing either way — the same
+// rail, the same items, the same rating card. Only the stops differ, so only
+// the stops are worked out separately.
 // ---------------------------------------------------------------------------
 
 function railCardHtml(order, stepLines, statusHtml, headNote, view) {
@@ -3807,14 +3578,11 @@ async function refreshArmLog() {
       <code>${escapeHtml(l.topic)}</code><span class="msg">${escapeHtml(l.message)}</span></div>`).join('');
   const pend = (st.pending || []).map((p) =>
     `<div class="arm-log-row"><span class="dir">⏳</span><span class="msg">${escapeHtml(p.productName)} — leg ${p.leg}/${p.totalLegs}, ${escapeHtml(p.state)}${p.lastError ? ' — ' + escapeHtml(p.lastError) : ''}</span></div>`).join('');
-  const runs = (st.mpdvRuns || []).map((r) =>
-    `<div class="arm-log-row"><span class="dir">⏳</span><span class="msg">Order ${escapeHtml(r.orderNumber || '')} — ${escapeHtml(r.productName)}, stage ${r.stage}/${r.totalStages}: ${escapeHtml(mpdvRunStateText(r.state, r.armLabel, r.stationName))}${r.lastError ? ' — ' + escapeHtml(r.lastError) : ''}</span></div>`).join('');
   const topics = (st.topics || []).length
     ? `<div class="arm-log-title">Listening on</div><div class="arm-log-row"><span class="dir in">▼</span><code>${st.topics.map(escapeHtml).join('</code> <code>')}</code></div>`
     : '';
   if (!host.isConnected) return;
   host.innerHTML = (pend ? `<div class="arm-log-title">Hand-overs in progress</div>${pend}` : '')
-    + (runs ? `<div class="arm-log-title">MPDV orders running</div>${runs}` : '')
     + topics
     + (rows ? `<div class="arm-log-title">Recent MQTT traffic</div>${rows}` : '');
 }
@@ -4271,21 +4039,7 @@ function renderAdminSettings() {
       </div>
       <h3 style="margin:22px 0 6px;">The arms</h3>
       ${armCardsHtml(a.arms || [])}
-      <h3 style="margin:22px 0 6px;">MPDV — while the order runs</h3>
-      <p class="hint">In MPDV mode the app creates no AGV job, so it watches SYNAOS instead: when a milestone at the hand-over's station has finished, the AGV is there and that arm is commanded. The order and its operation are still created exactly as before — this is only what happens afterwards.</p>
-      <div class="form-grid">
-        <label class="fld switch full">
-          <input type="checkbox" id="a-mpdv-enabled" ${(a.mpdvWait || {}).enabled !== false ? 'checked' : ''}> Command the arms while an MPDV order runs
-        </label>
-        <label class="fld">Wait for the AGV (seconds)
-          <input class="inp" id="a-mpdv-arrival" type="number" min="30" step="30" value="${Number((a.mpdvWait || {}).arrivalTimeoutSeconds) || 1800}">
-          <span class="fld-hint">If no AGV reaches the station in this time the run is given up, and the arm is not commanded.</span>
-        </label>
-        <label class="fld">Wait for the arm (seconds)
-          <input class="inp" id="a-mpdv-arm" type="number" min="5" step="30" value="${Number((a.mpdvWait || {}).armTimeoutSeconds) || 600}">
-          <span class="fld-hint">If the arm stays silent this long the order moves on regardless, and the stage says so.</span>
-        </label>
-      </div>
+      <p class="hint" style="margin-top:18px;">The arms belong to SYNAOS hand-overs. An MPDV order is the order and its operation and nothing else — no arm is commanded for one.</p>
       <div class="progress-actions" style="margin-top:16px; align-items:center; flex-wrap:wrap;">
         <button class="btn btn-secondary" id="saveArm">Save arm settings</button>
         <button class="btn btn-secondary" id="testArm">Test connection</button>
@@ -4695,12 +4449,7 @@ function renderAdminSettings() {
     username: $('#a-user').value,
     password: $('#a-pass').value,
     timeoutSeconds: parseInt($('#a-timeout').value, 10) || 120,
-    arms: readArmsFromForm(),
-    mpdvWait: {
-      enabled: $('#a-mpdv-enabled').checked,
-      arrivalTimeoutSeconds: parseInt($('#a-mpdv-arrival').value, 10) || 1800,
-      armTimeoutSeconds: parseInt($('#a-mpdv-arm').value, 10) || 600
-    }
+    arms: readArmsFromForm()
   });
   const armStatusEl = () => $('#armStatus');
   const showArmLog = refreshArmLog;
