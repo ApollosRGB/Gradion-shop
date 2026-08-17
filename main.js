@@ -22,6 +22,41 @@ function defaultMpdvOperationFields() {
   ];
 }
 
+// A product names the one operation its order carries (v1.19.2), so an
+// operation needs an identity of its own — one that survives being relabelled,
+// reordered or edited. Installs from before that have none, so one is derived
+// from the label: the same label gives the same id, so two machines that share
+// a setup through the repository agree on which operation a product means.
+function mpdvOperationSlug(op, index) {
+  const given = String((op && op.id) || '').trim();
+  if (given) return given;
+  const fromLabel = String((op && op.label) || '').trim().toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  return fromLabel || `op-${index + 1}`;
+}
+
+// Two operations sharing an id could not be told apart by the products naming
+// them, so the second one to claim it is moved aside.
+function normalizeMpdvOperationIds(operations) {
+  const seen = new Set();
+  (Array.isArray(operations) ? operations : []).forEach((op, i) => {
+    let id = mpdvOperationSlug(op, i);
+    while (seen.has(id)) id = `${id}-${i + 1}`;
+    seen.add(id);
+    op.id = id;
+  });
+}
+
+// The operation this product's order carries, or nothing. One order carries one
+// operation now, and it is the product that says which — so a product naming
+// none is refused rather than quietly given the first in the list, which would
+// put the wrong article on a real MES record.
+function mpdvOperationForProduct(cfg, product) {
+  const id = String((product || {}).mpdvOperationId || '').trim();
+  if (!id) return null;
+  return ((cfg || {}).operations || []).find((op) => op && op.id === id) || null;
+}
+
 // Rows arrive from the admin form, so take nothing on trust: a row is an
 // acronym and a value, both strings, and an unnamed row is not a field.
 function cleanMpdvFields(rows) {
@@ -62,7 +97,9 @@ function normalizeMpdvFields(mpdv, saved) {
   mpdv.orderRequestId = cleanMpdvRequestId(mpdv.orderRequestId, 1);
   mpdv.orderReturnAsObject = mpdv.orderReturnAsObject !== false;
   mpdv.orderRaw = cleanMpdvRaw(mpdv.orderRaw);
+  normalizeMpdvOperationIds(mpdv.operations);
   (mpdv.operations || []).forEach((op) => {
+    op.label = String(op.label == null ? '' : op.label).trim();
     op.fields = cleanMpdvFields(Array.isArray(op.fields) ? op.fields : defaultMpdvOperationFields());
     op.columns = cleanMpdvColumns(op.columns);
     op.requestId = cleanMpdvRequestId(op.requestId, 7);
@@ -151,8 +188,8 @@ function defaultStore() {
         }
       },
       // MPDV MES — an alternative to dispatching AGV jobs. An order placed here
-      // becomes a BOOrder plus one BOOperation per arm; the order goes first,
-      // because the operations reference its id.
+      // becomes a BOOrder plus the one BOOperation its product names; the order
+      // goes first, because the operation references its id.
       mpdv: {
         baseUrl: 'https://azu-tr-vhxw-10.mpdv.cloud:8080',
         accessId: '00099831',
@@ -175,14 +212,16 @@ function defaultStore() {
         orderColumns: [],
         orderRequestId: 1,
         orderReturnAsObject: true,
-        // One operation per arm, sent for every order. The identity fields are
-        // editable, and `fields` carries everything else the operation needs —
-        // the formulas, their modes and the cycle target — as editable rows.
-        // The two must not share an operation number: MPDV rejects the second
-        // as a duplicate on the same order ("Data are already available", 1669).
+        // The operations this shop can produce — one of them rides on an order,
+        // and it is the ordered product that says which (`mpdvOperationId`).
+        // The list is the operator's: add one for a new article, remove one that
+        // has gone. `id` is how a product names it, so it outlives relabelling
+        // and reordering; the identity fields are editable, and `fields` carries
+        // everything else the operation needs — the formulas, their modes and
+        // the cycle target — as editable rows.
         operations: [
-          { label: 'Openmind arm', operation: '0010', workplace: 'ROBOT01', article: 'BRACES', designation: 'BRACES', unit: 'PCS', fields: defaultMpdvOperationFields(), columns: [], requestId: 7, returnAsObject: true },
-          { label: 'Kuka arm', operation: '0020', workplace: 'ROBOT02', article: 'PEN', designation: 'PEN', unit: 'PCS', fields: defaultMpdvOperationFields(), columns: [], requestId: 7, returnAsObject: true }
+          { id: 'openmind', label: 'Openmind arm', operation: '0010', workplace: 'ROBOT01', article: 'BRACES', designation: 'BRACES', unit: 'PCS', fields: defaultMpdvOperationFields(), columns: [], requestId: 7, returnAsObject: true },
+          { id: 'kuka', label: 'Kuka arm', operation: '0020', workplace: 'ROBOT02', article: 'PEN', designation: 'PEN', unit: 'PCS', fields: defaultMpdvOperationFields(), columns: [], requestId: 7, returnAsObject: true }
         ]
       },
       // Where this shop's setup (products, stations, robots, recalls) is kept so
@@ -225,6 +264,8 @@ function defaultStore() {
     handoverCommandsMoved: true,
     // …and its order.ordertype already ships as a row, so nothing to move
     mpdvOrderTypeIsARow: true,
+    // …and its products already name the operation each one produces
+    mpdvOperationPerProduct: true,
     products: [
       {
         id: 'p-pen',
@@ -232,6 +273,9 @@ function defaultStore() {
         price: 5,
         image: null,
         visible: true,
+        // The operation this product's MPDV order carries — nothing is sent to
+        // MPDV for a product that names none.
+        mpdvOperationId: 'kuka',
         rating: 4.9,
         ratingCount: 642,
         sold: 642,
@@ -246,6 +290,7 @@ function defaultStore() {
         price: 8,
         image: null,
         visible: true,
+        mpdvOperationId: 'openmind',
         rating: 4.8,
         ratingCount: 729,
         sold: 729,
@@ -487,6 +532,28 @@ function loadStore() {
     data.products = data.products || def.products;
     // Seed rating counters so the displayed rating can become a running average
     data.products.forEach((p) => { if (p.ratingCount == null) p.ratingCount = p.sold || 0; });
+    // v1.19.2: an order carries the one operation its product names, so every
+    // product has to say which. Until now both operations went on every order,
+    // and the shop's two items *are* those two operations — so they are paired
+    // in the order both lists already stand in: first product to first
+    // operation, second to second. Beyond the second nothing is guessed at: a
+    // product left unassigned is simply not orderable in MPDV mode, and admin
+    // says so. Done once, so a choice made afterwards is never overwritten.
+    const productsMigrated = !data.mpdvOperationPerProduct;
+    if (productsMigrated) {
+      if (!data.products.some((p) => p && p.mpdvOperationId)) {
+        data.products.forEach((p, i) => {
+          const op = (mpdv.operations || [])[i];
+          if (p && op) p.mpdvOperationId = op.id;
+        });
+      }
+      data.mpdvOperationPerProduct = true;
+    }
+    // A product may name an operation that has since been deleted; that reads as
+    // unassigned everywhere, so the stale id is dropped rather than kept.
+    data.products.forEach((p) => {
+      if (p && p.mpdvOperationId && !mpdvOperationForProduct(mpdv, p)) p.mpdvOperationId = null;
+    });
     data.robots = data.robots || [];
     data.robots.forEach((r) => { if (r.homeNode === undefined) r.homeNode = null; });
     data.nodes = data.nodes || [];
@@ -510,7 +577,7 @@ function loadStore() {
     // v1.17 moved the command onto the arm; do this after products and recalls
     // exist, since it is their hand-over steps that are being cleared.
     // v1.19 turned order.ordertype into a row, which also reads the products.
-    const migrated = [migrateHandoverCommands(data), migrateMpdvOrderType(data)].some(Boolean);
+    const migrated = [migrateHandoverCommands(data), migrateMpdvOrderType(data), productsMigrated].some(Boolean);
     if (migrated && storePath) {
       try { saveStore(data); } catch (e) { /* read-only run; migration still applies in memory */ }
     }
@@ -1154,8 +1221,8 @@ function parseLooseJson(text) {
 }
 
 // The id the order actually went out with. In raw mode the operator's own body
-// decides it, and everything downstream has to follow that — the operations
-// reference it, and the shop quotes it — or the operations would hang off an
+// decides it, and everything downstream has to follow that — the operation
+// references it, and the shop quotes it — or the operation would hang off an
 // order that was never created.
 function orderIdFromBody(body, fallback) {
   const params = body && Array.isArray(body.params) ? body.params : [];
@@ -1919,7 +1986,7 @@ async function runRelaySupervisor() {
 // ---------------------------------------------------------------------------
 // MPDV run supervisor
 //
-// In MPDV mode the app creates no AGV job: the order and its operations go to
+// In MPDV mode the app creates no AGV job: the order and its operation go to
 // the MES, which sends the AGV. The arms still have to be told when to work, and
 // they only work once the AGV has actually arrived — so for each hand-over in
 // the product's route the supervisor:
@@ -2375,9 +2442,10 @@ function registerIpc() {
     return results;
   });
 
-  // Creates one MPDV order per cart line, then an operation per arm against it.
-  // Returns a result per line, each carrying every call it made, so the shop can
-  // show exactly which step failed and in MPDV's own words.
+  // Creates one MPDV order per cart line, then the single operation that line's
+  // product names against it. Returns a result per line, each carrying every
+  // call it made, so the shop can show exactly which step failed and in MPDV's
+  // own words.
   ipcMain.handle('mpdv:createOrders', async (_ev, { lines }) => {
     const startStore = loadStore();
     const cfg = startStore.settings.mpdv || {};
@@ -2426,6 +2494,22 @@ function registerIpc() {
 
     for (const line of lines || []) {
       const quantity = mpdvQuantity(line.quantity);
+      const product = (startStore.products || []).find((p) => p.id === line.productId);
+      // One order, one operation — the product's own. A product naming none is
+      // refused here, before a number is reserved: the day only has 99 of them,
+      // and an order with no operation is a record the cell cannot run.
+      const operation = mpdvOperationForProduct(cfg, product);
+      if (!operation) {
+        const entry = {
+          productName: line.name || '', orderNumber: null, quantity,
+          ok: false, status: 0,
+          error: `No MPDV operation is set for "${line.name || 'this product'}", so nothing was sent. Pick one in Admin → Jobs / Products.`,
+          response: '', calls: []
+        };
+        recordMpdvLog(entry);
+        results.push(entry);
+        continue;
+      }
       let orderNumber = null;
       if (!rawSuppliesId) {
         try {
@@ -2450,7 +2534,7 @@ function registerIpc() {
 
       // The order has to exist before an operation can reference its id
       const orderBody = mpdvOrderBody(cfg, orderNumber, quantity, requestId++, line.name);
-      // Whatever id the order actually carried is the one the operations must
+      // Whatever id the order actually carried is the one the operation must
       // use — in raw mode that is the operator's, not the number reserved here.
       const sentOrderId = orderBody.ok ? orderIdFromBody(orderBody.body, orderNumber) : orderNumber;
       const orderCall = orderBody.ok
@@ -2459,13 +2543,11 @@ function registerIpc() {
       const calls = [orderCall];
 
       if (orderCall.ok) {
-        for (const op of cfg.operations || []) {
-          const label = op.label || op.workplace || 'Operation';
-          const opBody = mpdvOperationBody(cfg, sentOrderId, op, quantity, requestId++, line.name);
-          calls.push(opBody.ok
-            ? await send(opBody.body, 'BOOperation', label)
-            : unsendable('operation', label, opBody));
-        }
+        const label = operation.label || operation.workplace || 'Operation';
+        const opBody = mpdvOperationBody(cfg, sentOrderId, operation, quantity, requestId++, line.name);
+        calls.push(opBody.ok
+          ? await send(opBody.body, 'BOOperation', label)
+          : unsendable('operation', label, opBody));
       }
 
       const failed = calls.find((c) => !c.ok);
@@ -2476,6 +2558,16 @@ function registerIpc() {
         orderNumber: sentOrderId,
         reservedNumber: orderNumber && orderNumber !== sentOrderId ? orderNumber : null,
         quantity,
+        // Which operation this order carried. Two orders differ by nothing else
+        // on the wire, so the shop and the log name it rather than leave "an
+        // order went out" to be read as "the right one did".
+        operation: {
+          id: operation.id,
+          label: operation.label || operation.workplace || 'Operation',
+          number: String(operation.operation || ''),
+          workplace: operation.workplace || '',
+          article: operation.article || ''
+        },
         ok: !failed,
         status: (failed || orderCall).status,
         error: failed ? `${failed.label}: ${failed.error}` : null,
@@ -2491,7 +2583,6 @@ function registerIpc() {
       // the product's route becomes a stage: AGV to the station, arm commanded,
       // arm finished. A line whose order was refused runs nothing.
       if (!failed && armGating) {
-        const product = (startStore.products || []).find((p) => p.id === line.productId);
         const stages = mpdvStagesForProduct(product, startStore.stations, armCfg);
         if (stages.length) {
           const run = {
@@ -2606,6 +2697,7 @@ function registerIpc() {
       // on, so the preview never shows a body that is not the one being sent.
       payload: buildMpdvOrderPayload(cfg, orderNumber, 1, 1),
       operationPayloads: (cfg.operations || []).map((op, i) => ({
+        id: op.id,
         label: op.label || op.workplace,
         payload: buildMpdvOperationPayload(cfg, orderNumber, op, 1, 7 + i)
       })),
@@ -3033,6 +3125,9 @@ module.exports = {
   mpdvOrderBody,
   mpdvOperationBody,
   mpdvOrderTypeValue,
+  mpdvOperationForProduct,
+  mpdvOperationSlug,
+  normalizeMpdvOperationIds,
   migrateMpdvOrderType,
   renderMpdvRaw,
   buildMpdvRawBody,

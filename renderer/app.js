@@ -231,6 +231,23 @@ function mpdvEnvelopeHtml(scope, columns, requestId, returnAsObject, defaultId) 
     </div>`;
 }
 
+// Which products send this operation. An operation nothing names is never sent,
+// and that is worth seeing here rather than discovering when an order does
+// nothing — the same goes for the products naming none, listed below the panel.
+function mpdvOperationUsersHtml(op) {
+  const users = (store.products || []).filter((p) => p.mpdvOperationId === op.id);
+  if (!users.length) return '<span class="mpdv-id-warn">⚠️ No product produces this operation, so it is never sent. Pick it on a product in Jobs / Products, or remove it.</span>';
+  return `Ordered as: ${users.map((p) => `<b>${escapeHtml(p.name)}</b>`).join(', ')}`;
+}
+
+function mpdvUnassignedProductsHtml() {
+  const orphans = (store.products || []).filter((p) => !mpdvOperationFor(p));
+  if (!orphans.length) return '';
+  return `<div class="handover-warn">⚠️ ${orphans.map((p) => escapeHtml(p.name || 'A product')).join(', ')}
+    ${orphans.length > 1 ? 'name' : 'names'} no operation, so nothing is sent to MPDV for ${orphans.length > 1 ? 'them' : 'it'}
+    and ${orphans.length > 1 ? 'they are' : 'it is'} hidden from the shop while the mode is MPDV. Set it on each in <b>Jobs / Products</b>.</div>`;
+}
+
 function mpdvFieldRowsHtml(rows, scope, placeholder) {
   return rows.map((row, i) => `
     <div class="field-row">
@@ -344,8 +361,50 @@ function showView(view) {
 // ===========================================================================
 // Catalog (user shop)
 // ===========================================================================
+// A product that names no MPDV operation cannot be ordered in MPDV mode — the
+// order would have nothing to produce — so it is off the shelf while the shop is
+// in that mode rather than failing at checkout. It is untouched in SYNAOS mode
+// and still listed in admin, where the missing operation is flagged.
 function visibleProducts() {
-  return store.products.filter((p) => p.visible);
+  return store.products.filter((p) => p.visible && (!isMpdv() || !!mpdvOperationFor(p)));
+}
+
+// The operation this product produces, as configured in Settings → MPDV.
+function mpdvOperationFor(product) {
+  const id = String((product || {}).mpdvOperationId || '').trim();
+  if (!id) return null;
+  return (((store.settings || {}).mpdv || {}).operations || []).find((op) => op && op.id === id) || null;
+}
+
+function mpdvOperationLabel(op) {
+  if (!op) return '';
+  return op.label || op.workplace || op.article || op.id;
+}
+
+// One order carries one operation, and this is where the product says which.
+// "None" is a real choice, not an empty state — it means this product is not
+// something the MES can produce, so the shop does not offer it in MPDV mode.
+function mpdvOperationOptionsHtml(product) {
+  const ops = ((store.settings || {}).mpdv || {}).operations || [];
+  const chosen = String((product || {}).mpdvOperationId || '');
+  return [
+    `<option value="" ${chosen ? '' : 'selected'}>— none — not offered in MPDV mode</option>`,
+    ...ops.map((op) => `<option value="${escapeHtml(op.id)}" ${chosen === op.id ? 'selected' : ''}>
+      ${escapeHtml(mpdvOperationLabel(op))} — ${escapeHtml(op.operation || '')} · ${escapeHtml(op.workplace || 'no workplace')} · ${escapeHtml(op.article || 'no article')}
+    </option>`)
+  ].join('');
+}
+
+function mpdvOperationHint(product) {
+  const op = mpdvOperationFor(product);
+  if (!op) {
+    return `<span class="fld-hint">${isMpdv()
+      ? '⚠️ Nothing is sent to MPDV for this product and it is hidden from the shop while the mode is MPDV. Pick the operation it produces.'
+      : 'Only used in MPDV mode. Leave it as none if this product is SYNAOS-only.'}</span>`;
+  }
+  return `<span class="fld-hint">Ordering this sends one <code>BOOrder</code> and one <code>BOOperation</code>:
+    <code>${escapeHtml(op.operation || '')}</code> at <code>${escapeHtml(op.workplace || '')}</code>, article
+    <code>${escapeHtml(op.article || '')}</code>. Edit it in <b>Settings → MPDV production orders</b>.</span>`;
 }
 
 function renderCatalog() {
@@ -612,6 +671,9 @@ function buildMpdvOrderRecord(lines, results, total) {
     return {
       productId: line.productId || null,
       productName: r.productName || line.name || '',
+      // The operation this order carried, kept on the order so the history says
+      // what was made and not only that something was
+      operation: r.operation || null,
       orderNumber: r.orderNumber || null,
       createdId: r.createdId || null,
       quantity: r.quantity != null ? r.quantity : line.quantity,
@@ -657,7 +719,7 @@ function isMpdvOrder(order) {
 
 // MPDV keeps this id in an 8-character field, so what it stored can be a
 // truncated version of what we sent — say so plainly rather than let it pass.
-// An MPDV line is several calls now — the order, then an operation per arm.
+// An MPDV line is two calls — the order, then the one operation it carries.
 // Each is shown in the order it was made, with what was sent and what came
 // back, so a failure points at the exact step rather than the line as a whole.
 function mpdvCallsHtml(entry) {
@@ -693,6 +755,16 @@ function mpdvCreatedIdNote(entry) {
     : ` — <span class="mpdv-id-warn">MPDV stored it as <b>${escapeHtml(entry.createdId)}</b></span>`);
 }
 
+// The operation that order carried. An order is one operation now, so which one
+// it was is the difference between two otherwise identical orders — said here
+// and in the log rather than left to be read out of the request bodies.
+function mpdvOperationNote(entry) {
+  const op = entry && entry.operation;
+  if (!op) return '';
+  return `<div class="tl-meta">🏭 ${escapeHtml(op.label || 'Operation')} — <code>${escapeHtml(op.number || '')}</code>
+    ${op.workplace ? `· ${escapeHtml(op.workplace)}` : ''} ${op.article ? `· ${escapeHtml(op.article)}` : ''}</div>`;
+}
+
 function renderMpdvResult(results, total, orderId) {
   const okCount = results.filter((r) => r.ok).length;
   const rows = results.map((r) => `
@@ -703,6 +775,7 @@ function renderMpdvResult(results, total, orderId) {
         <div class="tl-meta">${r.orderNumber
           ? `Order no. <b>${escapeHtml(r.orderNumber)}</b>`
           : 'No order number was issued'}${mpdvCreatedIdNote(r)}</div>
+        ${mpdvOperationNote(r)}
         ${r.ok ? '' : `<div class="err-text">${escapeHtml(r.error || 'Rejected by MPDV')}</div>`}
         ${r.armNote ? `<div class="tl-meta">🤝 ${escapeHtml(r.armNote)}</div>` : ''}
         ${mpdvCallsHtml(r)}
@@ -1473,7 +1546,7 @@ function mpdvStepLines(order) {
       steps.push({
         icon: '🏭',
         label: 'In production',
-        place: `${tag}MPDV ${line.orderNumber || ''}`.trim(),
+        place: `${tag}MPDV ${line.orderNumber || ''}${line.operation ? ` · ${line.operation.label}` : ''}`.trim(),
         text: `${line.productName} is with MPDV`,
         state: 'done',
         at: order.createdAt
@@ -1878,6 +1951,12 @@ function renderAdminProducts() {
 
   const list = store.products.map((p) => {
     const stepDesc = (p.steps || []).map((s) => `${stationName(s.stationRef)}·${s.action}`).join(' → ') || 'No steps';
+    // Which operation this product's order carries — the whole of what MPDV is
+    // told to make, so it belongs in the list next to the route.
+    const op = mpdvOperationFor(p);
+    const opLine = op
+      ? `<div class="desc">🏭 ${escapeHtml(mpdvOperationLabel(op))} — <code>${escapeHtml(op.operation || '')}</code> · ${escapeHtml(op.workplace || '')} · ${escapeHtml(op.article || '')}</div>`
+      : `<div class="desc">🏭 <span class="mpdv-id-warn">No MPDV operation${isMpdv() ? ' — hidden from the shop and nothing would be sent' : ''}</span></div>`;
     return `
       <div class="admin-item">
         <div class="thumb">${p.image ? `<img src="${p.image}">` : '🎁'}</div>
@@ -1888,6 +1967,7 @@ function renderAdminProducts() {
             <span class="chip ${p.visible ? 'on' : 'off'}">${p.visible ? 'Shown to users' : 'Hidden'}</span>
           </div>
           <div class="desc">🚚 ${escapeHtml(stepDesc)}</div>
+          ${opLine}
           <div class="row-actions" style="margin-top:10px;">
             <button class="link-btn" data-edit="${p.id}">Edit</button>
             <button class="link-btn" data-toggle="${p.id}">${p.visible ? 'Hide from users' : 'Show to users'}</button>
@@ -1901,7 +1981,7 @@ function renderAdminProducts() {
     <div class="panel">
       <h2>Jobs / Products</h2>
       <p class="hint">Each product maps to a SYNAOS transport job. Configure its milestones (station + action), price, image, and whether users can see it.</p>
-      ${isMpdv() ? '<p class="hint">In <b>MPDV</b> mode the order and its operations are what reach the MES — but the route is still read for its <b>hand-overs</b>: each one says which arm works at which station, and the order waits there for that arm to report it has finished.</p>' : ''}
+      ${isMpdv() ? '<p class="hint">In <b>MPDV</b> mode each product is <b>one operation</b>: ordering it sends an order carrying that operation and nothing else, so a product with none set is hidden from the shop. The route is still read for its <b>hand-overs</b>: each one says which arm works at which station, and the order waits there for that arm to report it has finished.</p>' : ''}
       <div class="admin-list">${list || '<p class="hint">No products yet.</p>'}</div>
       <button class="btn btn-primary" id="addProduct" style="margin-top:16px;">+ New job / product</button>
     </div>`;
@@ -1909,7 +1989,7 @@ function renderAdminProducts() {
   $('#addProduct').addEventListener('click', () => {
     productDraft = {
       id: uid('p'), name: '', price: 0, image: null, visible: true,
-      rating: 4.9, sold: 0,
+      rating: 4.9, sold: 0, mpdvOperationId: null,
       steps: store.stations.length >= 2
         ? [{ stationRef: store.stations[0].id, action: 'PICK' }, { stationRef: store.stations[1].id, action: 'DROP' }]
         : [{ stationRef: store.stations[0] ? store.stations[0].id : '', action: 'PICK' }],
@@ -2055,6 +2135,10 @@ function renderProductEditor(body) {
           </select>
           ${resourceHint}
         </label>
+        <label class="fld full">MPDV operation (what this product is, to the MES)
+          <select class="inp" id="f-mpdvop">${mpdvOperationOptionsHtml(p)}</select>
+          ${mpdvOperationHint(p)}
+        </label>
         <label class="fld switch full">
           <input type="checkbox" id="f-visible" ${p.visible ? 'checked' : ''}> Show this job to users
         </label>
@@ -2088,6 +2172,8 @@ function renderProductEditor(body) {
   $('#f-sold').addEventListener('input', (e) => p.sold = parseInt(e.target.value) || 0);
   $('#f-visible').addEventListener('change', (e) => p.visible = e.target.checked);
   $('#f-resource').addEventListener('change', (e) => { p.resourceId = e.target.value || null; renderAdmin(); });
+  // Redrawn so the hint underneath says what this product would now send
+  $('#f-mpdvop').addEventListener('change', (e) => { p.mpdvOperationId = e.target.value || null; renderAdmin(); });
   // Re-render on step edits: changing a station or action changes which robots are
   // allowed there and whether a hand-over boundary is still valid.
   $$('[data-step-station]', body).forEach((el) => el.addEventListener('change', (e) => {
@@ -3925,6 +4011,12 @@ async function applySyncedConfig(config) {
   // `order.ordertype` row — the app owned that value then — so ask for that
   // migration again rather than let the incoming setup send no ordertype.
   delete store.mpdvOrderTypeIsARow;
+  // And a setup published by ≤1.19.1 carries products that name no operation —
+  // every order sent both back then — so ask for that pairing again rather than
+  // load a shop where nothing is orderable in MPDV mode. It only fires when no
+  // incoming product names one, so a setup from a machine on this version is
+  // taken exactly as it was published.
+  delete store.mpdvOperationPerProduct;
   // Keep each recall's own countdown and in-flight run — that is this machine's
   store.recalls = (config.recalls || store.recalls || []).map((r) => {
     const here = (store.recalls || []).find((x) => x.id === r.id);
@@ -3947,6 +4039,11 @@ async function applySyncedConfig(config) {
   }
 
   await persist();
+  // The migrations asked for above run in the main process the moment it reads
+  // the store again, and they change what was just written — the hand-over
+  // commands, the ordertype row, the operation each product produces. Take its
+  // copy back, or the next save from this window puts the unmigrated one on top.
+  try { store = await window.api.storeGet(); } catch (e) { /* it will be read at the next start */ }
   renderCatalog();
   renderCart();
   applyMode();
@@ -4069,7 +4166,7 @@ function renderAdminSettings() {
     </div>
     <div class="panel">
       <h2>MPDV production orders</h2>
-      <p class="hint">Used when the shop is set to <b>MPDV</b>. Each cart line becomes an <b>order</b> (<code>BOOrder/insert</code>) followed by <b>one operation per arm</b> (<code>BOOperation/insert</code>). The order goes first because the operations reference its id; the ordered quantity becomes <code>order.plan.yield.base</code> and each operation's <code>plan.yield.primary</code>. <code>order.ordertype</code> is a row like any other below — <code>GR</code> as shipped, the same for every order — so changing it needs no new version.</p>
+      <p class="hint">Used when the shop is set to <b>MPDV</b>. Each cart line becomes an <b>order</b> (<code>BOOrder/insert</code>) carrying <b>the one operation that product is</b> (<code>BOOperation/insert</code>) — two items ordered are two orders, one operation each, never one order with both. The order goes first because the operation references its id; the ordered quantity becomes <code>order.plan.yield.base</code> and the operation's <code>plan.yield.primary</code>. <code>order.ordertype</code> is a row like any other below — <code>GR</code> as shipped, the same for every order — so changing it needs no new version.</p>
       <div class="form-grid">
         <label class="fld">Base URL
           <input class="inp" id="m-base" value="${escapeHtml(m.baseUrl || '')}" placeholder="https://host:8080">
@@ -4103,11 +4200,13 @@ function renderAdminSettings() {
       <button class="chip-btn" data-mf-add="order">+ Add field</button>
       ${mpdvEnvelopeHtml('order', m.orderColumns, m.orderRequestId, m.orderReturnAsObject, 1)}
       ${mpdvRawHtml('order', m.orderRaw, MPDV_RAW_EXAMPLE)}
-      <h3 style="margin:22px 0 6px;">Operations — one per arm</h3>
-      <p class="hint">Sent against the order after it exists, both of them, every time. The boxes in each row are the identity of the operation; the rows underneath are the rest of what it carries — the formulas, their modes and the cycle target — sent exactly as supplied.</p>
+      <h3 style="margin:22px 0 6px;">Operations — one per product</h3>
+      <p class="hint">Everything this shop can produce. <b>One</b> of these goes on an order — the one the ordered product names in <b>Jobs / Products</b> — sent against the order once it exists. Add an operation for a new article, remove one that has gone. The boxes in each row are the identity of the operation; the rows underneath are the rest of what it carries — the formulas, their modes and the cycle target — sent exactly as supplied.</p>
       ${(m.operations || []).map((op, i) => `
         <div class="op-row">
-          <span class="chip">${escapeHtml(op.label || 'Arm ' + (i + 1))}</span>
+          <label class="inline-fld">name
+            <input class="inp" data-m-op="${i}" data-f="label" value="${escapeHtml(op.label || '')}" placeholder="Openmind arm" style="max-width:150px;">
+          </label>
           <label class="inline-fld">operation
             <input class="inp" data-m-op="${i}" data-f="operation" value="${escapeHtml(op.operation || '')}" style="max-width:80px;">
           </label>
@@ -4124,15 +4223,18 @@ function renderAdminSettings() {
             <input class="inp" data-m-op="${i}" data-f="unit" value="${escapeHtml(op.unit || 'PCS')}" style="max-width:80px;">
           </label>
           <div class="op-fields">
+            <p class="hint" style="margin:0 0 8px;">${mpdvOperationUsersHtml(op)}</p>
             ${mpdvFieldRowsHtml(op.fields || [], 'op:' + i, 'operation.cycle.target')}
             <button class="chip-btn" data-mf-add="op:${i}">+ Add field</button>
             ${mpdvEnvelopeHtml('op:' + i, op.columns, op.requestId, op.returnAsObject, 7)}
             ${mpdvRawHtml('op:' + i, op.raw, MPDV_RAW_EXAMPLE)}
+            <div class="row-actions" style="margin-top:10px;">
+              <button class="link-btn danger" data-op-del="${i}">Remove this operation</button>
+            </div>
           </div>
         </div>`).join('')}
-      ${(m.operations || []).length === 2 && m.operations[0].operation === m.operations[1].operation
-        ? `<div class="handover-warn">⚠️ Both operations use number <b>${escapeHtml(m.operations[0].operation)}</b>. MPDV may refuse the second as a duplicate on the same order — if it does, give this one its own number (e.g. 0020).</div>`
-        : ''}
+      <button class="chip-btn" data-op-add="1">+ Add operation</button>
+      ${mpdvUnassignedProductsHtml()}
       <div class="progress-actions" style="margin-top:16px; align-items:center; flex-wrap:wrap;">
         <button class="btn btn-secondary" id="saveMpdv">Save MPDV settings</button>
         <span class="api-status" id="mpdvNext"></span>
@@ -4170,7 +4272,7 @@ function renderAdminSettings() {
       <h3 style="margin:22px 0 6px;">The arms</h3>
       ${armCardsHtml(a.arms || [])}
       <h3 style="margin:22px 0 6px;">MPDV — while the order runs</h3>
-      <p class="hint">In MPDV mode the app creates no AGV job, so it watches SYNAOS instead: when a milestone at the hand-over's station has finished, the AGV is there and that arm is commanded. The order and its operations are still created exactly as before — this is only what happens afterwards.</p>
+      <p class="hint">In MPDV mode the app creates no AGV job, so it watches SYNAOS instead: when a milestone at the hand-over's station has finished, the AGV is there and that arm is commanded. The order and its operation are still created exactly as before — this is only what happens afterwards.</p>
       <div class="form-grid">
         <label class="fld switch full">
           <input type="checkbox" id="a-mpdv-enabled" ${(a.mpdvWait || {}).enabled !== false ? 'checked' : ''}> Command the arms while an MPDV order runs
@@ -4354,6 +4456,28 @@ function renderAdminSettings() {
     store.settings.mpdv = cfg;
     renderAdmin();
   };
+  // Adding an operation is the same trick as adding a row: read the panel first,
+  // so nothing half-typed is lost to the redraw. A new one starts as a copy of
+  // the last one's rows and envelope — operations at a site differ in what they
+  // make, rarely in their formulas — and its identity is left to be filled in.
+  const newMpdvOperation = (ops) => {
+    const last = ops[ops.length - 1] || {};
+    // The id is what a product names, so it must not collide with one in use
+    let id = `op-${ops.length + 1}`;
+    for (let n = ops.length + 2; ops.some((o) => o.id === id); n++) id = `op-${n}`;
+    return {
+      id,
+      label: `Operation ${ops.length + 1}`,
+      operation: last.operation || '0010',
+      workplace: '', article: '', designation: '',
+      unit: last.unit || 'PCS',
+      fields: JSON.parse(JSON.stringify(last.fields || [])),
+      columns: (last.columns || []).slice(),
+      requestId: last.requestId || 7,
+      returnAsObject: last.returnAsObject !== false,
+      raw: { enabled: false, body: '' }
+    };
+  };
   // ---- the raw request bodies ----
   const rawBox = (scope) => $(`[data-mraw="${scope}"][data-f="body"]`);
   const rawVerdict = (scope, html) => {
@@ -4475,6 +4599,37 @@ function renderAdminSettings() {
     editMpdvFields(el.dataset.mfAdd, (list) => list.push({ acronym: '', value: '' }))));
   $$('[data-mf-del]', body).forEach((el) => el.addEventListener('click', () =>
     editMpdvFields(el.dataset.mfDel, (list) => list.splice(Number(el.dataset.i), 1))));
+
+  $('[data-op-add]', body).addEventListener('click', () => {
+    const cfg = Object.assign({}, store.settings.mpdv, readMpdvForm());
+    cfg.operations.push(newMpdvOperation(cfg.operations));
+    store.settings.mpdv = cfg;
+    renderAdmin();
+  });
+  // Removing an operation takes it away from every product that names it, so
+  // those products stop being orderable in MPDV mode — that is said before it
+  // happens, and written to disk with the operation itself so the two cannot
+  // disagree about which operations exist.
+  $$('[data-op-del]', body).forEach((el) => el.addEventListener('click', () => {
+    const i = Number(el.dataset.opDel);
+    const op = (store.settings.mpdv.operations || [])[i];
+    if (!op) return;
+    const users = (store.products || []).filter((p) => p.mpdvOperationId === op.id);
+    confirmModal(`Remove “${mpdvOperationLabel(op) || 'this operation'}”?`,
+      users.length
+        ? `${users.map((p) => p.name).join(', ')} ${users.length > 1 ? 'produce' : 'produces'} it, so ${users.length > 1 ? 'they' : 'it'} will have no operation: nothing would be sent to MPDV for ${users.length > 1 ? 'them' : 'it'} and ${users.length > 1 ? 'they are' : 'it is'} hidden from the shop until you pick another. This cannot be undone.`
+        : 'No product produces it, so nothing else changes. This cannot be undone.',
+      async () => {
+        const cfg = Object.assign({}, store.settings.mpdv, readMpdvForm());
+        cfg.operations.splice(i, 1);
+        store.settings.mpdv = cfg;
+        (store.products || []).forEach((p) => { if (p.mpdvOperationId === op.id) p.mpdvOperationId = null; });
+        await persist();
+        renderCatalog();
+        renderAdmin();
+        toast(users.length ? 'Operation removed — those products now have none' : 'Operation removed', 'success');
+      });
+  }));
   const showMpdvState = async () => {
     const [preview, log] = await Promise.all([window.api.mpdvPreview(), window.api.mpdvLog()]);
     $('#mpdvNext').innerHTML = `<span class="dot ok"></span> Next order no. <b>${escapeHtml(preview.orderNumber)}</b>
@@ -4486,6 +4641,7 @@ function renderAdminSettings() {
             <code>${escapeHtml(l.orderNumber || '—')}</code>
             <span class="chip">HTTP ${l.status === 0 ? 'no reply' : l.status}</span>
             <span class="msg">${escapeHtml(l.productName || '')} ×${l.quantity}</span>
+            ${l.operation ? `<span class="chip">${escapeHtml(l.operation.label || '')} · ${escapeHtml(l.operation.number || '')}</span>` : ''}
             <span class="mpdv-log-time">${escapeHtml(new Date(l.at).toLocaleString())}</span>
           </div>
           ${l.ok ? '' : `<div class="mpdv-log-err">${escapeHtml(l.error || 'Rejected')}</div>`}

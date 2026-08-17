@@ -3,11 +3,11 @@
 A Shopee-style desktop ordering app that dispatches orders to either of two systems, chosen from a start menu:
 
 - **SYNAOS** — creates AGV transport jobs through the SYNAOS Job Management API and tracks them live.
-- **MPDV** — creates production orders (order + one operation per arm) in the MPDV MES.
+- **MPDV** — creates production orders (order + the one operation that product is) in the MPDV MES.
 
 Built with Electron for Windows and macOS, with light/dark mode and separate **user** and **admin** interfaces.
 
-![status](https://img.shields.io/badge/version-1.19.1-e0563f)
+![status](https://img.shields.io/badge/version-1.19.2-e0563f)
 
 ## Features
 
@@ -20,7 +20,7 @@ Built with Electron for Windows and macOS, with light/dark mode and separate **u
 - **My Orders** keeps a history of orders from **both systems** (v1.15) — an MPDV one is marked 🏭 and quotes the MES order number it was given. Reopen any order to see its live status: a SYNAOS order is tracked through its job milestones, an MPDV one through the cell's stages (see below). Confirm receipt ("👍 Got it!") or, for a SYNAOS order, cancel it (discards the SYNAOS jobs).
 
 ### ⚙️ Admin interface (password-protected)
-- **Jobs / Products** — define each product as a sequence of job milestones (station + action + **the robot that performs it**, e.g. *Production · PICK → Shop · DROP*), set its price, attach an image file, and choose whether users can see it.
+- **Jobs / Products** — define each product as a sequence of job milestones (station + action + **the robot that performs it**, e.g. *Production · PICK → Shop · DROP*), set its price, attach an image file, and choose whether users can see it. In **MPDV** mode a product is also **one MPDV operation** (v1.19.2), chosen here from the operations set up in Settings: that is what its order carries, and a product naming none is not offered in the shop.
 - **Multi-robot relays** — a SYNAOS job is executed by exactly one transport resource, so when consecutive steps use different robots the app splits the route into **one job per robot** and chains them with a milestone dependency (`requiredPredecessorStatus: FINISHED`), meaning a leg cannot start approaching until the previous leg has finished. The editor previews the split and warns if a robot change isn't a **DROP → PICK at the same station**, which is what a physical hand-over requires.
 - **Recalls** — routes the admin runs on demand, typically fetching a rack back from the shop to production. They never appear in the shop, so a customer order can simply deliver instead of also hauling everything straight back. A recall is defined like a product route (station + action + robot per step, hand-overs included), previews how it will be split into jobs, and is dispatched with one button; recent sends are logged with the robot used and any error.
 - **Recalls after a delivery** — a recall can run itself once an order has been **delivered**: tick *Run this recall after an order is delivered* and give it a wait in minutes. The countdown hangs off the order's delivery, so the rack is fetched back a set time after it went out; switching the option on starts nothing on its own, and a run finishing does not schedule another one — only the next delivered order does. A further delivery while waiting **pushes the run back** rather than adding a second one, so the AGV goes in once deliveries have settled. Deliveries are noticed even when nobody is on the progress screen (that screen only polls while it is open), so the countdown is not lost if the customer walks away.
@@ -49,9 +49,9 @@ Toggle from the top bar; the choice is saved.
 
 ## MPDV production orders
 
-Selected from the start menu (or the badge in the top bar). Each **cart line** becomes an **order** followed by **one operation per arm**, authenticated with HTTP Basic. No workplan order is involved — that path was removed in v1.12.
+Selected from the start menu (or the badge in the top bar). Each **cart line** becomes an **order** followed by **the one operation that product is**, authenticated with HTTP Basic. No workplan order is involved — that path was removed in v1.12.
 
-**1. `POST /data/BOOrder/insert`** — the order has to exist first, because the operations reference its id.
+**1. `POST /data/BOOrder/insert`** — the order has to exist first, because the operation references its id.
 
 | Field | Value |
 |---|---|
@@ -61,7 +61,7 @@ Selected from the start menu (or the badge in the top bar). Each **cart line** b
 
 **`order.ordertype` is a row you own, not a value the app decides (v1.19).** It is **`GR`** for every order this shop sends — MPDV's own code for the kind of order these are — so it sits in the editable rows alongside the deadline rather than among the fields filled in per order. It briefly went the other way: v1.8 made it a setting of its own, v1.12 moved it onto each product as a `0`/`1` choice of AGV, and v1.18 built an AGV table on top of that reading. None of that was right — the value is MPDV's business and it does not vary — so all of it is gone and the row is the whole of it. An install upgrading gains the row set to `GR` once, keeping any `order.ordertype` already typed, and the per-product numbers are cleared. Change the row and both the built body and a hand-typed one's `{orderType}` follow it; remove the row and no ordertype is sent at all.
 
-**2. `POST /data/BOOperation/insert`, once per arm** — both are sent for every order.
+**2. `POST /data/BOOperation/insert`, once** — the one operation the ordered product names, and nothing else.
 
 | Field | Openmind arm | Kuka arm |
 |---|---|---|
@@ -71,7 +71,15 @@ Selected from the start menu (or the badge in the top bar). Each **cart line** b
 | `operation.article` / `.designation` | `BRACES` | `PEN` |
 | `operation.plan.yield.primary` | the ordered quantity | the ordered quantity |
 | `operation.plan.unit.primary` | `PCS` | `PCS` |
-| *that arm's own rows* | `BEA_ZY` / `RLFZ` formulas, their `FORMULA` modes, `60000` cycle target | same |
+| *that operation's own rows* | `BEA_ZY` / `RLFZ` formulas, their `FORMULA` modes, `60000` cycle target | same |
+
+**One order carries one operation, and the product decides which (v1.19.2).** Until now *every* order carried *both* operations, whichever of the two items was ordered — so the two shop items and the two operations, which are the same two things, could not correspond. They do now: each product names **one** operation in **Admin → Jobs / Products**, and ordering it sends that operation alone. Two items in one cart are therefore **two orders with one operation each**, never one order carrying both, and each operation still hangs off its own order's id.
+
+The operations themselves stay where they were, in **Admin → Settings → MPDV**, and the list is now **yours to grow**: **+ Add operation** for a new article — it starts as a copy of the last one's rows and envelope — and **Remove this operation** for one that has gone, which says which products produce it before it does anything and clears them if you go ahead. Each operation carries an editable **name** and shows **which products order it**, so one that nothing produces (and would therefore never be sent) is visible rather than discovered later; the products naming none are listed under the panel the same way.
+
+**A product with no operation cannot be ordered in MPDV mode.** It is **hidden from the shop** while the mode is MPDV — a customer is never offered something the MES has nothing to make — and if a line for one reaches the app anyway it is **refused before anything is sent**: no `BOOrder`, no order number spent out of the day's 99, and the reason said on the result screen. The other lines in the same cart are unaffected and still go out. In SYNAOS mode the setting is ignored entirely, so a SYNAOS-only product simply leaves it as *none*.
+
+**Upgrading pairs what an install already has**, once: the first product to the first operation, the second to the second — which is exactly the two shop items and the two arms as they stood — and anything beyond the second is left unassigned rather than guessed at. A choice made afterwards is never overwritten, and loading a setup published by an older version asks for the same pairing rather than arriving with nothing orderable.
 
 **Everything the app does not fill in itself is editable** in **Admin → Settings → MPDV** (v1.13). The order and each operation carry a list of **acronym/value rows** you can add to, change and remove, so a field this MPDV wants — `order.article`, a different cycle target, another formula — needs no new build. The two order fields in bold above and each operation's identity boxes are filled in per order and shown locked; a row naming one of them is ignored rather than allowed to overwrite the running number or the ordered quantity. A value is sent as a **JSON number when it is one and nothing else** — `60000` goes as `60000`, while `0010` stays the string it was typed as instead of being flattened to `10`.
 
@@ -81,15 +89,15 @@ Bodies are pasted from vendor documentation and from someone's notes, so the edi
 
 The **envelope** around those params is editable too (v1.13.1): **`columns`** (comma-separated, e.g. `operation.id, operation.ordertype`), the **`requestId`** MPDV echoes back, and **`returnAsObject`** — set per request, so the order and each arm can differ. `language` and `timeZoneId` were already editable. A requestId left unusable falls back to the counter that numbers the calls within a send, and blank entries in `columns` are dropped, so nothing typed into those boxes can produce a malformed body.
 
-The two arms ship with **different** operation numbers (`0010` and `0020`): MPDV refuses a second operation that reuses a number already on the order, answering return code **1669, "Data are already available"**. An install that still had both on `0010` is moved once on upgrade, and a number set deliberately afterwards is left alone. The deadline used to be a setting of its own; on upgrade it becomes the order's first row, so what an install already had keeps being sent — including a setup published by an older version.
+The two arms keep the **different** operation numbers they were given (`0010` and `0020`). They no longer share an order, so they can no longer collide on one — that was the point of separating them: MPDV refuses a second operation reusing a number already on its order, answering return code **1669, "Data are already available"**. An install that still had both on `0010` was moved once on upgrade, and a number set deliberately afterwards is left alone. The deadline used to be a setting of its own; on upgrade it becomes the order's first row, so what an install already had keeps being sent — including a setup published by an older version.
 
-**A refused operation is retried** — three attempts, one then two seconds apart — before the next one is sent. If the **order** insert fails, no operation is sent against an order that does not exist. Every call is kept in the log and on the result screen with what was sent, what came back and which attempt succeeded, so a failure points at the exact step.
+**A refused operation is retried** — three attempts, one then two seconds apart — before the next line is sent. If the **order** insert fails, no operation is sent against an order that does not exist. Every call is kept in the log and on the result screen with what was sent, what came back and which attempt succeeded, so a failure points at the exact step.
 
 The running number is **`DDMMYY` + a two-digit counter** that restarts each day — `03082601`, `03082602`, … `04082601`. It is deliberately 8 characters: MPDV stores this id in an 8-character field, and a longer number is silently truncated, which would make every order of a day collide on one id. That caps the app at **99 MPDV orders per day**; beyond that it refuses to send rather than create a duplicate. The date follows the configured `timeZoneId`, not the PC clock, so the number matches the day MPDV records.
 
 ### While the order runs — the arms (v1.14)
 
-The order and its operations are created **exactly as before**; this is what happens afterwards. In MPDV mode the app creates no AGV job — the MES sends the AGV — so it cannot know from its own work when an arm should start. For each **hand-over in the product's route**, in route order, it therefore:
+The order and its operation are created **exactly as before**; this is what happens afterwards. In MPDV mode the app creates no AGV job — the MES sends the AGV — so it cannot know from its own work when an arm should start. For each **hand-over in the product's route**, in route order, it therefore:
 
 1. **watches SYNAOS** until a milestone at that hand-over's station has `MILESTONE_FINISHED` *after the order was sent* — that is the AGV arriving. The station and action come from the step **before** the hand-over, so a `PICK` at the same station, or a drop from before the order, is not mistaken for this delivery;
 2. **publishes the command** to that hand-over's arm, on its own command topic, carrying the ordered quantity and that arm's command (or the hand-over's own, if it was given one);
@@ -101,7 +109,7 @@ Runs are advanced **one at a time** — there is one cell, and two orders must n
 
 The log, its running order number, hand-over and MPDV run progress are written by the **main process**, so a save from the window never carries an older copy of them back — clearing the log makes it stay cleared, a send recorded while the panel is open is not wiped, and the running number can never be rewound onto an id MPDV has already been given.
 
-Every send is logged in **Admin → Settings → MPDV** with the order number, quantity, HTTP status and whether MPDV accepted it. **The full response body and the request that produced it are kept for every order, successful or not**, expandable and pretty-printed in the log and on the order result screen. A success also reports the id MPDV actually stored; because that field truncates to 8 characters, the app flags it when what MPDV kept differs from what was sent. A failure additionally shows MPDV's own message. The message is dug out of whatever shape MPDV uses (`message`, `errorMessage`, `error`, an `errors` array, a nested `result`, or its `__rowType` rows); if the shape is unrecognised the raw body is shown verbatim, so nothing is ever hidden. MPDV also answers `200` for some rejected orders, so the body is inspected as well as the status code. The host serves a valid DigiCert certificate but not its full chain, so a "don't validate the TLS certificate" option is provided and enabled by default for it.
+Every send is logged in **Admin → Settings → MPDV** with the order number, quantity, **the operation it carried**, HTTP status and whether MPDV accepted it. Two orders differ by nothing else on the wire, so which operation went out is named on the result screen and in the order history as well as in the log. **The full response body and the request that produced it are kept for every order, successful or not**, expandable and pretty-printed in the log and on the order result screen. A success also reports the id MPDV actually stored; because that field truncates to 8 characters, the app flags it when what MPDV kept differs from what was sent. A failure additionally shows MPDV's own message. The message is dug out of whatever shape MPDV uses (`message`, `errorMessage`, `error`, an `errors` array, a nested `result`, or its `__rowType` rows); if the shape is unrecognised the raw body is shown verbatim, so nothing is ever hidden. MPDV also answers `200` for some rejected orders, so the body is inspected as well as the status code. The host serves a valid DigiCert certificate but not its full chain, so a "don't validate the TLS certificate" option is provided and enabled by default for it.
 
 ## SYNAOS connection
 
@@ -119,8 +127,8 @@ Authentication is HTTP Basic. All admin configuration (products, stations, price
 ## Download
 
 Grab the latest installers from the [Releases page](../../releases):
-- **Windows** — `GradionShop-Setup-1.19.1.exe`
-- **macOS** — `GradionShop-1.19.1.dmg`
+- **Windows** — `GradionShop-Setup-1.19.2.exe`
+- **macOS** — `GradionShop-1.19.2.dmg`
 
 ## Development
 
